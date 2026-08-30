@@ -1,7 +1,7 @@
 #pragma once
 
-#include "config.h"
-#include "handAnalysis/handClusterer.h"
+#include "solver/config.h"
+#include "solver/handAnalysis/handClusterer.h"
 
 struct Engine {
     struct Player {
@@ -154,7 +154,7 @@ struct Engine {
             // Each table has an exact expected size. Checking it up front turns a
             // missing or truncated file into an immediate error instead of a
             // silently zeroed table.
-            const std::string handScorePath = "handAnalysis/handScores.bin";
+            const std::string handScorePath = "solver/handAnalysis/handScores.bin";
             handScoreTable.resize(133784560);
             uint64_t handScoreBytes = handScoreTable.size() * sizeof(uint32_t);
             if (fileSize(handScorePath) != handScoreBytes) {
@@ -163,7 +163,7 @@ struct Engine {
             std::ifstream handScoreFile = openRead(handScorePath);
             readExact(handScoreFile, handScoreTable.data(), handScoreBytes, handScorePath);
 
-            const std::string boardClassPath = "handAnalysis/boardClasses.bin";
+            const std::string boardClassPath = "solver/handAnalysis/boardClasses.bin";
             boardClassTable.resize(60929700);
             uint64_t boardClassBytes = boardClassTable.size() * sizeof(uint16_t);
             if (fileSize(boardClassPath) != boardClassBytes) {
@@ -181,8 +181,8 @@ struct Engine {
                 throw std::runtime_error("board class overflows the 15-bit key field");
             }
 
-            loadHandMetas("handAnalysis/handMetasBasic.bin", handMetasBasic);
-            loadHandMetas("handAnalysis/handMetas.bin", handMetas);
+            loadHandMetas("solver/handAnalysis/handMetasBasic.bin", handMetasBasic);
+            loadHandMetas("solver/handAnalysis/handMetas.bin", handMetas);
         });
     }
 

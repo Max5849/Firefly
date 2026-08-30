@@ -1,6 +1,6 @@
 #pragma once
 
-#include "include/library.h"
+#include "solver/include/library.h"
 
 constexpr int PLAYER_COUNT = 7;
 constexpr float CHIP_COUNT = 400.0;

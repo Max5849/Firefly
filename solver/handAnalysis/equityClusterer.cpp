@@ -1,9 +1,6 @@
-#include "include/library.h"
-#include "handClusterer.h"
-#include "dealer.h"
-#include <thread>
-#include <mutex>
-#include <atomic>
+#include "solver/include/library.h"
+#include "solver/handAnalysis/handClusterer.h"
+#include "solver/handAnalysis/dealer.h"
 
 bool mergeClusterPair(std::vector<std::vector<uint64_t>>& clusterHands, std::vector<uint64_t>& clusterSizes,
         std::vector<std::array<float, 110>>& clusterPoints, int begin, int end, int mergeCount, int maxClusters) {

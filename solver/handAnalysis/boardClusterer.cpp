@@ -1,6 +1,6 @@
-#include "include/library.h"
-#include "handClusterer.h"
-#include "dealer.h"
+#include "solver/include/library.h"
+#include "solver/handAnalysis/handClusterer.h"
+#include "solver/handAnalysis/dealer.h"
 
 int main() {
     Dealer dealer;

@@ -1,7 +1,7 @@
-#include "config.h"
-#include "engine.h"
-#include "strategyTable.h"
-#include "baseTable.h"
+#include "solver/config.h"
+#include "solver/engine.h"
+#include "solver/strategyTable.h"
+#include "solver/baseTable.h"
 
 // Step size encoding, pinned to visit counts rather than tuned: delta 0 is the
 // step at the largest representable visit count, delta 255 the step at the

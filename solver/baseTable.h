@@ -1,6 +1,6 @@
 #pragma once
 
-#include "config.h"
+#include "solver/config.h"
 
 // Option priors from a previous run. Read only after load and consulted only when
 // a state is first inserted, so lookup latency is nearly free to spend and the
