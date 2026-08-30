@@ -1,0 +1,24 @@
+#pragma once
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <vector>
+#include <array>
+#include <set>
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <cassert>
+#include <atomic>
+#include <thread>
+#include <barrier>
+#include <mutex>
+#include <bit>
+#include <cstring>
+#include <stdexcept>
+#include <filesystem>
+#include <system_error>
+#include <sys/mman.h>
+#include "ankerl/unordered_dense.h"
