@@ -148,20 +148,26 @@ struct Engine {
     // Loads the shared read-only tables exactly once, even if several Engines
     // are constructed concurrently. Call explicitly from main() before spawning
     // workers so the file I/O is not serialised behind a std::call_once wait.
-    static void loadTables() {
+    // withHandScores is false only for read-only consumers that never reach
+    // showdown, such as server/. It skips a 535 MB table nothing else would touch.
+    // The once_flag means the first caller decides, so a process must not mix the
+    // two: the solver always passes true, the server always passes false.
+    static void loadTables(bool withHandScores = true) {
         static std::once_flag loadFlag;
-        std::call_once(loadFlag, [] {
+        std::call_once(loadFlag, [withHandScores] {
             // Each table has an exact expected size. Checking it up front turns a
             // missing or truncated file into an immediate error instead of a
             // silently zeroed table.
-            const std::string handScorePath = "solver/handAnalysis/handScores.bin";
-            handScoreTable.resize(133784560);
-            uint64_t handScoreBytes = handScoreTable.size() * sizeof(uint32_t);
-            if (fileSize(handScorePath) != handScoreBytes) {
-                throw std::runtime_error(handScorePath + " has an unexpected size");
+            if (withHandScores) {
+                const std::string handScorePath = "solver/handAnalysis/handScores.bin";
+                handScoreTable.resize(133784560);
+                uint64_t handScoreBytes = handScoreTable.size() * sizeof(uint32_t);
+                if (fileSize(handScorePath) != handScoreBytes) {
+                    throw std::runtime_error(handScorePath + " has an unexpected size");
+                }
+                std::ifstream handScoreFile = openRead(handScorePath);
+                readExact(handScoreFile, handScoreTable.data(), handScoreBytes, handScorePath);
             }
-            std::ifstream handScoreFile = openRead(handScorePath);
-            readExact(handScoreFile, handScoreTable.data(), handScoreBytes, handScorePath);
 
             const std::string boardClassPath = "solver/handAnalysis/boardClasses.bin";
             boardClassTable.resize(60929700);
