@@ -105,7 +105,7 @@ int main() {
     Dealer dealer;
     std::vector<uint16_t> boardClasses;
     boardClasses.resize(60929700);
-    std::ifstream readFile("handAnalysis/boardClasses.bin", std::ios::binary);
+    std::ifstream readFile("solver/handAnalysis/boardClasses.bin", std::ios::binary);
     readFile.read(reinterpret_cast<char*>(boardClasses.data()), boardClasses.size() * sizeof(uint16_t));
     std::unordered_map<uint64_t, uint8_t> handMetasBasic;
     std::unordered_map<uint64_t, uint8_t> handMetas;

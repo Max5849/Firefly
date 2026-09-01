@@ -9,7 +9,7 @@ constexpr bool MEMORY_BASIC = true;
 constexpr bool BASE_METAS_BASIC = true;
 constexpr bool BASE_MEMORY_BASIC = true;
 constexpr bool USE_BASE = false;
-constexpr uint64_t EPOCHS = 3 * 100 * (1ULL << 32);
+constexpr uint64_t EPOCHS = 10 * 10000793600;
 
 // Fixed strategy table capacity. Never resized, so slot addresses are stable
 // for the lifetime of the process and insertion is a single CAS.

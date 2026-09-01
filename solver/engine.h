@@ -342,17 +342,15 @@ struct Engine {
             state |= uint64_t(villan.lastActions[i] & 0x1) << (shift + i);
         }
         shift += 4;
-        state |= uint64_t((round < 1 || (!memoryBasic && round < 2) ? player.positionBasic : 0) & 0x7) << shift;
+        state |= uint64_t((round < 2 || !memoryBasic ? player.positionBasic : 0) & 0x7) << shift;
         shift += 3;
-        state |= uint64_t((round < 1 || (!memoryBasic && round < 2) ? villan.positionBasic : 0) & 0x7) << shift;
+        state |= uint64_t((round < 2 || !memoryBasic ? villan.positionBasic : 0) & 0x7) << shift;
         shift += 3;
         state |= uint64_t((raiseSize > 0) & 0x1) << shift;
         state |= uint64_t(std::min(raiseStrength, uint8_t(3)) & 0x3) << (shift + 1);
         shift += 3;
-        if (!memoryBasic) {
-            state |= uint64_t((hiddenRaiseSize > 0) & 0x1) << shift;
-            state |= uint64_t(std::min(hiddenRaiseStrength, uint8_t(3)) & 0x3) << (shift + 1);
-        }
+        state |= uint64_t((hiddenRaiseSize > 0) & 0x1) << shift;
+        state |= uint64_t(std::min(hiddenRaiseStrength, uint8_t(3)) & 0x3) << (shift + 1);
         shift += 3;
         state |= uint64_t(std::min(player.raisesFaced, uint8_t(3)) & 0x3) << shift;
         shift += 2;

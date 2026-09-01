@@ -6,6 +6,14 @@
 // Step size encoding, pinned to visit counts rather than tuned: delta 0 is the
 // step at the largest representable visit count, delta 255 the step at the
 // max(visits, 5) floor.
+// exp overflows above ~709.8 and underflows to zero below ~-745. Capping the
+// exponent keeps a sum of four terms inside double range, and keeps every term
+// non-zero. Clamping the product rather than the weight lets the bound scale with
+// invTemp. The worst exponent measured in a real run is 47, so this never binds
+// in practice; it only stops a runaway weight from turning the option total into
+// inf or zero, either of which silently makes the node fold forever.
+inline constexpr double MAX_EXP_ARG = 700.0;
+
 double MIN_DELTA_INC;
 double DELTA_SCALAR;
 double INV_MIN_DELTA_INC;
@@ -30,6 +38,7 @@ struct EpochNode {
     int option;
     int action;
     float chips;
+    float pot;
 };
 
 struct Worker {
@@ -48,11 +57,10 @@ struct Worker {
 enum class Phase { Warmup, Training, Cooldown };
 
 struct Explorer {
-    // Warm up and cooldown are 2% of EPOCHS each and each runs as one
-    // uninterrupted stretch, so neither takes a delta update at its midpoint.
+    // One block, and one block each for warm up and cooldown.
     static constexpr uint64_t BLOCK = EPOCHS / 100;
-    static constexpr uint64_t WARMUP_HANDS = EPOCHS / 50;
-    static constexpr uint64_t COOLDOWN_HANDS = EPOCHS / 50;
+    static constexpr uint64_t WARMUP_HANDS = EPOCHS / 100;
+    static constexpr uint64_t COOLDOWN_HANDS = EPOCHS / 100;
 
     StrategyTable strategy;
     BaseTable strategyBase;
@@ -63,15 +71,16 @@ struct Explorer {
 
     explicit Explorer(unsigned threads) : threads(threads), bar(threads), nextChunk(0) {}
 
-    int chooseOption(Worker& worker, uint64_t keyBase, uint64_t key,
+    int chooseOption(Worker& worker, uint64_t keyBase, uint64_t key, float pot,
                 std::array<bool, 5> options, int action, float chips, double invTemp) {
         bool inserted = false;
         uint64_t slotIndex = 0;
         uint64_t word = 0;
         Entry& weights = *strategy.locate(key, slotIndex, word, inserted);
         if (inserted) {
-            // The mapping is already zero, so only the legal options and the
-            // starting step need writing before the record is published.
+            // Every field is written explicitly: compaction recycles dense indices,
+            // so a record handed out here may still hold the previous occupant's
+            // data rather than the zeroes the fresh mapping used to guarantee.
             const int baseOptions = strategyBase.find(keyBase);
             const bool baseLost = baseOptions < 0;
             uint8_t legal = 0;
@@ -80,6 +89,10 @@ struct Explorer {
                     legal |= uint8_t(1u << j);
                 }
             }
+            for (int j = 0; j < 4; j++) {
+                weights.weights[j].store(0, std::memory_order_relaxed);
+            }
+            weights.visits.store(0, std::memory_order_relaxed);
             weights.options.store(legal, std::memory_order_relaxed);
             weights.delta.store(255, std::memory_order_relaxed);
             strategy.publish(slotIndex, word);
@@ -102,8 +115,7 @@ struct Explorer {
             if (legal & (1u << j)) {
                 double w = std::bit_cast<double>(
                     weights.weights[j - 1].load(std::memory_order_relaxed));
-                running += std::exp(invTemp * std::copysign(8.33, w)
-                    * std::log(1 + std::abs(w) / 8.33));
+                running += std::exp(std::clamp(invTemp * w, -MAX_EXP_ARG, MAX_EXP_ARG));
             }
             dividers[j] = running;
         }
@@ -116,7 +128,7 @@ struct Explorer {
             }
         }
         if (option != 0) {
-            worker.epochPath.push_back({&weights, option, action, chips});
+            worker.epochPath.push_back({&weights, option, action, chips, pot});
         }
         return option;
     }
@@ -130,7 +142,7 @@ struct Explorer {
                 double scalar = multiplier * MIN_DELTA_INC * std::exp(DELTA_SCALAR
                     * weights->delta.load(std::memory_order_relaxed));
                 emaUpdate(weights->weights[epochNode.option - 1],
-                    rewards[epochNode.action] - epochNode.chips, scalar);
+                    (rewards[epochNode.action] - epochNode.chips) / epochNode.pot , scalar);
             }
         }
         worker.epochPath.clear();
@@ -146,24 +158,25 @@ struct Explorer {
             // max(visits, 5) pins the top of the byte at 255; the counter's own
             // ceiling pins the bottom at 0. The clamp only guards the last bit of
             // floating point rounding.
-            double alpha = -std::expm1(-std::log(2) / std::max(double(visits), 5.0));
+            double alpha = -std::expm1(-std::log(2) / std::max(double(visits), double(VISIT_FLOOR)));
             long encoded = std::lround(std::log(alpha * INV_MIN_DELTA_INC) * INV_DELTA_SCALAR);
             weights.delta.store(uint8_t(std::clamp(encoded, 0L, 255L)),
                 std::memory_order_relaxed);
-            weights.visits.store(0, std::memory_order_relaxed);
         }
     }
 
     // Quiesce every thread, rebuild the deltas over disjoint ranges, rearm the
     // chunk counter, then release everyone.
-    void deltaPass(unsigned t) {
+    void deltaPass(unsigned t, bool keepVisits = false) {
         bar.arrive_and_wait();
         uint64_t live = strategy.count();
         uint64_t span = live / threads;
         uint64_t begin = span * t;
         uint64_t end = (t + 1 == threads) ? live : span * (t + 1);
         updateDeltasRange(begin, end);
+        bar.arrive_and_wait();
         if (t == 0) {
+            strategy.compact(keepVisits);
             nextChunk.store(0, std::memory_order_relaxed);
         }
         bar.arrive_and_wait();
@@ -177,7 +190,7 @@ struct Explorer {
         do {
             uint64_t keyBase = USE_BASE ? engine.getState(BASE_METAS_BASIC, BASE_MEMORY_BASIC) : 0;
             uint64_t key = engine.getState(METAS_BASIC, MEMORY_BASIC);
-            option = chooseOption(worker, keyBase, key, engine.getOptions(),
+            option = chooseOption(worker, keyBase, key, engine.getPot(), engine.getOptions(),
                 engine.getAction(), engine.getChips(), invTemp);
         } while (engine.play(option));
         engine.showdown();
@@ -229,14 +242,18 @@ struct Explorer {
         runBlock(worker, Phase::Warmup, 0, 0.0, WARMUP_HANDS);
         // The inverse temperature is held for a whole block and steps at the block
         // boundary, in step with the delta pass that opens it, rising from 0 to its
-        // ceiling of log(4) across the hundred blocks.
+        // ceiling of log(65536) across the hundred blocks.
         for (uint64_t block = 0; block < 100; block++) {
             deltaPass(t);
             runBlock(worker, Phase::Training, block * BLOCK,
-                std::log(1.0 + 3.0 * double(block) / 100.0), BLOCK);
+                std::log(65536.0) * double(block) / 100.0, BLOCK);
         }
         deltaPass(t);
-        runBlock(worker, Phase::Cooldown, 0, std::log(4.0), COOLDOWN_HANDS);
+        runBlock(worker, Phase::Cooldown, 0, std::log(65536.0), COOLDOWN_HANDS);
+        // A last pass over the cooldown's visit counts, so the states the annealed
+        // strategy no longer reaches are cut before the table is written out. The
+        // counts are held rather than rearmed, since uploadStrategy exports them.
+        deltaPass(t, true);
     }
 
     void run() {
@@ -268,7 +285,7 @@ struct Explorer {
     }
 
     void downloadStrategyBase() {
-        std::string path = "strategies/strategyBase_"
+        std::string path = "solver/strategies/strategyBase_"
             + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC) + ".bin";
         uint64_t bytes = fileSize(path);
         std::ifstream file = openRead(path);
@@ -302,7 +319,7 @@ struct Explorer {
     }
 
     void uploadStrategy() {
-        CheckedWriter writeFile("strategies/strategy_"
+        CheckedWriter writeFile("solver/strategies/strategy_"
             + spec(METAS_BASIC, MEMORY_BASIC) + ".bin");
         uint64_t size = strategy.count();
         writeFile.write(&size, sizeof(size));
@@ -313,7 +330,8 @@ struct Explorer {
                 out[j] = std::bit_cast<double>(weights.weights[j].load(std::memory_order_relaxed));
             }
             uint32_t visits = weights.visits.load(std::memory_order_relaxed);
-            writeFile.write(&weights.key, sizeof(weights.key));
+            uint64_t key = weights.key.load(std::memory_order_relaxed);
+            writeFile.write(&key, sizeof(key));
             writeFile.write(&out, sizeof(out));
             writeFile.write(&visits, sizeof(visits));
         }
@@ -321,14 +339,14 @@ struct Explorer {
     }
 
     void uploadStrategyBase() {
-        CheckedWriter writeFile("strategies/strategyBase_"
+        CheckedWriter writeFile("solver/strategies/strategyBase_"
             + spec(METAS_BASIC, MEMORY_BASIC) + ".bin");
         uint64_t size = strategy.count();
         writeFile.write(&size, sizeof(size));
         for (uint64_t i = 0; i < size; i++) {
             Entry& weights = strategy.dense[i];
             // Evaluated at the terminal inverse temperature, keeping any option
-            // drawn at least once in 65536.
+            // drawn at least once in 16.
             const uint8_t legal = weights.options.load(std::memory_order_relaxed);
             std::array<double, 5> drawWeights = {0};
             double sum = 0;
@@ -340,18 +358,19 @@ struct Explorer {
                 if (legal & (1u << j)) {
                     double w = std::bit_cast<double>(
                         weights.weights[j - 1].load(std::memory_order_relaxed));
-                    drawWeights[j] = std::exp(std::log(4) * std::copysign(8.33, w)
-                        * std::log(1 + std::abs(w) / 8.33));
+                    drawWeights[j] = std::exp(
+                        std::clamp(std::log(65536) * w, -MAX_EXP_ARG, MAX_EXP_ARG));
                 }
                 sum += drawWeights[j];
             }
             uint8_t options = 0;
             for (int j = 0; j < 5; j++) {
-                if (65536 * drawWeights[j] / sum >= 1.0) {
+                if (16 * drawWeights[j] / sum >= 1.0) {
                     options |= uint8_t(1u << j);
                 }
             }
-            writeFile.write(&weights.key, sizeof(weights.key));
+            uint64_t key = weights.key.load(std::memory_order_relaxed);
+            writeFile.write(&key, sizeof(key));
             writeFile.write(&options, sizeof(options));
         }
         writeFile.commit();

@@ -1,4 +1,5 @@
-strategies/
+.claude/
 .vscode/
+strategies/
 build/
 *.bin
