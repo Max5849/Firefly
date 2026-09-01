@@ -3,6 +3,8 @@
 #include "server/replay.h"
 #include "server/strategyStore.h"
 
+#include <cmath>
+
 // The sampler's exponent clamp, copied from explorer.cpp, which cannot be
 // included because it carries main(). It never binds in practice - the worst
 // exponent measured in a real run is 47 - and only stops a runaway weight from

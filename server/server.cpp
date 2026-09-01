@@ -22,6 +22,9 @@
 #include "server/include/json.hpp"
 
 #include <charconv>
+#include <cmath>
+#include <cstdlib>
+#include <string>
 
 using json = nlohmann::json;
 

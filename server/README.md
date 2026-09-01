@@ -170,7 +170,8 @@ diffing against an independent reader of `strategy_<spec>.bin`.
 
 ## On the VM
 
-Copy, from the repository root:
+**Step by step instructions are in [DEPLOY.md](DEPLOY.md).** In summary, copy
+from the repository root:
 
 - `solver/handAnalysis/boardClasses.bin`, `handMetas.bin`, `handMetasBasic.bin` (178 MB)
 - `solver/strategies/strategy_<spec>.bin` (477 MB)

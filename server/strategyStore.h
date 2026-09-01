@@ -6,6 +6,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include <cmath>
+#include <string>
+
 // A record as strategy_<spec>.bin stores it: the state key, the option 1..4
 // expected values, and the visit count from the cooldown block. There is no
 // weight for option 0, because folding's pot normalised return is analytically

@@ -2,6 +2,14 @@
 
 #include "solver/engine.h"
 
+// library.h leans on transitive includes that libc++ happens to provide and
+// libstdc++ does not, so the headers this file actually uses are named here.
+// The build target is Linux/GCC; the development machine is macOS/clang.
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <string>
+
 // Cards are rank * 4 + suit with rank 0 = ace descending to 12 = deuce, exactly
 // as handAnalysis encodes them. The suit letters are this API's own convention:
 // the abstraction only ever counts suits, so any consistent mapping serves.

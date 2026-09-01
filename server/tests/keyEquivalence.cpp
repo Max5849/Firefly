@@ -18,6 +18,9 @@
 #include "server/replay.h"
 #include "server/sweep.h"
 
+#include <cmath>
+#include <cstdlib>
+
 struct Node {
     std::vector<int> actions;
     std::vector<int> board;

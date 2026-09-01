@@ -12,8 +12,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=firefly
-Group=firefly
+# The default login user of the Oracle image: "ubuntu" on the Ubuntu images,
+# "opc" on the Oracle Linux ones. Change both lines if yours differs.
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/opt/firefly
 ExecStart=/opt/firefly/build/server --host 127.0.0.1 --port 8080 --warm
 Restart=always

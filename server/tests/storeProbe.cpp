@@ -6,6 +6,8 @@
 #include "solver/config.h"
 #include "server/strategyStore.h"
 
+#include <cstdlib>
+
 int main(int argc, char** argv) {
     try {
         StrategyStore store;
