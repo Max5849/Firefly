@@ -291,12 +291,17 @@ cd /opt/firefly
 sleep 5
 
 curl -s localhost:8080/health
-curl -s -X POST localhost:8080/strategy -d '{"actions":[]}' | head -c 400
+curl -s -X POST localhost:8080/strategy \
+  -d '{"actions":[],"include":{"combos":{"frequencies":true}}}' | head -c 400
 ```
 
 Expect `{"status":"ok", ...}` and then a wall of JSON whose first combo is `AcAd`
 raising about 94% of the time. If that works, the hard part is done — everything
 left is networking.
+
+Note the `include`: every response section is off unless asked for, so
+`{"actions":[]}` on its own returns `{}`. That is a successful reply — it means the
+action list replayed legally — but it is not much of a smoke test.
 
 Optionally prove the port is exactly right:
 
@@ -490,7 +495,91 @@ Done.
 
 ---
 
-## 14. Updating later
+## 14. Running it day to day: closing the terminal, stopping, restarting
+
+### Can I close the terminal?
+
+It depends which of three things you started.
+
+| How you started it | Survives closing the terminal? | Survives a reboot? |
+| --- | --- | --- |
+| `./build/server --port 8080 &` — the §8 smoke test | Not reliably | No |
+| `sudo systemctl enable --now firefly-api` — §9 | **Yes** | **Yes** |
+| `ssh -N -L 8080:...` — the tunnel, on your Mac | No, but see below | n/a |
+
+The `&` in section 8 only backgrounds the process **inside your shell**. When SSH
+disconnects, the terminal it was attached to disappears, and whether the process
+outlives that is down to shell settings you should not have to think about. It is
+a smoke test, not a way to run a service.
+
+`systemctl enable --now` is the real answer. systemd starts the server as a
+service owned by the operating system, with no connection to your login session
+at all. You can close the terminal, close the laptop, fly somewhere — it keeps
+serving, and it comes back by itself after a reboot or a crash.
+
+**If you are using the SSH tunnel:** closing that terminal does **not** stop the
+API. The tunnel is just a private road from your Mac to the VM. The service keeps
+running; you simply cannot reach it from your Mac until you open the tunnel again
+with the same `ssh -N -L` command.
+
+### Checking on it when you come back
+
+```bash
+systemctl is-active firefly-api      # "active"
+systemctl is-enabled firefly-api     # "enabled" = it will start at boot
+systemctl status firefly-api --no-pager
+curl -s localhost:8080/health
+```
+
+### Stopping it
+
+There are two independent switches: **running right now**, and **starts at boot**.
+
+```bash
+sudo systemctl stop firefly-api            # stop now; still starts at next boot
+sudo systemctl disable firefly-api         # keep running now; do not start at boot
+sudo systemctl disable --now firefly-api   # both: stop now and stay stopped
+```
+
+And to bring it back:
+
+```bash
+sudo systemctl start firefly-api
+sudo systemctl enable --now firefly-api    # start now and at every boot
+sudo systemctl restart firefly-api         # after a rebuild or a new strategy file
+```
+
+**Do not stop it with `kill`.** The unit sets `Restart=always`, so systemd notices
+the process die and starts a fresh one two seconds later — it will look like the
+kill did nothing. `systemctl stop` is an explicit instruction, and the restart
+policy does not override it.
+
+(`kill %1` *is* the right way to stop the §8 smoke-test copy, because that one is
+not under systemd.)
+
+### nginx is a separate service
+
+```bash
+sudo systemctl stop nginx        # public endpoint down, the API itself still runs
+sudo systemctl start nginx
+```
+
+Stop only the API and nginx stays up answering `502 Bad Gateway`. Stop only nginx
+and the API keeps running but is unreachable from outside. To take the whole thing
+down:
+
+```bash
+sudo systemctl stop nginx firefly-api
+```
+
+Stopping the API releases its ~312 MB of resident memory and drops the strategy
+mappings from the page cache. Starting it again re-reads the tables, which takes a
+few seconds — the `--warm` flag in the unit means it faults the mappings back in
+up front rather than making the first few requests pay for it.
+
+---
+
+## 15. Updating later
 
 **Code changed on GitHub:**
 
@@ -519,7 +608,7 @@ matching `strategy_<spec>.bin`, a rebuilt server, and a fresh index.
 
 ---
 
-## 15. When something is wrong
+## 16. When something is wrong
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
@@ -545,7 +634,7 @@ sudo tail -f /var/log/nginx/error.log
 
 ---
 
-## 16. What it costs you on the box
+## 17. What it costs you on the box
 
 | | |
 | --- | --- |

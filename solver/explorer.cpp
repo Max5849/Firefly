@@ -57,10 +57,19 @@ struct Worker {
 enum class Phase { Warmup, Training, Cooldown };
 
 struct Explorer {
-    // One block, and one block each for warm up and cooldown.
-    static constexpr uint64_t BLOCK = EPOCHS / 100;
-    static constexpr uint64_t WARMUP_HANDS = EPOCHS / 100;
-    static constexpr uint64_t COOLDOWN_HANDS = EPOCHS / 100;
+    // EPOCHS is the training budget and BLOCK divides it, so the block length
+    // sets how often the deltas are rebuilt and how finely the anneal steps
+    // without changing how many hands are trained on. Warm up and cooldown are
+    // one block each and sit outside that budget.
+    static constexpr uint64_t BLOCK = EPOCHS / 20;
+    static constexpr uint64_t BLOCKS = EPOCHS / BLOCK;
+    static constexpr uint64_t WARMUP_HANDS = EPOCHS / 20;
+    static constexpr uint64_t COOLDOWN_HANDS = EPOCHS / 20;
+    // A BLOCK that does not divide EPOCHS would silently shorten the run by the
+    // remainder, and report() would never reach 100%.
+    static_assert(BLOCK > 0 && EPOCHS % BLOCK == 0,
+        "BLOCK must divide EPOCHS exactly");
+    static_assert(BLOCKS >= 1, "the run needs at least one training block");
 
     StrategyTable strategy;
     BaseTable strategyBase;
@@ -242,11 +251,11 @@ struct Explorer {
         runBlock(worker, Phase::Warmup, 0, 0.0, WARMUP_HANDS);
         // The inverse temperature is held for a whole block and steps at the block
         // boundary, in step with the delta pass that opens it, rising from 0 to its
-        // ceiling of log(65536) across the hundred blocks.
-        for (uint64_t block = 0; block < 100; block++) {
+        // ceiling of log(65536) across the blocks.
+        for (uint64_t block = 0; block < BLOCKS; block++) {
             deltaPass(t);
             runBlock(worker, Phase::Training, block * BLOCK,
-                std::log(65536.0) * double(block) / 100.0, BLOCK);
+                std::log(65536.0) * double(block) / double(BLOCKS), BLOCK);
         }
         deltaPass(t);
         runBlock(worker, Phase::Cooldown, 0, std::log(65536.0), COOLDOWN_HANDS);

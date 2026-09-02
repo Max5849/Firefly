@@ -66,7 +66,12 @@ requests are not disk-bound. `--strategy` and `--index` override the paths;
 ### `POST /strategy`
 
 ```json
-{ "actions": [2, 0, 0, 0, 0, 0, 1], "board": "As7h2d", "invTemp": 11.0904 }
+{
+  "actions": [2, 0, 0, 0, 0, 0, 1],
+  "board": "As7h2d",
+  "invTemp": 11.0904,
+  "include": { "transition": true, "combos": { "weights": true } }
+}
 ```
 
 | Field | Meaning |
@@ -74,45 +79,91 @@ requests are not disk-bound. `--strategy` and `--index` override the paths;
 | `actions` | Option indices in order: 0 fold, 1 call/check, 2 raise to half pot, 3 raise to one and a half pot, 4 all in. Empty means the first preflop decision, UTG. |
 | `board` | `"As7h2d"`, `"As 7h 2d"` or `"As,7h,2d"`. Must hold exactly the cards for the street the actions reach: 0, 3, 4 or 5. |
 | `invTemp` | Optional. Defaults to `log(65536)` ≈ 11.0904, the inverse temperature the run finished at. |
+| `include` | Which sections to return. **Everything is off unless named**, so a request with no `include` returns `{}`. |
 
-The response describes the node and then carries 1326 rows in hole-pair index
-order, `i * (101 - i) / 2 + j - 1` for cards `i < j`:
+#### `include`
+
+`node`, `transition` and `keyComponents` are booleans. `combos` takes a boolean —
+`true` turns on every sub-field — or an object naming `weights`, `frequencies`,
+`visits`, `key`, `handMeta`, `counts`. An unknown key is a 400 naming it.
+
+Anything off is **not computed**, not merely not serialised. Measured on one flop
+node:
+
+| `include` | Payload | p50 |
+| --- | --- | --- |
+| `{}` | 2 B | 0.20 ms |
+| `{"transition": true}` | 235 B | 0.23 ms |
+| `{"combos": {"handMeta": true}}` | 36.8 KB | 0.50 ms |
+| `{"combos": {"frequencies": true}}` | 131 KB | 0.72 ms |
+| `{"combos": true}` | 334.8 KB | 2.28 ms |
+
+#### The sections
+
+**`node`** — the abstraction's simplified view: `spec`, `round`, `street`, `seat`,
+`heads`, `board`, `legal`, `options`, `invTemp`, `weightUnits`.
+
+**`transition`** — exact chips, for a UI applying one action and rendering the
+next decision. Only the two seats that changed; the rest of the table accumulates
+on the client.
 
 ```json
-{
-  "spec": "74011", "round": 1, "street": "flop", "seat": 2, "heads": 2,
-  "board": "As7h2d",
-  "pot": 10, "potAfterCall": 10, "toCall": 0, "chips": 396, "spr": 39.55, "cpr": 0,
-  "legal": [false, true, true, true, false],
-  "options": ["fold", "call", "raise 0.5x pot", "raise 1.5x pot", "all in"],
-  "invTemp": 11.0904,
-  "found": 1173, "missing": 3, "invalid": 150, "metaMissing": 0,
-  "combos": [
-    { "combo": "AcAd", "key": "0x684150a3c6a10", "found": false },
-    null,
-    { "combo": "KcKd", "key": "0x68415163c6a10", "found": true,
-      "weights": [0.281, -5.841, -5.367, null],
-      "frequencies": [0, 1, 3.3e-30, 6.2e-28, 0],
-      "visits": 630 }
-  ]
+"transition": {
+  "pot": 10,
+  "lastAction": { "seat": 2, "option": 1, "chips": 395.5, "bet": 0, "inHand": true },
+  "actor": { "seat": 2, "chips": 395.5, "bet": 0, "toCall": 0,
+             "potAfterCall": 10, "spr": 39.55, "cpr": 0,
+             "legal": [false, true, true, true, false] }
 }
 ```
 
+`lastAction` is `null` when `actions` is empty. Note that its `bet` reads 0
+whenever that action closed the street — `newRound()` zeroes every live player's
+bet, so the chips are in `pot` and the stack is in `chips`.
+
+**`keyComponents`** — the part of the key all 1326 hands share, decomposed into
+named fields, with `raiseHistory` (four per-street counts) in place of
+`raiseHistoryCompressed`. Values are as the key encodes them: bucketed, clamped,
+and zeroed where `MEMORY_BASIC` drops a field. `boardField` and `boardClass` are
+`null` preflop, where the board field carries the hand-dependent 169-combo index
+instead.
+
+**`combos`** — 1326 rows in hole-pair index order, `i * (101 - i) / 2 + j - 1` for
+cards `i < j`, carrying only the requested fields:
+
+```json
+[ { "combo": "AcAd", "handMeta": 5, "found": false },
+  null,
+  { "combo": "KcKd", "found": true,
+    "weights": [0.281, -5.841, -5.367, null],
+    "frequencies": [0, 1, 3.3e-30, 6.2e-28, 0],
+    "visits": 22.5, "nodeVisits": 630, "metaCombos": 28 } ]
+```
+
 - A `null` row is a combination that clashes with the board.
-- `"found": false` means the state is absent from the table — see below.
+- `"found": false` means the state is absent from the table — see below. `found` is
+  emitted whenever a record-backed field was requested.
 - `weights` holds four numbers for options 1 to 4. There is no weight for folding
   because its pot-normalised return is analytically exactly 0, and that zero is
   the reference every other weight is measured against. Illegal options are
-  `null`, since their stored slot holds whatever was in memory.
+  `null`.
 - `frequencies` holds five, fold first, and sums to 1 over the legal options.
-- Weights are in units of *(stack change) / (pot after calling)* at that node, so
-  `potAfterCall` is what turns one back into chips.
+- `visits` is **per holding**: `nodeVisits / metaCombos`. The stored count belongs
+  to the key, which every combination in the same hand cluster shares, so the raw
+  number overstates one holding by the size of its cluster. Preflop `metaCombos`
+  is exactly 6 for a pair, 4 suited, 12 offsuit.
+- `counts` emits `{found, missing, invalid, metaMissing}` as a sibling of `combos`.
 
-Errors are 400 with `error`, the offending `actionIndex`, and the `legal` set at
-that point:
+Weights are in units of *(stack change) / (pot after calling)* at that node, so
+`transition.actor.potAfterCall` is what turns one back into chips.
+
+Errors are 400 with `error`, a `reason` naming the restriction that blocked the
+action, the offending `actionIndex`, and the `legal` set at that point:
 
 ```json
-{ "actionIndex": 0, "error": "option 1 (call) is not legal here",
+{ "error": "option 1 (call) is not legal here",
+  "reason": "no preflop limping: the pot is unraised, so every seat must fold or raise",
+  "actionIndex": 0,
   "legal": [true, false, true, true, false], "options": [...] }
 ```
 

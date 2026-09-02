@@ -72,14 +72,95 @@ inline const char* OPTION_NAMES[5] = {
     "fold", "call", "raise 0.5x pot", "raise 1.5x pot", "all in"
 };
 
+// Why getOptions() turned one option off.
+//
+// It re-evaluates the same conditions rather than reading the returned mask,
+// because the mask says only that an option is off, never which clause did it.
+// That makes this a second copy of getOptions()'s logic, so keyEquivalence asserts
+// every illegal option gets a non-empty reason at every node it visits - an option
+// that falls through every clause here would otherwise be rejected with no
+// explanation at all.
+//
+// Returns "" for an option that is legal.
+inline std::string illegalReason(Engine& engine, int option) {
+    const Engine::Player& player = engine.players[engine.action];
+    const int raises = engine.raiseHistory[0] + engine.raiseHistory[1]
+        + engine.raiseHistory[2] + engine.raiseHistory[3];
+    auto sprText = [&] { return std::to_string(player.spr); };
+
+    if (option == 0) {
+        if (player.cpr < 0.01f) {
+            return "there is nothing to call, so folding is not an option here - "
+                "check or bet";
+        }
+        return "";
+    }
+
+    if (option == 1) {
+        // The call clauses only apply inside this guard; outside it, calling is
+        // always legal.
+        if (!(player.spr >= 0.01f && raises < 6)) {
+            return "";
+        }
+        // First in source order, matching how the || chain reads.
+        if (engine.raiseHistory[0] == 0) {
+            return "no preflop limping: the pot is unraised, so every seat must "
+                "fold or raise";
+        }
+        if (player.raisesFaced > 1) {
+            return "you are facing a 3-bet or more since you last acted: fold or "
+                "re-raise, no flat call";
+        }
+        if (player.calls > 1) {
+            return "no third call on the same street";
+        }
+        if (engine.calls > 1 && (engine.raiseHistory[0] > 1 || engine.round != 0)) {
+            return "no third cold-caller in a 3-bet-plus preflop pot or on any "
+                "postflop street";
+        }
+        return "";
+    }
+
+    if (player.spr < 0.01f) {
+        return "calling is already all-in, so there are no chips behind to raise "
+            "with";
+    }
+    if (raises >= 6) {
+        return "the hand has reached its six-raise cap";
+    }
+    if (raises > 4) {
+        return "the sixth raise can only be all-in";
+    }
+    if (option == 2 && player.spr < 0.866f) {
+        return "the stack-to-pot ratio is " + sprText()
+            + ", below the 0.866 needed to raise half pot";
+    }
+    if (option == 3 && player.spr < 2.6f) {
+        return "the stack-to-pot ratio is " + sprText()
+            + ", below the 2.6 needed to raise one and a half pot";
+    }
+    if (option == 4 && player.spr >= 7.8f) {
+        return "the stack-to-pot ratio is " + sprText()
+            + ", at or above the 7.8 beyond which an all-in is not offered";
+    }
+    return "";
+}
+
 struct ReplayResult {
     bool ok = false;
     std::string error;
+    // Names the restriction that turned the option off, when the failure was an
+    // illegal option. Empty otherwise.
+    std::string reason;
     // Index into the submitted action list, or -1 when the failure is not tied
     // to one action.
     int actionIndex = -1;
     std::array<bool, 5> legal = {};
     bool hasLegal = false;
+    // The seat that played the last entry in the action list, and what it played.
+    // -1 when the list was empty, so there is no preceding action to describe.
+    int lastSeat = -1;
+    int lastOption = -1;
 };
 
 // Drives the real Engine to the node the action list describes.
@@ -148,11 +229,15 @@ struct Replay {
             if (!legal[option]) {
                 result.error = std::string("option ") + std::to_string(option) + " ("
                     + OPTION_NAMES[option] + ") is not legal here";
+                result.reason = illegalReason(engine, option);
                 result.actionIndex = int(i);
                 result.legal = legal;
                 result.hasLegal = true;
                 return result;
             }
+            // Captured before play(), which advances the action pointer.
+            result.lastSeat = engine.getAction();
+            result.lastOption = option;
             if (!engine.play(option)) {
                 result.error = "the hand ended at action " + std::to_string(i)
                     + ", so there is no node to query";

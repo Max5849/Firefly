@@ -33,9 +33,34 @@ struct ComboRow {
     bool metaFound = true;
     uint64_t key = 0;
     std::array<int, 2> cards = {0, 0};
+    // The hand meta the key branches on: the 169 combo index preflop, the 5 bit
+    // cluster postflop. This is handMetaBasic, since METAS_BASIC selects it.
+    uint8_t handMeta = 0;
     std::array<double, 4> weights = {};
     std::array<double, 5> frequencies = {};
-    uint32_t visits = 0;
+    // The record's raw count, shared by every combination with this key.
+    uint32_t nodeVisits = 0;
+    // How many valid combinations in this sweep produce this same key.
+    int metaCombos = 0;
+    // nodeVisits / metaCombos: the estimated visits for this exact holding rather
+    // than for its whole cluster.
+    double visits = 0.0;
+};
+
+// Which per-combination fields the caller asked for. Anything off is not computed,
+// not merely not serialised - with every field off the sweep does not run at all.
+struct SweepFields {
+    bool weights = false;
+    bool frequencies = false;
+    bool visits = false;
+    bool key = false;
+    bool handMeta = false;
+    bool counts = false;
+
+    // The row's presence in the strategy table is only needed for the fields that
+    // come out of the record.
+    bool needsStore() const { return weights || frequencies || visits || counts; }
+    bool any() const { return needsStore() || key || handMeta; }
 };
 
 struct SweepResult {
@@ -124,9 +149,10 @@ inline bool comboKey(Engine& engine, int first, int second, uint64_t& key) {
 }
 
 // Reads the weights for every hole card combination at the node the replay has
-// reached.
+// reached. Work is gated on fields: nothing the caller did not ask for is
+// computed, so a request wanting only handMeta never touches the strategy file.
 inline SweepResult sweep(Engine& engine, const std::vector<int>& board,
-        const StrategyStore& store, double invTemp) {
+        const StrategyStore& store, double invTemp, const SweepFields& fields) {
     SweepResult result;
 
     // getOptions() reads spr and cpr, which getState() assigns, and neither
@@ -139,6 +165,7 @@ inline SweepResult sweep(Engine& engine, const std::vector<int>& board,
         onBoard[card] = true;
     }
 
+    const bool needsStore = fields.needsStore();
     StrategyRecord record;
     for (int first = 0; first < 52; first++) {
         for (int second = first + 1; second < 52; second++) {
@@ -154,11 +181,18 @@ inline SweepResult sweep(Engine& engine, const std::vector<int>& board,
                 result.metaMissing++;
                 continue;
             }
+            row.handMeta = engine.players[engine.action].handMetaBasic;
+            if (!needsStore) {
+                continue;
+            }
             if (store.lookup(row.key, record)) {
                 row.found = true;
                 row.weights = record.weights;
-                row.visits = record.visits;
-                computeFrequencies(row.weights, result.legal, invTemp, row.frequencies);
+                row.nodeVisits = record.visits;
+                if (fields.frequencies) {
+                    computeFrequencies(row.weights, result.legal, invTemp,
+                        row.frequencies);
+                }
                 result.found++;
             } else {
                 // The table only holds states self play actually reached. A
@@ -168,5 +202,145 @@ inline SweepResult sweep(Engine& engine, const std::vector<int>& board,
             }
         }
     }
+
+    // visits is stored against the key, and a key is shared by every combination
+    // with the same hand meta - so the raw count overstates one holding by the
+    // size of its cluster. Divide it by how many valid combinations reach this
+    // same key. Every row in a group shares a key and therefore a record, so found
+    // is uniform within a group and misses need no special case.
+    if (fields.visits) {
+        ankerl::unordered_dense::map<uint64_t, int> groupSizes;
+        groupSizes.reserve(COMBO_COUNT);
+        for (const ComboRow& row : result.rows) {
+            if (row.valid && row.metaFound) {
+                groupSizes[row.key]++;
+            }
+        }
+        for (ComboRow& row : result.rows) {
+            if (row.valid && row.metaFound) {
+                row.metaCombos = groupSizes[row.key];
+                row.visits = double(row.nodeVisits) / double(row.metaCombos);
+            }
+        }
+    }
     return result;
+}
+
+// The part of the key every one of the 1326 hands shares, decomposed into named
+// components.
+//
+// Values are reported as the key encodes them - bucketed, clamped, and zeroed
+// where MEMORY_BASIC drops a field - not as the underlying quantities. The one
+// exception is raiseHistory, which replaces raiseHistoryCompressed: the four
+// per-street counts are what a reader wants, and the compressed byte is a colex
+// rank of exactly those counts.
+//
+// This is the only code in server/ that reproduces getState()'s encoding instead
+// of calling it, so it can drift silently. keyEquivalence masks every field out of
+// the real key and compares, at every node it visits.
+struct KeyComponents {
+    int roundHeadsBasic = 0;
+    int headsBasic = 0;
+    int actionPositionBucket = 0;
+    int sprCprBucket = 0;
+    // "spr" when the player has chips behind after calling, "cpr" when calling is
+    // already all-in and the price carries the information instead.
+    const char* sprCprKind = "spr";
+    // Preflop the 15 bit board field carries the 169 combo index, which is hand
+    // dependent - so there is no shared board field to report and this is false.
+    bool hasBoardField = false;
+    int boardField = 0;
+    int boardClass = 0;
+    std::array<int, 4> raiseHistory = {};
+    std::array<int, 4> playerLastActions = {};
+    std::array<int, 4> villanLastActions = {};
+    int playerPositionBasic = 0;
+    int villanPositionBasic = 0;
+    // Not a key field: it selects which seat the two villan fields describe, and
+    // they cannot be read without it.
+    int villanPosition = 0;
+    int raiseSizeOverZero = 0;
+    int raiseStrength = 0;
+    int hiddenRaiseSizeOverZero = 0;
+    int hiddenRaiseStrength = 0;
+    int raisesFaced = 0;
+    int relativePosition = 0;
+    bool playerCallsOverOne = false;
+    int calls = 0;
+};
+
+// The SPR / CPR bucket, bits 6-9. Duplicated from getState() because it is the
+// only component whose encoding is more than a mask or a clamp; the thresholds are
+// geometric with ratio sqrt(3), so each bucket is half an octave of pot odds.
+inline int sprCprBucket(float spr, float cpr, bool& isSpr) {
+    static constexpr float THRESHOLDS[8] =
+        {0.289f, 0.5f, 0.866f, 1.5f, 2.6f, 4.5f, 7.8f, 13.5f};
+    if (spr < 0.01f) {
+        // Calling is effectively all-in, so stack depth carries no information and
+        // the price does. Buckets 9..15 against the first six thresholds.
+        isSpr = false;
+        for (int i = 0; i < 6; i++) {
+            if (cpr < THRESHOLDS[i]) {
+                return 9 + i;
+            }
+        }
+        return 15;
+    }
+    isSpr = true;
+    for (int i = 0; i < 8; i++) {
+        if (spr < THRESHOLDS[i]) {
+            return i;
+        }
+    }
+    return 8;
+}
+
+// Must be called after a getState(), which assigns player.spr, player.cpr and
+// player.actionPosition as a side effect.
+inline KeyComponents keyComponents(const Engine& engine) {
+    const Engine::Player& player = engine.players[engine.action];
+    const Engine::Player& villan = engine.players[player.villanPosition];
+    // MEMORY_BASIC zeroes the two positionBasic fields from the turn onward.
+    // Report the zeros that are genuinely in the key rather than undoing them.
+    //
+    // It does NOT touch the hiddenRaise fields: the if (!memoryBasic) that used to
+    // wrap them was removed in commit 1b24d24, so they are always encoded. The
+    // solver skill still documents the old behaviour.
+    const bool keepPositions = engine.round < 2 || !MEMORY_BASIC;
+
+    KeyComponents out;
+    out.roundHeadsBasic = engine.roundHeadsBasic & 0x3;
+    out.headsBasic = engine.headsBasic & 0x3;
+    out.actionPositionBucket = player.actionPosition & 0x3;
+
+    bool isSpr = true;
+    out.sprCprBucket = sprCprBucket(player.spr, player.cpr, isSpr);
+    out.sprCprKind = isSpr ? "spr" : "cpr";
+
+    if (engine.round != 0) {
+        out.hasBoardField = true;
+        // METAS_BASIC keys the board field on the flop class plus the street, so
+        // turn and river cards create no new board branches.
+        out.boardClass = METAS_BASIC ? engine.boardClasses[1] : engine.boardClasses[engine.round];
+        out.boardField = (out.boardClass + 169 + (METAS_BASIC ? engine.round : 0)) & 0x7FFF;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        out.raiseHistory[i] = engine.raiseHistory[i];
+        out.playerLastActions[i] = player.lastActions[i] & 0x1;
+        out.villanLastActions[i] = villan.lastActions[i] & 0x1;
+    }
+    out.playerPositionBasic = keepPositions ? (player.positionBasic & 0x7) : 0;
+    out.villanPositionBasic = keepPositions ? (villan.positionBasic & 0x7) : 0;
+    out.villanPosition = player.villanPosition;
+
+    out.raiseSizeOverZero = engine.raiseSize > 0 ? 1 : 0;
+    out.raiseStrength = std::min(engine.raiseStrength, uint8_t(3)) & 0x3;
+    out.hiddenRaiseSizeOverZero = engine.hiddenRaiseSize > 0 ? 1 : 0;
+    out.hiddenRaiseStrength = std::min(engine.hiddenRaiseStrength, uint8_t(3)) & 0x3;
+    out.raisesFaced = std::min(player.raisesFaced, uint8_t(3)) & 0x3;
+    out.relativePosition = player.relativePosition & 0x1;
+    out.playerCallsOverOne = player.calls > 1;
+    out.calls = engine.calls < 2 ? engine.calls : (engine.calls < 4 ? 2 : 3);
+    return out;
 }
