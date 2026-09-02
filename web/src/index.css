@@ -1,0 +1,67 @@
+@import 'tailwindcss';
+
+@theme {
+  /* Ground and structure. --void doubles as the hairline between grid cells, so
+     the mosaic is separated by page showing through rather than by a border. */
+  --color-void: #0a0b0d;
+  --color-slate: #14161a;
+  --color-rule: #21252b;
+  --color-chalk: #e4e7eb;
+  --color-ash: #6b737d;
+
+  /* Action colours. Pink and red are separated by lightness, not hue - at the low
+     opacities that low-visit combos render at, two mid-tone hues are identical. */
+  --color-act-fold: #2563eb;
+  --color-act-call: #16a34a;
+  --color-act-small: #f472b6;
+  --color-act-big: #dc2626;
+  --color-act-shove: #9333ea;
+
+  /* Suit tiles: saturated fill, near-black ink. Spades take the achromatic tile,
+     which is what makes them read as the black suit on a dark ground. */
+  --color-suit-c: #3f9e5a;
+  --color-suit-d: #3b82f6;
+  --color-suit-h: #dc2626;
+  --color-suit-s: #c8cdd3;
+
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-display: 'Archivo', ui-sans-serif, system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-void);
+  color: var(--color-chalk);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* The page is a keyboard instrument and takes focus at the document level, so the
+   default outline would sit around the whole app. Focus is still visible on the
+   one element that can hold it. */
+:focus-visible {
+  outline: 2px solid var(--color-chalk);
+  outline-offset: 2px;
+}
+
+.strip {
+  transition: opacity 120ms linear, background 120ms linear;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .strip {
+    transition: none;
+  }
+}
