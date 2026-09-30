@@ -53,6 +53,12 @@ struct StrategyTable {
 
     uint64_t count() const { return used.load(std::memory_order_relaxed); }
 
+    // Pulls the key's home slot word toward the cache ahead of locate(), so a batch
+    // of lookups overlaps its misses instead of taking them one at a time.
+    void prefetch(uint64_t key) const {
+        __builtin_prefetch(&slots[mix64(key) >> (64 - STRATEGY_CAP_LOG2)]);
+    }
+
     Entry* locate(uint64_t key, uint64_t& slotIndex, uint64_t& word, bool& inserted) {
         const uint64_t hash = mix64(key);
         const uint64_t tag = (hash & 0xFFFFFFFFULL) | 0x80000000ULL;

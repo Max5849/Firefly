@@ -2,6 +2,8 @@
 
 #include "solver/include/library.h"
 
+#include <cmath>
+
 constexpr int PLAYER_COUNT = 7;
 constexpr float CHIP_COUNT = 400.0;
 constexpr bool METAS_BASIC = true;
@@ -10,7 +12,27 @@ constexpr bool BASE_METAS_BASIC = true;
 constexpr bool BASE_MEMORY_BASIC = true;
 constexpr bool USE_BASE = false;
 constexpr uint64_t EPOCHS = 100 * 10000793600;
-constexpr double MAX_INV_TEMP = 256.0;
+
+// The fixed inverse temperature every phase samples at: P(j) proportional to
+// exp(INV_TEMP * w_j). log(256) means a weight one pot above another is drawn 256
+// times as often.
+inline const double INV_TEMP = std::log(256.0);
+
+// Clamp on INV_TEMP * w before exp, so a runaway weight cannot turn the option total
+// into inf or zero.
+inline constexpr double MAX_EXP_ARG = 700.0;
+
+// A combo whose reach falls below this is dropped from its range: it is not looked
+// up at the decision and can carry at most this much weight into any update.
+constexpr float RANGE_FLOOR = 1e-6f;
+
+// Every two card holding. For cards i < j the combo index is
+// i * (101 - i) / 2 + j - 1, the addressing used throughout handAnalysis.
+inline constexpr int COMBO_COUNT = 1326;
+
+inline int holePairIndex(int i, int j) {
+    return i * (101 - i) / 2 + j - 1;
+}
 
 // A strategy_<spec>.bin record: uint64 key, float weights[4] for options 1..4, and
 // uint32 visits. Weights are doubles only while the run holds them; every file the

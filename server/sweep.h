@@ -5,23 +5,11 @@
 
 #include <cmath>
 
-// The sampler's exponent clamp, copied from explorer.cpp, which cannot be
-// included because it carries main(). It never binds in practice - the worst
-// exponent measured in a real run is 47 - and only stops a runaway weight from
-// turning the option total into inf or zero.
-inline constexpr double MAX_EXP_ARG = 700.0;
+// MAX_EXP_ARG, COMBO_COUNT and holePairIndex come from solver/config.h.
 
-// The inverse temperature the run finished at. Frequencies at this value are the
-// policy the solver was actually sampling from at the end of training.
-inline const double TERMINAL_INV_TEMP = std::log(65536.0);
-
-inline constexpr int COMBO_COUNT = 1326;
-
-// The 1326 combo addressing used throughout handAnalysis: for cards i < j,
-// index = i * (101 - i) / 2 + j - 1.
-inline int holePairIndex(int i, int j) {
-    return i * (101 - i) / 2 + j - 1;
-}
+// The fixed inverse temperature the solver trains at. Frequencies at this value are
+// the policy the solver was actually sampling from.
+inline const double TERMINAL_INV_TEMP = INV_TEMP;
 
 struct ComboRow {
     // Clashes with a board card, so this hand cannot be held.
