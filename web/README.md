@@ -39,23 +39,37 @@ different things in the two modes, which never overlap.
 
 ## Reading the grid
 
-Each of the 169 cells is split into one strip per combination — 6 for a pair, 4
-suited, 12 offsuit — ordered ♠ ♥ ♦ ♣, high card first. Every strip fills from the
-bottom in action order:
+Each of the 169 cells is one row of columns, one per combination — 6 for a pair, 4
+suited, 12 offsuit. Every column fills from the bottom in action order:
 
-| | fold | call | raise 0.5x | raise 1.5x | all in |
+| | fold | call | raise | raise | all in |
 | --- | --- | --- | --- | --- | --- |
 | | blue | green | pink | red | purple |
 
-**Opacity is visits**, linear from the busiest of the 1326 down to zero. A blank
-strip is therefore one of three things, all of them real: the combination uses a
-board card, the solver never built that node, or it was reached far less often than
-the busiest one. A whole blank cell usually means the second — for instance the big
-blind never flats a UTG raise with aces, so `AA` is empty on a flop that follows
-that line.
+**Columns are ordered by how close the hand is to a flush**, most first. For each
+combination, count the board cards plus hole cards in each suit the hole cards
+actually contribute to, and take the largest; ties go to the hand whose card in that
+suit is higher. On a two-spade flop every A♠5x therefore sits left of every Ax5♠ —
+both hold three spades, and the ace outranks the five. The order changes with the
+board, which is the point: it is the board that decides what "suited" is worth.
 
-`VISITS` in the header is the mean over the *possible* combinations — 1326 less the
-ones the board rules out — so it stays comparable across streets.
+**Eliminated combinations are black and shift to the right**, so the live columns stay
+together on the left. Three separate things eliminate a column, and the grid does
+not distinguish them:
+
+- the combination uses a board card;
+- the solver never built that node;
+- the hand class is too thin to read — its visit count, divided by the number of
+  combinations in the class, is under 5% of the largest such figure at this node.
+
+That last one is normalised deliberately. A class covering 255 holdings would
+otherwise always outrank one covering 12 on raw counts alone. On a `Ks9s2dAh` turn
+it blacks out the ace-queen class at 28,030 visits over 99 combinations — 283 each,
+against a 367 cut — while a class with 26,914 raw visits over 36 combinations
+survives at 748.
+
+`VISITS` in the header is the node total: the sum over *distinct* hand classes, not
+the sum of the per-combination figures, which would multiply each class by its size.
 
 ## Street changes
 

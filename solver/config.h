@@ -10,23 +10,30 @@ constexpr bool BASE_METAS_BASIC = true;
 constexpr bool BASE_MEMORY_BASIC = true;
 constexpr bool USE_BASE = false;
 constexpr uint64_t EPOCHS = 100 * 10000793600;
+constexpr double MAX_INV_TEMP = 256.0;
 
-// Fixed strategy table capacity. Never resized, so slot addresses are stable
-// for the lifetime of the process and insertion is a single CAS.
+// A strategy_<spec>.bin record: uint64 key, float weights[4] for options 1..4, and
+// uint32 visits. Weights are doubles only while the run holds them; every file the
+// solver writes or reads carries floats.
+constexpr uint64_t STRATEGY_RECORD_BYTES = 28;
+constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
+
+// An option survives the base prune when it would still be drawn at least once in
+// BASE_PRUNE_RATIO at the terminal inverse temperature.
+constexpr double BASE_PRUNE_RATIO = 16.0;
+// The base table carries no fingerprint array, so a miss walks the whole cluster and
+// touches a 24 byte record at every step. Half the load is worth twice the slots.
+constexpr double BASE_MAX_LOAD = 0.5;
+
+constexpr bool TRACE_KEY_ENABLED = false;
+constexpr uint64_t TRACE_KEY = 0x1404c85a4810de00;
+
 constexpr uint64_t STRATEGY_CAP_LOG2 = 28;
-// A ceiling, not an operating point: below it the load factor costs nothing, so
-// this only takes effect if the run genuinely discovers that many states. At 0.95
-// lookups still cost ~1.5 probes and throughput is unchanged; the cliff is ~0.99.
 constexpr double MAX_LOAD = 0.95;
 
-// Work-stealing granularity: threads claim CHUNK_HANDS hands at a time so that
-// the fast performance cores naturally take more chunks than the efficiency ones.
 constexpr uint64_t CHUNK_HANDS = 1ULL << 16;
-// Progress is printed every PRINT_CHUNKS claimed chunks.
 constexpr uint64_t PRINT_CHUNKS = 1ULL << 8;
 
-// splitmix64 finaliser. State keys are packed bitfields whose low bits are highly
-// structured, so they need a proper avalanche before indexing a table.
 inline uint64_t mix64(uint64_t x) {
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
@@ -35,11 +42,6 @@ inline uint64_t mix64(uint64_t x) {
     x ^= x >> 33;
     return x;
 }
-
-// --- checked binary file I/O -------------------------------------------------
-// Every read and write below reports failure by throwing. Silence is the failure
-// mode that matters here: a missing table file would otherwise leave a zeroed
-// array in memory and a run would burn days producing nonsense.
 
 inline uint64_t fileSize(const std::string& path) {
     std::error_code ec;
@@ -65,8 +67,6 @@ inline void readExact(std::istream& file, void* destination, uint64_t bytes, con
     }
 }
 
-// Reads a whole file into memory so record loops can be parsed with memcpy
-// instead of millions of small stream reads.
 inline std::vector<char> readWholeFile(const std::string& path) {
     uint64_t bytes = fileSize(path);
     std::ifstream file = openRead(path);
@@ -77,8 +77,6 @@ inline std::vector<char> readWholeFile(const std::string& path) {
     return data;
 }
 
-// Writes to a temporary alongside the destination and renames on commit, so a
-// crashed, failed, or interrupted run can never destroy the previous good file.
 struct CheckedWriter {
     std::string path;
     std::string temporary;
@@ -94,8 +92,6 @@ struct CheckedWriter {
         }
     }
 
-    // Stream error state is sticky, so one check in commit() catches any failure
-    // anywhere in the run of writes.
     void write(const void* source, uint64_t bytes) {
         file.write(static_cast<const char*>(source), std::streamsize(bytes));
     }
@@ -117,7 +113,6 @@ struct CheckedWriter {
     }
 
     ~CheckedWriter() {
-        // Not committed, so something threw. Leave no partial file behind.
         if (file.is_open()) {
             file.close();
             std::error_code ec;

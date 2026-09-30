@@ -3,15 +3,6 @@
 #include "solver/strategyTable.h"
 #include "solver/baseTable.h"
 
-// Step size encoding, pinned to visit counts rather than tuned: delta 0 is the
-// step at the largest representable visit count, delta 255 the step at the
-// max(visits, 5) floor.
-// exp overflows above ~709.8 and underflows to zero below ~-745. Capping the
-// exponent keeps a sum of four terms inside double range, and keeps every term
-// non-zero. Clamping the product rather than the weight lets the bound scale with
-// invTemp. The worst exponent measured in a real run is 47, so this never binds
-// in practice; it only stops a runaway weight from turning the option total into
-// inf or zero, either of which silently makes the node fold forever.
 inline constexpr double MAX_EXP_ARG = 700.0;
 
 double MIN_DELTA_INC;
@@ -19,18 +10,28 @@ double DELTA_SCALAR;
 double INV_MIN_DELTA_INC;
 double INV_DELTA_SCALAR;
 
-// w += s * (target - w). Recomputing the step from the freshly loaded value on
-// every retry makes two concurrent updates compose into exactly two sequential
-// EMA steps, so nothing is lost and no lock is needed.
-static inline void emaUpdate(std::atomic<uint64_t>& word, float target, double scalar) {
+static inline std::pair<double, double> emaUpdate(std::atomic<uint64_t>& word,
+            float target, double scalar) {
     uint64_t old = word.load(std::memory_order_relaxed);
     uint64_t next;
+    double value;
     do {
-        double value = std::bit_cast<double>(old);
+        value = std::bit_cast<double>(old);
         float delta = target - value;
         next = std::bit_cast<uint64_t>(value + scalar * delta);
     } while (!word.compare_exchange_weak(old, next,
         std::memory_order_relaxed, std::memory_order_relaxed));
+    return {value, std::bit_cast<double>(next)};
+}
+
+static inline const char* optionName(int option) {
+    switch (option) {
+        case 0:  return "fold";
+        case 1:  return "call/check";
+        case 2:  return "raise 0.5x pot";
+        case 3:  return "raise 1.5x pot";
+        default: return "all in";
+    }
 }
 
 struct EpochNode {
@@ -39,6 +40,27 @@ struct EpochNode {
     int action;
     float chips;
     float pot;
+    int trace;
+};
+
+struct TraceNode {
+    Entry* entry;
+    uint64_t key;
+    int action;
+    int option;
+    uint8_t legal;
+    uint32_t visits;
+    double invTemp;
+    std::array<double, 4> weights;
+    std::array<double, 5> probabilities;
+    float chips;
+    float pot;
+
+    bool updated;
+    double scalar;
+    double target;
+    double before;
+    double after;
 };
 
 struct Worker {
@@ -46,9 +68,8 @@ struct Worker {
     std::mt19937 gen;
     std::uniform_real_distribution<double> unit{0.0, 1.0};
     std::vector<EpochNode> epochPath;
+    std::vector<TraceNode> tracePath;
 
-    // Thread 0 reproduces the original single-threaded stream, so a one thread run
-    // stays comparable against earlier results.
     explicit Worker(unsigned t) : gen(15 + t) {
         epochPath.reserve(64);
     }
@@ -57,16 +78,10 @@ struct Worker {
 enum class Phase { Warmup, Training, Cooldown };
 
 struct Explorer {
-    // EPOCHS is the training budget and BLOCK divides it, so the block length
-    // sets how often the deltas are rebuilt and how finely the anneal steps
-    // without changing how many hands are trained on. Warm up and cooldown are
-    // one block each and sit outside that budget.
     static constexpr uint64_t BLOCK = EPOCHS / 20;
     static constexpr uint64_t BLOCKS = EPOCHS / BLOCK;
     static constexpr uint64_t WARMUP_HANDS = EPOCHS / 20;
     static constexpr uint64_t COOLDOWN_HANDS = EPOCHS / 20;
-    // A BLOCK that does not divide EPOCHS would silently shorten the run by the
-    // remainder, and report() would never reach 100%.
     static_assert(BLOCK > 0 && EPOCHS % BLOCK == 0,
         "BLOCK must divide EPOCHS exactly");
     static_assert(BLOCKS >= 1, "the run needs at least one training block");
@@ -87,19 +102,40 @@ struct Explorer {
         uint64_t word = 0;
         Entry& weights = *strategy.locate(key, slotIndex, word, inserted);
         if (inserted) {
-            // Every field is written explicitly: compaction recycles dense indices,
-            // so a record handed out here may still hold the previous occupant's
-            // data rather than the zeroes the fresh mapping used to guarantee.
-            const int baseOptions = strategyBase.find(keyBase);
-            const bool baseLost = baseOptions < 0;
+            const BaseEntry* base = USE_BASE ? strategyBase.find(keyBase) : nullptr;
             uint8_t legal = 0;
-            for (int j = 0; j < 5; j++) {
-                if (options[j] && (baseLost || (baseOptions & (1 << j)))) {
-                    legal |= uint8_t(1u << j);
+            if (base == nullptr) {
+                for (int j = 0; j < 5; j++) {
+                    if (options[j]) {
+                        legal |= uint8_t(1u << j);
+                    }
+                }
+            } else {
+                std::array<double, 5> draw = {0};
+                double sum = 0;
+                if (options[0]) {
+                    draw[0] = 1.0;                       
+                }
+                for (int j = 1; j < 5; j++) {
+                    if (options[j]) {
+                        draw[j] = std::exp(std::clamp(
+                            std::log(MAX_INV_TEMP) * double(base->weights[j - 1]),
+                            -MAX_EXP_ARG, MAX_EXP_ARG));
+                    }
+                }
+                for (int j = 0; j < 5; j++) {
+                    sum += draw[j];
+                }
+                for (int j = 0; j < 5; j++) {
+                    if (options[j] && BASE_PRUNE_RATIO * draw[j] / sum >= 1.0) {
+                        legal |= uint8_t(1u << j);
+                    }
                 }
             }
             for (int j = 0; j < 4; j++) {
-                weights.weights[j].store(0, std::memory_order_relaxed);
+                double seed = base != nullptr ? double(base->weights[j]) : 0.0;
+                weights.weights[j].store(std::bit_cast<uint64_t>(seed),
+                    std::memory_order_relaxed);
             }
             weights.visits.store(0, std::memory_order_relaxed);
             weights.options.store(legal, std::memory_order_relaxed);
@@ -110,9 +146,6 @@ struct Explorer {
             throw std::runtime_error("a node reached 2^32 visits, so the visit counter "
                 "wrapped and its step size would jump to the maximum");
         }
-        // The sampler is stochastic and legality is fixed at insert, so this read
-        // path needs nothing beyond relaxed atomics. Running totals let one uniform
-        // sample scaled by the total land in exactly one option's interval.
         const uint8_t legal = weights.options.load(std::memory_order_relaxed);
         std::array<double, 5> dividers = {0};
         double running = 0;
@@ -136,46 +169,137 @@ struct Explorer {
                 break;
             }
         }
+        int trace = -1;
+        if constexpr (TRACE_KEY_ENABLED) {
+            if (key == TRACE_KEY) {
+                TraceNode node{};
+                node.entry = &weights;
+                node.key = key;
+                node.action = action;
+                node.option = option;
+                node.legal = legal;
+                node.visits = weights.visits.load(std::memory_order_relaxed);
+                node.invTemp = invTemp;
+                for (int j = 0; j < 4; j++) {
+                    node.weights[j] = std::bit_cast<double>(
+                        weights.weights[j].load(std::memory_order_relaxed));
+                }
+                for (int j = 0; j < 5; j++) {
+                    double mass = dividers[j] - (j == 0 ? 0.0 : dividers[j - 1]);
+                    node.probabilities[j] = running > 0 ? mass / running : 0.0;
+                }
+                node.chips = chips;
+                node.pot = pot;
+                node.updated = false;
+                trace = int(worker.tracePath.size());
+                worker.tracePath.push_back(node);
+            }
+        }
         if (option != 0) {
-            worker.epochPath.push_back({&weights, option, action, chips, pot});
+            worker.epochPath.push_back({&weights, option, action, chips, pot, trace});
         }
         return option;
     }
 
+    void printTrace(Worker& worker, std::array<float, PLAYER_COUNT> rewards) {
+        if (worker.tracePath.empty()) {
+            return;
+        }
+        std::ostringstream out;
+        out << std::fixed;
+        for (const TraceNode& node : worker.tracePath) {
+            out << "===== trace key 0x" << std::hex << std::setw(16) << std::setfill('0')
+                << node.key << std::dec << std::setfill(' ') << " =====\n";
+            out << std::setprecision(3);
+            out << "  seat " << node.action << "   visits " << node.visits
+                << "   invTemp " << node.invTemp
+                << "   chips " << node.chips << "   pot " << node.pot << "\n";
+            out << std::setprecision(6);
+            out << "  weights ";
+            for (int j = 0; j < 5; j++) {
+                out << "  " << optionName(j) << " ";
+                if (!(node.legal & (1u << j))) {
+                    out << "-";                      
+                } else if (j == 0) {
+                    out << "0.000000 (exact)";       
+                } else {
+                    out << node.weights[j - 1];
+                }
+            }
+            out << "\n";
+            out << std::setprecision(4);
+            out << "  policy  ";
+            for (int j = 0; j < 5; j++) {
+                out << "  " << optionName(j) << " " << 100.0 * node.probabilities[j] << "%";
+            }
+            out << "\n";
+            out << "  chosen    " << optionName(node.option) << "\n";
+            out << std::setprecision(6);
+            if (node.option == 0) {
+                out << "  return    0.000000 (folding ends the seat's hand at the stack "
+                       "it had here)\n";
+                out << "  update    none, fold has no stored weight\n";
+            } else {
+                out << "  return    stack " << (rewards[node.action] - node.chips)
+                    << " over pot " << node.pot << " = " << node.target << "\n";
+                if (!node.updated) {
+                    out << "  update    none, the phase multiplier is 0\n";
+                } else {
+                    out << "  update    " << optionName(node.option) << " "
+                        << node.before << " -> " << node.after
+                        << "  (change " << (node.after - node.before)
+                        << ", step " << node.scalar << ")\n";
+                }
+            }
+        }
+        worker.tracePath.clear();
+        std::lock_guard<std::mutex> lock(printMutex);
+        std::cout << out.str() << std::flush;
+    }
+
     void updateWeights(Worker& worker, std::array<float, PLAYER_COUNT> rewards, double multiplier) {
-        // Warm up passes zero, making every step a no-op, so that phase produces no
-        // weight write traffic at all.
         if (multiplier != 0.0) {
             for (auto& epochNode : worker.epochPath) {
                 Entry* weights = epochNode.entry;
                 double scalar = multiplier * MIN_DELTA_INC * std::exp(DELTA_SCALAR
                     * weights->delta.load(std::memory_order_relaxed));
-                emaUpdate(weights->weights[epochNode.option - 1],
-                    (rewards[epochNode.action] - epochNode.chips) / epochNode.pot , scalar);
+                float target = (rewards[epochNode.action] - epochNode.chips) / epochNode.pot;
+                auto [before, after] = emaUpdate(
+                    weights->weights[epochNode.option - 1], target, scalar);
+                if constexpr (TRACE_KEY_ENABLED) {
+                    if (epochNode.trace >= 0) {
+                        TraceNode& node = worker.tracePath[epochNode.trace];
+                        node.updated = true;
+                        node.scalar = scalar;
+                        node.target = target;
+                        node.before = before;
+                        node.after = after;
+                    }
+                }
             }
         }
         worker.epochPath.clear();
+        if constexpr (TRACE_KEY_ENABLED) {
+            for (TraceNode& node : worker.tracePath) {
+                if (!node.updated && node.option != 0) {
+                    node.target = (rewards[node.action] - node.chips) / node.pot;
+                }
+            }
+            printTrace(worker, rewards);
+        }
     }
 
-    // Runs at a barrier over a record range owned exclusively by this thread.
-    // Walking the dense array costs time proportional to the states that exist
-    // rather than to the capacity.
     void updateDeltasRange(uint64_t begin, uint64_t end) {
         for (uint64_t i = begin; i < end; i++) {
             Entry& weights = strategy.dense[i];
             uint32_t visits = weights.visits.load(std::memory_order_relaxed);
-            // max(visits, 5) pins the top of the byte at 255; the counter's own
-            // ceiling pins the bottom at 0. The clamp only guards the last bit of
-            // floating point rounding.
-            double alpha = -std::expm1(-std::log(2) / std::max(double(visits), double(VISIT_FLOOR)));
+            double alpha = -std::expm1(-1.0 / std::max(double(visits), double(VISIT_FLOOR)));
             long encoded = std::lround(std::log(alpha * INV_MIN_DELTA_INC) * INV_DELTA_SCALAR);
             weights.delta.store(uint8_t(std::clamp(encoded, 0L, 255L)),
                 std::memory_order_relaxed);
         }
     }
 
-    // Quiesce every thread, rebuild the deltas over disjoint ranges, rearm the
-    // chunk counter, then release everyone.
     void deltaPass(unsigned t, bool keepVisits = false) {
         bar.arrive_and_wait();
         uint64_t live = strategy.count();
@@ -206,8 +330,6 @@ struct Explorer {
         updateWeights(worker, engine.getRewards(), multiplier);
     }
 
-    // One continuous stretch of phaseHands hands, claimed CHUNK_HANDS at a time so
-    // the performance cores simply take more chunks than the efficiency cores.
     void runBlock(Worker& worker, Phase phase, uint64_t blockBase, double invTemp,
                 uint64_t phaseHands) {
         const uint64_t phaseChunks = (phaseHands + CHUNK_HANDS - 1) / CHUNK_HANDS;
@@ -249,19 +371,13 @@ struct Explorer {
     void workerMain(unsigned t) {
         Worker worker(t);
         runBlock(worker, Phase::Warmup, 0, 0.0, WARMUP_HANDS);
-        // The inverse temperature is held for a whole block and steps at the block
-        // boundary, in step with the delta pass that opens it, rising from 0 to its
-        // ceiling of log(65536) across the blocks.
         for (uint64_t block = 0; block < BLOCKS; block++) {
             deltaPass(t);
             runBlock(worker, Phase::Training, block * BLOCK,
-                std::log(65536.0) * double(block) / double(BLOCKS), BLOCK);
+                std::log(MAX_INV_TEMP) * double(block) / double(BLOCKS), BLOCK);
         }
         deltaPass(t);
-        runBlock(worker, Phase::Cooldown, 0, std::log(65536.0), COOLDOWN_HANDS);
-        // A last pass over the cooldown's visit counts, so the states the annealed
-        // strategy no longer reaches are cut before the table is written out. The
-        // counts are held rather than rearmed, since uploadStrategy exports them.
+        runBlock(worker, Phase::Cooldown, 0, std::log(MAX_INV_TEMP), COOLDOWN_HANDS);
         deltaPass(t, true);
     }
 
@@ -273,10 +389,6 @@ struct Explorer {
                 try {
                     workerMain(t);
                 } catch (const std::exception& e) {
-                    // A table overflow trips every worker at once. Taking the print
-                    // lock and exiting while still holding it means exactly one
-                    // legible message instead of ten interleaved ones. Unwinding
-                    // would leave the others deadlocked at the barrier.
                     std::lock_guard<std::mutex> lock(printMutex);
                     std::cerr << "worker " << t << " failed: " << e.what() << std::endl;
                     std::_Exit(1);
@@ -292,39 +404,35 @@ struct Explorer {
         return std::to_string((int)(10000 * PLAYER_COUNT + 10 * CHIP_COUNT
             + 10 * metasBasic + memoryBasic));
     }
-
+    
     void downloadStrategyBase() {
-        std::string path = "solver/strategies/strategyBase_"
+        std::string path = "solver/strategies/strategy_"
             + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC) + ".bin";
         uint64_t bytes = fileSize(path);
         std::ifstream file = openRead(path);
         uint64_t size;
         readExact(file, &size, sizeof(size), path);
-        // Validating the count against the file length also stops a corrupt header
-        // from asking for an absurd allocation.
-        if (bytes != sizeof(uint64_t) + size * 9) {
-            throw std::runtime_error(path + " has an unexpected size");
-        }
         strategyBase.build(size);
-        // Streamed rather than read whole: at full scale the file is 2.3 GB, and
-        // holding it beside the table it fills would double peak memory.
         constexpr uint64_t BATCH = 1ULL << 16;
-        std::vector<char> buffer(BATCH * 9);
+        std::vector<char> buffer(BATCH * STRATEGY_RECORD_BYTES);
         for (uint64_t done = 0; done < size; ) {
             uint64_t take = std::min(BATCH, size - done);
-            readExact(file, buffer.data(), take * 9, path);
+            readExact(file, buffer.data(), take * STRATEGY_RECORD_BYTES, path);
             const char* cursor = buffer.data();
             for (uint64_t i = 0; i < take; i++) {
                 uint64_t key;
+                std::array<float, 4> weights;
                 std::memcpy(&key, cursor, sizeof(key));
-                strategyBase.insert(key, uint8_t(cursor[8]));
-                cursor += 9;
+                std::memcpy(weights.data(), cursor + 8, sizeof(weights));
+                strategyBase.insert(key, weights);
+                cursor += STRATEGY_RECORD_BYTES;
             }
             done += take;
         }
         std::cout << "Strategy base: " << strategyBase.size() << " entries in "
-                  << strategyBase.slots() << " slots ("
-                  << (strategyBase.slots() * 9 / (1024.0 * 1024.0)) << " MB)" << std::endl;
+                  << strategyBase.slotCount() << " slots ("
+                  << (strategyBase.slotCount() * sizeof(BaseEntry) / (1024.0 * 1024.0))
+                  << " MB)" << std::endl;
     }
 
     void uploadStrategy() {
@@ -334,53 +442,16 @@ struct Explorer {
         writeFile.write(&size, sizeof(size));
         for (uint64_t i = 0; i < size; i++) {
             Entry& weights = strategy.dense[i];
-            std::array<double, 4> out;
+            std::array<float, 4> out;
             for (int j = 0; j < 4; j++) {
-                out[j] = std::bit_cast<double>(weights.weights[j].load(std::memory_order_relaxed));
+                out[j] = float(std::bit_cast<double>(
+                    weights.weights[j].load(std::memory_order_relaxed)));
             }
             uint32_t visits = weights.visits.load(std::memory_order_relaxed);
             uint64_t key = weights.key.load(std::memory_order_relaxed);
             writeFile.write(&key, sizeof(key));
             writeFile.write(&out, sizeof(out));
             writeFile.write(&visits, sizeof(visits));
-        }
-        writeFile.commit();
-    }
-
-    void uploadStrategyBase() {
-        CheckedWriter writeFile("solver/strategies/strategyBase_"
-            + spec(METAS_BASIC, MEMORY_BASIC) + ".bin");
-        uint64_t size = strategy.count();
-        writeFile.write(&size, sizeof(size));
-        for (uint64_t i = 0; i < size; i++) {
-            Entry& weights = strategy.dense[i];
-            // Evaluated at the terminal inverse temperature, keeping any option
-            // drawn at least once in 16.
-            const uint8_t legal = weights.options.load(std::memory_order_relaxed);
-            std::array<double, 5> drawWeights = {0};
-            double sum = 0;
-            if (legal & 1u) {
-                drawWeights[0] = 1;
-            }
-            sum += drawWeights[0];
-            for (int j = 1; j < 5; j++) {
-                if (legal & (1u << j)) {
-                    double w = std::bit_cast<double>(
-                        weights.weights[j - 1].load(std::memory_order_relaxed));
-                    drawWeights[j] = std::exp(
-                        std::clamp(std::log(65536) * w, -MAX_EXP_ARG, MAX_EXP_ARG));
-                }
-                sum += drawWeights[j];
-            }
-            uint8_t options = 0;
-            for (int j = 0; j < 5; j++) {
-                if (16 * drawWeights[j] / sum >= 1.0) {
-                    options |= uint8_t(1u << j);
-                }
-            }
-            uint64_t key = weights.key.load(std::memory_order_relaxed);
-            writeFile.write(&key, sizeof(key));
-            writeFile.write(&options, sizeof(options));
         }
         writeFile.commit();
     }
@@ -398,9 +469,9 @@ struct Explorer {
 
 int main () {
     try {
-        MIN_DELTA_INC = -std::expm1(-std::log(2) / 4294967295.0);
+        MIN_DELTA_INC = -std::expm1(-1.0 / 4294967295.0);
         INV_MIN_DELTA_INC = 1.0 / MIN_DELTA_INC;
-        const double maxAlpha = -std::expm1(-std::log(2) / 5.0);
+        const double maxAlpha = -std::expm1(-1.0 / 5.0);
         DELTA_SCALAR = std::log(maxAlpha * INV_MIN_DELTA_INC) / 255.0;
         INV_DELTA_SCALAR = 1.0 / DELTA_SCALAR;
 
@@ -413,8 +484,6 @@ int main () {
         }
         std::cout << "Threads: " << threads << std::endl;
 
-        // Loaded before any worker exists so the I/O is not serialised behind a
-        // std::call_once wait.
         Engine::loadTables();
 
         Explorer explorer(threads);
@@ -424,7 +493,6 @@ int main () {
         explorer.run();
         explorer.printSize();
         explorer.uploadStrategy();
-        explorer.uploadStrategyBase();
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "fatal: " << e.what() << std::endl;

@@ -100,24 +100,26 @@ struct HandClusterer {
                 straightOneDraws[i] = 0;
             }
         }
-        if (straightFillCount < 1) {
-            if (straightDrawCount < 2) {
+        if (flopClassification[0] > 1) {
+            if (straightFillCount < 2) {
                 straightState = 0;
             } else {
-                straightState = 1;
+                straightState = 3;
             }
-            if (flopClassification[0] > 1) {
-                straightState = 0;
-            }
-        } else if (straightFillCount < 2) {
-            straightState = 2;
-            if (flopClassification[0] > 1) {
-                straightState = 0;
-            }
-        } else if (straightFillCount < 3) {
-            straightState = 3;
         } else {
-            straightState = 4;
+            if (straightFillCount < 1) {
+                if (straightDrawCount < 2) {
+                    straightState = 0;
+                } else {
+                    straightState = 1;
+                }
+            } else if (straightFillCount < 2) {
+                straightState = 2;
+            } else if (straightFillCount < 3) {
+                straightState = 3;
+            } else {
+                straightState = 4;
+            }
         }
         flopClassification[classIndex++] = straightState;
         
@@ -173,7 +175,7 @@ struct HandClusterer {
     }    
 
     uint32_t classifyTurn(const std::array<int, 5>& boardCards) {
-        std::array<int, 8> turnClassification;
+        std::array<int, 9> turnClassification;
         int classIndex = 0;
 
         for (int i = 3; i < 4; i++) {
@@ -238,43 +240,79 @@ struct HandClusterer {
                 straightOneCompleteCount++;
             }
         }
-        if (straightOneFillCount < 1) {
-            if (straightFillCount < 1) {
+        if (turnClassification[0] > 2) {
+            if (straightOneFillCount < 1) {
                 straightState = 0;
-            } else if (straightFillCount < 2) {
-                if (straightCompleteCount < 1) {
-                    straightState = 1;
-                } else {
-                    straightState = 2;
-                }
-                if (turnClassification[0] > 1) {
-                    straightState = 0;
-                }
-            } else if (straightFillCount < 3) {
-                straightState = 3;
             } else {
-                straightState = 4;
-            }
-            if (turnClassification[0] > 2) {
-                straightState = 0;
-            }
-        } else {
-            if (straightOneFillCount < 2) {
-                if (straightOneCompleteCount < 1) {
+                if (straightOneFillCount < 2) {
                     straightState = 5;
                 } else {
-                    straightState = 6;
+                    straightState = 7;
+                }
+            } 
+        } else if (turnClassification[0] > 1) {
+            if (straightOneFillCount < 1) {
+                if (straightFillCount < 1) {
+                    straightState = 0;
+                } else if (straightFillCount < 2) {
+                    if (straightCompleteCount < 1) {
+                        straightState = 1;
+                    } else {
+                        straightState = 2;
+                    }
+                } else {
+                    straightState = 3;
                 }
             } else {
-                straightState = 7;
-            }
-        } 
+                if (straightOneFillCount < 2) {
+                    if (straightOneCompleteCount < 1) {
+                        straightState = 5;
+                    } else {
+                        straightState = 6;
+                    }
+                } else {
+                    straightState = 7;
+                }
+            } 
+        } else {
+            if (straightOneFillCount < 1) {
+                if (straightFillCount < 1) {
+                    straightState = 0;
+                } else if (straightFillCount < 2) {
+                    if (straightCompleteCount < 1) {
+                        straightState = 1;
+                    } else {
+                        straightState = 2;
+                    }
+                } else if (straightFillCount < 3) {
+                    straightState = 3;
+                } else {
+                    straightState = 4;
+                }
+            } else {
+                if (straightOneFillCount < 2) {
+                    if (straightOneCompleteCount < 1) {
+                        straightState = 5;
+                    } else {
+                        straightState = 6;
+                    }
+                } else {
+                    straightState = 7;
+                }
+            } 
+        }
         turnClassification[classIndex++] = straightState;
         
         int highCard = 0;
         for (int i = 0; i < 13; i++) {
             if (cardRanks[i] > 0) {
                 highCard = i;
+                if (boardCards[0] / 4 > highCard && boardCards[1] / 4 > highCard 
+                    && boardCards[2] / 4 > highCard) {
+                    turnClassification[classIndex++] = 1;
+                } else {
+                    turnClassification[classIndex++] = 0;
+                }
                 turnClassification[classIndex++] = cardRankBuckets[i];
                 break;
             }
@@ -314,17 +352,18 @@ struct HandClusterer {
         uint32_t key = 0;
         key = 4 * key + turnClassification[0];
         key = 8 * key + turnClassification[1];
-        key = 4 * key + turnClassification[2];
+        key = 2 * key + turnClassification[2];
         key = 4 * key + turnClassification[3];
         key = 4 * key + turnClassification[4];
         key = 4 * key + turnClassification[5];
         key = 4 * key + turnClassification[6];
         key = 4 * key + turnClassification[7];
+        key = 4 * key + turnClassification[8];
         return key + 1;
     }     
 
     uint32_t classifyRiver(const std::array<int, 5>& boardCards) {
-        std::array<int, 9> riverClassification;
+        std::array<int, 10> riverClassification;
         int classIndex = 0;
 
         bool backdoorFlush = false;
@@ -447,47 +486,88 @@ struct HandClusterer {
                 straightOneCompleteCount++;
             }
         }
-        if (straightZeroFillCount < 1) {
-            if (straightOneFillCount < 1) {
-                if (straightFillCount < 1) {
+        if (riverClassification[0] == 4) {
+            if (straightZeroFillCount < 1) {
+                if (straightOneFillCount < 1) {
                     straightState = 0;
-                } else if (straightFillCount < 2) {
-                    if (straightCompleteCount < 1) {
-                        straightState = 1;
-                    } else {
-                        straightState = 2;
-                    }
-                    if (riverClassification[0] > 1 && riverClassification[0] != 5) {
-                        straightState = 0;
-                    }
-                } else if (straightFillCount < 3) {
-                    straightState = 3;
                 } else {
-                    straightState = 4;
-                }
-                if (riverClassification[0] > 2 && riverClassification[0] != 5) {
-                    straightState = 0;
-                }
+                    straightState = 5;
+                } 
             } else {
-                if (straightOneFillCount < 2) {
-                    if (straightOneCompleteCount < 1) {
-                        straightState = 5;
-                    } else {
-                        straightState = 6;
-                    }
+                straightState = 8;
+            }
+        } else if (riverClassification[0] > 2 && riverClassification[0] != 5) {
+            if (straightZeroFillCount < 1) {
+                if (straightOneFillCount < 1) {
+                    straightState = 0;
+                } else if (straightOneFillCount < 2) {
+                    straightState = 5;
                 } else {
                     straightState = 7;
                 }
-            } 
-        } else {
-            if (straightOneCompleteCount < 1) {
-                straightState = 8;
             } else {
-                straightState = 9;
+                straightState = 8;
             }
-        }
-        if (riverClassification[0] == 4) {
-            straightState = 0;
+        } else if (riverClassification[0] > 1 && riverClassification[0] != 5) {
+            if (straightZeroFillCount < 1) {
+                if (straightOneFillCount < 1) {
+                    if (straightFillCount < 2) {
+                        straightState = 0;
+                    } else {
+                        straightState = 3;
+                    }
+                } else {
+                    if (straightOneFillCount < 2) {
+                        if (straightOneCompleteCount < 1) {
+                            straightState = 5;
+                        } else {
+                            straightState = 6;
+                        }
+                    } else {
+                        straightState = 7;
+                    }
+                } 
+            } else {
+                if (straightOneCompleteCount < 1) {
+                    straightState = 8;
+                } else {
+                    straightState = 9;
+                }
+            }
+        } else {
+            if (straightZeroFillCount < 1) {
+                if (straightOneFillCount < 1) {
+                    if (straightFillCount < 1) {
+                        straightState = 0;
+                    } else if (straightFillCount < 2) {
+                        if (straightCompleteCount < 1) {
+                            straightState = 1;
+                        } else {
+                            straightState = 2;
+                        }
+                    } else if (straightFillCount < 3) {
+                        straightState = 3;
+                    } else {
+                        straightState = 4;
+                    }
+                } else {
+                    if (straightOneFillCount < 2) {
+                        if (straightOneCompleteCount < 1) {
+                            straightState = 5;
+                        } else {
+                            straightState = 6;
+                        }
+                    } else {
+                        straightState = 7;
+                    }
+                } 
+            } else {
+                if (straightOneCompleteCount < 1) {
+                    straightState = 8;
+                } else {
+                    straightState = 9;
+                }
+            }
         }
         riverClassification[classIndex++] = straightState;
         
@@ -495,6 +575,12 @@ struct HandClusterer {
         for (int i = 0; i < 13; i++) {
             if (cardRanks[i] > 0) {
                 highCard = i;
+                if (boardCards[0] / 4 > highCard && boardCards[1] / 4 > highCard 
+                    && boardCards[2] / 4 > highCard && boardCards[3] / 4 > highCard) {
+                    riverClassification[classIndex++] = 1;
+                } else {
+                    riverClassification[classIndex++] = 0;
+                }
                 riverClassification[classIndex++] = cardRankBuckets[i];
                 break;
             }
@@ -543,12 +629,13 @@ struct HandClusterer {
         key = 6 * key + riverClassification[0];
         key = 4 * key + riverClassification[1];
         key = 10 * key + riverClassification[2];
-        key = 4 * key + riverClassification[3];
+        key = 2 * key + riverClassification[3];
         key = 4 * key + riverClassification[4];
         key = 4 * key + riverClassification[5];
         key = 4 * key + riverClassification[6];
         key = 4 * key + riverClassification[7];
         key = 4 * key + riverClassification[8];
+        key = 4 * key + riverClassification[9];
         return key + 1;
     }   
 

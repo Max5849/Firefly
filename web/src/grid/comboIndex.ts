@@ -40,3 +40,24 @@ export function comboName(a: number, b: number): string {
   const j = Math.max(a, b);
   return cardName(i) + cardName(j);
 }
+
+/** combo index -> its two cards, stronger first. Built once. */
+export const COMBO_CARDS: [number, number][] = (() => {
+  const table = new Array<[number, number]>(1326);
+  for (let i = 0; i < 52; i++) {
+    for (let j = i + 1; j < 52; j++) {
+      table[comboIndex(i, j)] = [i, j];
+    }
+  }
+  return table;
+})();
+
+/** Counts of each suit on the board, indexed by suit 0..3 (c d h s). */
+export function boardSuitCounts(board: string): number[] {
+  const counts = [0, 0, 0, 0];
+  for (let i = 0; i + 1 < board.length; i += 2) {
+    const suit = WIRE_SUITS.indexOf(board[i + 1].toLowerCase());
+    if (suit >= 0) counts[suit]++;
+  }
+  return counts;
+}

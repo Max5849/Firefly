@@ -145,19 +145,9 @@ struct Engine {
         std::iota(deck.begin(), deck.end(), 0);
     }
 
-    // Loads the shared read-only tables exactly once, even if several Engines
-    // are constructed concurrently. Call explicitly from main() before spawning
-    // workers so the file I/O is not serialised behind a std::call_once wait.
-    // withHandScores is false only for read-only consumers that never reach
-    // showdown, such as server/. It skips a 535 MB table nothing else would touch.
-    // The once_flag means the first caller decides, so a process must not mix the
-    // two: the solver always passes true, the server always passes false.
     static void loadTables(bool withHandScores = true) {
         static std::once_flag loadFlag;
         std::call_once(loadFlag, [withHandScores] {
-            // Each table has an exact expected size. Checking it up front turns a
-            // missing or truncated file into an immediate error instead of a
-            // silently zeroed table.
             if (withHandScores) {
                 const std::string handScorePath = "solver/handAnalysis/handScores.bin";
                 handScoreTable.resize(133784560);
@@ -178,10 +168,6 @@ struct Engine {
             std::ifstream boardClassFile = openRead(boardClassPath);
             readExact(boardClassFile, boardClassTable.data(), boardClassBytes, boardClassPath);
 
-            // getState() masks (boardClass + 169 + round) into the 15 bits at
-            // shift 10. If a board class ever grew past that, the mask would
-            // silently alias unrelated boards onto the same state key, so check
-            // the data rather than trusting it.
             uint32_t maxBoardClass = *std::max_element(boardClassTable.begin(), boardClassTable.end());
             if (maxBoardClass + 169 + 3 >= 0x7FFF) {
                 throw std::runtime_error("board class overflows the 15-bit key field");
@@ -192,8 +178,6 @@ struct Engine {
         });
     }
 
-    // Each record is an 8 byte key followed by a 1 byte value, preceded by a
-    // count. Parsed from memory rather than with millions of small stream reads.
     static void loadHandMetas(const std::string& path,
             ankerl::unordered_dense::map<uint64_t, uint8_t>& out) {
         std::vector<char> data = readWholeFile(path);
@@ -215,7 +199,6 @@ struct Engine {
         }
     }
 
-    // The distribution is a member so it is built once rather than per swap.
     std::uniform_int_distribution<int> cardDist;
 
     void shuffle(std::mt19937& gen) {
@@ -269,7 +252,9 @@ struct Engine {
         Player& villan = players[player.villanPosition];
         uint64_t state = 0;
         int shift = 0;
-        state |= uint64_t(roundHeadsBasic & 0x3) << shift;
+        if (!memoryBasic) {
+            state |= uint64_t(roundHeadsBasic & 0x3) << shift;
+        }
         shift += 2;
         state |= uint64_t(headsBasic & 0x3) << shift;
         shift += 2;
@@ -284,40 +269,64 @@ struct Engine {
         shift += 2;
         player.spr = float(player.chips - (bet - player.bet)) / (pot + (bet - player.bet));
         player.cpr = float(bet - player.bet) / (pot - (bet - player.bet));
-        if (player.spr < 0.01f) {
-            if (player.cpr < 0.289f) {
-                state |= uint64_t(9 & 0xF) << shift;
-            } else if (player.cpr < 0.5f) {
-                state |= uint64_t(10 & 0xF) << shift;
-            } else if (player.cpr < 0.866f) {
-                state |= uint64_t(11 & 0xF) << shift;
-            } else if (player.cpr < 1.5f) {
-                state |= uint64_t(12 & 0xF) << shift;
-            } else if (player.cpr < 2.6f) {
-                state |= uint64_t(13 & 0xF) << shift;
-            } else if (player.cpr < 4.5f) {
-                state |= uint64_t(14 & 0xF) << shift;
+        if (!memoryBasic) {
+            if (player.spr < 0.01f) {
+                if (player.cpr < 0.289f) {
+                    state |= uint64_t(9 & 0xF) << shift;
+                } else if (player.cpr < 0.5f) {
+                    state |= uint64_t(10 & 0xF) << shift;
+                } else if (player.cpr < 0.866f) {
+                    state |= uint64_t(11 & 0xF) << shift;
+                } else if (player.cpr < 1.5f) {
+                    state |= uint64_t(12 & 0xF) << shift;
+                } else if (player.cpr < 2.6f) {
+                    state |= uint64_t(13 & 0xF) << shift;
+                } else if (player.cpr < 4.5f) {
+                    state |= uint64_t(14 & 0xF) << shift;
+                } else {
+                    state |= uint64_t(15 & 0xF) << shift;
+                } 
+            } else if (player.spr < 0.289f) {
+                state |= uint64_t(0 & 0xF) << shift;
+            } else if (player.spr < 0.5f) {
+                state |= uint64_t(1 & 0xF) << shift;
+            } else if (player.spr < 0.866f) {
+                state |= uint64_t(2 & 0xF) << shift;
+            } else if (player.spr < 1.5f) {
+                state |= uint64_t(3 & 0xF) << shift;
+            } else if (player.spr < 2.6f) {
+                state |= uint64_t(4 & 0xF) << shift;
+            } else if (player.spr < 4.5f) {
+                state |= uint64_t(5 & 0xF) << shift;
+            } else if (player.spr < 7.8f) {
+                state |= uint64_t(6 & 0xF) << shift;
+            } else if (player.spr < 13.5f) {
+                state |= uint64_t(7 & 0xF) << shift;
             } else {
-                state |= uint64_t(15 & 0xF) << shift;
-            } 
-        } else if (player.spr < 0.289f) {
-            state |= uint64_t(0 & 0xF) << shift;
-        } else if (player.spr < 0.5f) {
-            state |= uint64_t(1 & 0xF) << shift;
-        } else if (player.spr < 0.866f) {
-            state |= uint64_t(2 & 0xF) << shift;
-        } else if (player.spr < 1.5f) {
-            state |= uint64_t(3 & 0xF) << shift;
-        } else if (player.spr < 2.6f) {
-            state |= uint64_t(4 & 0xF) << shift;
-        } else if (player.spr < 4.5f) {
-            state |= uint64_t(5 & 0xF) << shift;
-        } else if (player.spr < 7.8f) {
-            state |= uint64_t(6 & 0xF) << shift;
-        } else if (player.spr < 13.5f) {
-            state |= uint64_t(7 & 0xF) << shift;
+                state |= uint64_t(8 & 0xF) << shift;
+            }
         } else {
-            state |= uint64_t(8 & 0xF) << shift;
+            if (player.spr < 0.01f) {
+                if (player.cpr < 0.289f) {
+                    state |= uint64_t(9 & 0xF) << shift;
+                } else if (player.cpr < 0.866f) {
+                    state |= uint64_t(11 & 0xF) << shift;
+                } else if (player.cpr < 2.6f) {
+                    state |= uint64_t(13 & 0xF) << shift;
+                } else {
+                    state |= uint64_t(15 & 0xF) << shift;
+                } 
+            } else if (player.spr < 0.289f) {
+                state |= uint64_t(0 & 0xF) << shift;
+            } else if (player.spr < 0.866f) {
+                state |= uint64_t(2 & 0xF) << shift;
+            } else if (player.spr < 2.6f) {
+                state |= uint64_t(4 & 0xF) << shift;
+            } else if (player.spr < 7.8f) {
+                state |= uint64_t(6 & 0xF) << shift;
+            } else {
+                state |= uint64_t(8 & 0xF) << shift;
+            }
         }
         shift += 4;
         if (!metasBasic) {
@@ -348,15 +357,21 @@ struct Engine {
             state |= uint64_t(villan.lastActions[i] & 0x1) << (shift + i);
         }
         shift += 4;
-        state |= uint64_t((round < 2 || !memoryBasic ? player.positionBasic : 0) & 0x7) << shift;
+        if (round < 1 || (!memoryBasic && round < 2)) {
+            state |= uint64_t(player.positionBasic & 0x7) << shift;
+        }
         shift += 3;
-        state |= uint64_t((round < 2 || !memoryBasic ? villan.positionBasic : 0) & 0x7) << shift;
+        if (round < 1 || (!memoryBasic && round < 2)) {
+            state |= uint64_t(villan.positionBasic & 0x7) << shift;
+        }
         shift += 3;
         state |= uint64_t((raiseSize > 0) & 0x1) << shift;
         state |= uint64_t(std::min(raiseStrength, uint8_t(3)) & 0x3) << (shift + 1);
         shift += 3;
-        state |= uint64_t((hiddenRaiseSize > 0) & 0x1) << shift;
-        state |= uint64_t(std::min(hiddenRaiseStrength, uint8_t(3)) & 0x3) << (shift + 1);
+        if (!memoryBasic) {
+            state |= uint64_t((hiddenRaiseSize > 0) & 0x1) << shift;
+            state |= uint64_t(std::min(hiddenRaiseStrength, uint8_t(3)) & 0x3) << (shift + 1);
+        }
         shift += 3;
         state |= uint64_t(std::min(player.raisesFaced, uint8_t(3)) & 0x3) << shift;
         shift += 2;
@@ -364,12 +379,14 @@ struct Engine {
         shift += 1;
         state |= uint64_t((player.calls > 1) & 0x1) << shift;
         shift += 1;
-        if (calls < 2) {
-            state |= uint64_t(calls & 0x3) << shift;
-        } else if (calls < 4) {
-            state |= uint64_t(2 & 0x3) << shift;
-        } else {
-            state |= uint64_t(3 & 0x3) << shift;
+        if (!memoryBasic) {
+            if (calls < 2) {
+                state |= uint64_t(calls & 0x3) << shift;
+            } else if (calls < 4) {
+                state |= uint64_t(2 & 0x3) << shift;
+            } else {
+                state |= uint64_t(3 & 0x3) << shift;
+            }
         }
         shift += 2;
         return state;
@@ -396,7 +413,7 @@ struct Engine {
                     options[2] = true;
                 }
             }
-            if (raiseHistory[0] == 0 || player.raisesFaced > 1 || (player.calls > 1)
+            if (raiseHistory[0] == 0 || player.raisesFaced > 1 || player.calls > 1
                 || (calls > 1 && (raiseHistory[0] > 1 || round != 0))) {
                 options[1] = false;
             }

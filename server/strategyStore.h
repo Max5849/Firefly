@@ -14,20 +14,23 @@
 // weight for option 0, because folding's pot normalised return is analytically
 // exactly zero.
 //
-// The file packs these at 44 bytes with no padding, so records after the first
-// are not 8 byte aligned. Never point a StrategyRecord* into the mapping; copy
-// the fields out with memcpy.
+// The solver holds the weights as doubles while it trains and narrows them to
+// float on the way out, so the file is float and nothing here needs more.
+//
+// The file packs these at STRATEGY_RECORD_BYTES with no padding, so records after
+// the first are not 8 byte aligned. Never point a StrategyRecord* into the
+// mapping; copy the fields out with memcpy.
 struct StrategyRecord {
     uint64_t key;
-    std::array<double, 4> weights;
+    std::array<float, 4> weights;
     uint32_t visits;
 };
 
-inline constexpr uint64_t STRATEGY_RECORD_BYTES = 44;
-inline constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
+// STRATEGY_RECORD_BYTES and STRATEGY_HEADER_BYTES come from solver/config.h, so
+// the writer and every reader move together.
 
 // The index is a sidecar rather than a rewrite of the strategy file, so the
-// 477 MB the solver wrote is mapped and never copied.
+// hundreds of megabytes the solver wrote are mapped and never copied.
 struct StrategyIndexHeader {
     char magic[8];
     uint64_t records;
@@ -75,10 +78,11 @@ inline std::string defaultIndexPath() {
     return "solver/strategies/strategy_" + fireflySpec() + ".idx";
 }
 
-// Validates strategy_<spec>.bin against the current 44 byte record format and
-// returns its record count. The pre-visits 40 byte and legacy 56/64 byte layouts
-// decode into plausible looking nonsense rather than failing, so this check is
-// the only thing standing between a stale file and silently wrong answers.
+// Validates strategy_<spec>.bin against the current 28 byte record format and
+// returns its record count. The 44 byte double layout, the pre-visits 40 byte one
+// and the legacy 56/64 byte ones all decode into plausible looking nonsense rather
+// than failing, so this check is the only thing standing between a stale file and
+// silently wrong answers.
 inline uint64_t strategyRecordCount(const std::string& path) {
     uint64_t bytes = fileSize(path);
     if (bytes < STRATEGY_HEADER_BYTES) {
@@ -91,7 +95,8 @@ inline uint64_t strategyRecordCount(const std::string& path) {
         throw std::runtime_error(path + " declares zero records");
     }
     if (bytes != STRATEGY_HEADER_BYTES + records * STRATEGY_RECORD_BYTES) {
-        throw std::runtime_error(path + " is not in the 44 byte record format: "
+        throw std::runtime_error(path + " is not in the "
+            + std::to_string(STRATEGY_RECORD_BYTES) + " byte record format: "
             + std::to_string(records) + " records declared but "
             + std::to_string(bytes) + " bytes on disk. Regenerate it from a run of "
             "the current solver.");
@@ -192,8 +197,8 @@ struct StrategyStore {
         const uint8_t* cursor = strategyMap.data + STRATEGY_HEADER_BYTES
             + index * STRATEGY_RECORD_BYTES;
         std::memcpy(&out.key, cursor, sizeof(out.key));
-        std::memcpy(out.weights.data(), cursor + 8, sizeof(double) * 4);
-        std::memcpy(&out.visits, cursor + 40, sizeof(out.visits));
+        std::memcpy(out.weights.data(), cursor + 8, sizeof(float) * 4);
+        std::memcpy(&out.visits, cursor + 24, sizeof(out.visits));
     }
 
     // The 32 bit tag in the slot resolves almost every miss without touching the

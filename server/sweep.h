@@ -187,7 +187,11 @@ inline SweepResult sweep(Engine& engine, const std::vector<int>& board,
             }
             if (store.lookup(row.key, record)) {
                 row.found = true;
-                row.weights = record.weights;
+                // Stored as float, widened here so the softmax below and the JSON
+                // it feeds stay in double.
+                for (int j = 0; j < 4; j++) {
+                    row.weights[j] = double(record.weights[j]);
+                }
                 row.nodeVisits = record.visits;
                 if (fields.frequencies) {
                     computeFrequencies(row.weights, result.legal, invTemp,

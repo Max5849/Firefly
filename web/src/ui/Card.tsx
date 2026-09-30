@@ -15,12 +15,12 @@ export function Card({ text }: { text: string }) {
 
   return (
     <span
-      className="inline-flex h-7 w-6 flex-col items-center justify-center rounded-[2px] leading-none"
+      className="inline-flex h-9 w-7 flex-col items-center justify-center rounded-[3px] leading-none"
       style={{ background: TILE[suit] ?? 'var(--color-ash)', color: 'var(--color-void)' }}
       aria-label={`${rank}${pip}`}
     >
-      <span className="text-[11px] font-semibold">{rank}</span>
-      <span className="text-[10px]">{pip}</span>
+      <span className="text-[13px] font-semibold">{rank}</span>
+      <span className="text-[12px]">{pip}</span>
     </span>
   );
 }
@@ -41,7 +41,7 @@ export function CardRow({ board, slots = 0 }: { board: string; slots?: number })
       {Array.from({ length: empty }, (_, i) => (
         <span
           key={`slot-${i}`}
-          className="inline-block h-7 w-6 rounded-[2px] border border-dashed"
+          className="inline-block h-9 w-7 rounded-[3px] border border-dashed"
           style={{ borderColor: 'var(--color-rule)' }}
         />
       ))}

@@ -6,7 +6,11 @@ export type CellKind = 'pair' | 'suited' | 'offsuit';
 export interface Cell {
   label: string;
   kind: CellKind;
-  /** Wire indices into combos[], already in left-to-right display order. */
+  /**
+   * Wire indices into combos[], as one row of columns. The order here is only a
+   * canonical starting set - display order depends on the board and on which
+   * combinations are eliminated, so it is computed per node by orderCell().
+   */
   strips: number[];
 }
 

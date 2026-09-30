@@ -143,7 +143,8 @@ cards `i < j`, carrying only the requested fields:
 - A `null` row is a combination that clashes with the board.
 - `"found": false` means the state is absent from the table — see below. `found` is
   emitted whenever a record-backed field was requested.
-- `weights` holds four numbers for options 1 to 4. There is no weight for folding
+- `weights` holds four numbers for options 1 to 4, stored as `float` and widened
+  to double here. There is no weight for folding
   because its pot-normalised return is analytically exactly 0, and that zero is
   the reference every other weight is measured against. Illegal options are
   `null`.
@@ -225,11 +226,10 @@ diffing against an independent reader of `strategy_<spec>.bin`.
 from the repository root:
 
 - `solver/handAnalysis/boardClasses.bin`, `handMetas.bin`, `handMetasBasic.bin` (178 MB)
-- `solver/strategies/strategy_<spec>.bin` (477 MB)
+- `solver/strategies/strategy_<spec>.bin` (8 + 28 bytes per record)
 
 **Not** `handScores.bin` (535 MB): only `showdown()` reads it and the API never
 reaches showdown, which is why `server.cpp` calls `Engine::loadTables(false)`.
-Not `strategyBase_<spec>.bin` either — nothing here reads it.
 
 Then run `indexBuilder`, install `deploy/firefly-api.service` and
 `deploy/nginx.conf`, and open 443 in the Oracle security list *and* in the VM's

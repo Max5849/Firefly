@@ -1,28 +1,29 @@
 @import 'tailwindcss';
 
 @theme {
-  /* Ground and structure. --void doubles as the hairline between grid cells, so
-     the mosaic is separated by page showing through rather than by a border. */
+  /* Ground and structure. --void doubles as the wall between grid cells, so the
+     mosaic is separated by page showing through rather than by a border. */
   --color-void: #0a0b0d;
   --color-slate: #14161a;
-  --color-rule: #21252b;
-  --color-chalk: #e4e7eb;
-  --color-ash: #6b737d;
+  --color-rule: #262b32;
+  --color-chalk: #f2f5f8;
+  --color-ash: #7e8792;
 
-  /* Action colours. Pink and red are separated by lightness, not hue - at the low
-     opacities that low-visit combos render at, two mid-tone hues are identical. */
-  --color-act-fold: #2563eb;
-  --color-act-call: #16a34a;
-  --color-act-small: #f472b6;
-  --color-act-big: #dc2626;
-  --color-act-shove: #9333ea;
+  /* Action colours, at full strength - shading by visits is gone, so nothing
+     dilutes these any more and they carry the whole read. Pink and red still
+     differ in lightness as well as hue so they never collapse into each other. */
+  --color-act-fold: #3b82f6;
+  --color-act-call: #22c55e;
+  --color-act-small: #ff6fb5;
+  --color-act-big: #f43f3f;
+  --color-act-shove: #b558f6;
 
   /* Suit tiles: saturated fill, near-black ink. Spades take the achromatic tile,
      which is what makes them read as the black suit on a dark ground. */
-  --color-suit-c: #3f9e5a;
-  --color-suit-d: #3b82f6;
-  --color-suit-h: #dc2626;
-  --color-suit-s: #c8cdd3;
+  --color-suit-c: #34d058;
+  --color-suit-d: #4c9aff;
+  --color-suit-h: #ff4d4d;
+  --color-suit-s: #e8edf2;
 
   --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   --font-display: 'Archivo', ui-sans-serif, system-ui, sans-serif;
