@@ -55,9 +55,9 @@ struct Dealer {
             }
         }
         for (int i = 0; i < 991; i++) {
-            handRankBuckets[i] = i / 9;
+            handRankBuckets[i] = i / 6;
         }
-        handRankBuckets[990] = 109;
+        handRankBuckets[990] = 164;
     }  
 
     bool flopGen() {
