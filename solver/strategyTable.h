@@ -10,18 +10,40 @@ inline void cpuRelax() {
 #endif
 }
 
+// stats packs the node's visits, step size and legal options into one word:
+//   bits 0-39   visits in 1/256 units, saturating at 2^40 - 1 (UINT32_MAX whole visits)
+//   bits 40-55  delta, the log-encoded step size
+//   bits 56-63  options, the legal-option mask
+// Visits are added with a CAS so the fractional carry is atomic. delta and options
+// change only at insert, before publish, or at the delta pass barrier.
 struct Entry {
     std::atomic<uint64_t> key;
     std::array<std::atomic<uint64_t>, 4> weights;
-    std::atomic<uint32_t> visits;
-    std::atomic<uint8_t> delta;
-    std::atomic<uint8_t> options;
+    std::atomic<uint64_t> stats;
 };
 static_assert(sizeof(Entry) == 48, "Entry must stay packed at 48 bytes");
 
-inline constexpr uint32_t VISIT_FLOOR = 5;
+inline constexpr uint64_t VISITS_MASK = (1ULL << 40) - 1;
+inline constexpr uint64_t DELTA_MASK = 0xFFFFULL << 40;
 
-inline constexpr uint32_t VISITS_MAX = 0xFFFFFFFFu;
+inline uint32_t entryVisits(uint64_t stats) { return uint32_t((stats & VISITS_MASK) >> 8); }
+inline uint16_t entryDelta(uint64_t stats) { return uint16_t(stats >> 40); }
+inline uint8_t entryOptions(uint64_t stats) { return uint8_t(stats >> 56); }
+
+inline uint64_t makeStats(uint8_t options, uint16_t delta) {
+    return (uint64_t(options) << 56) | (uint64_t(delta) << 40);
+}
+
+// Adds add / 256 visits, saturating rather than wrapping into delta.
+inline void addVisits(Entry& entry, uint64_t add) {
+    uint64_t old = entry.stats.load(std::memory_order_relaxed);
+    uint64_t next;
+    do {
+        uint64_t visits = std::min((old & VISITS_MASK) + add, VISITS_MASK);
+        next = (old & ~VISITS_MASK) | visits;
+    } while (!entry.stats.compare_exchange_weak(old, next,
+        std::memory_order_relaxed, std::memory_order_relaxed));
+}
 
 struct StrategyTable {
     static constexpr uint64_t CAP = 1ULL << STRATEGY_CAP_LOG2;
@@ -112,8 +134,7 @@ struct StrategyTable {
             dst.weights[j].store(src.weights[j].load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
         }
-        dst.delta.store(src.delta.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        dst.options.store(src.options.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dst.stats.store(src.stats.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
 
     uint64_t compact(bool keepVisits = false) {
@@ -121,14 +142,15 @@ struct StrategyTable {
         uint64_t kept = 0;
         for (uint64_t i = 0; i < n; i++) {
             Entry& entry = dense[i];
-            uint32_t visits = entry.visits.load(std::memory_order_relaxed);
-            if (visits < VISIT_FLOOR) {
+            uint64_t stats = entry.stats.load(std::memory_order_relaxed);
+            if (entryVisits(stats) < VISITS_FLOOR) {
                 continue;
             }
             if (kept != i) {
                 copyRecord(dense[kept], entry);
             }
-            dense[kept].visits.store(keepVisits ? visits : 0, std::memory_order_relaxed);
+            dense[kept].stats.store(keepVisits ? stats : stats & ~VISITS_MASK,
+                std::memory_order_relaxed);
             kept++;
         }
         used.store(kept, std::memory_order_relaxed);

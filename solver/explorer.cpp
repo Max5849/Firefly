@@ -2,69 +2,44 @@
 #include "solver/engine.h"
 #include "solver/strategyTable.h"
 #include "solver/baseTable.h"
+#include "solver/trace.h"
 
 double MIN_DELTA_INC;
 double DELTA_SCALAR;
 double INV_MIN_DELTA_INC;
 double INV_DELTA_SCALAR;
 
-static inline std::pair<double, double> emaUpdate(std::atomic<uint64_t>& word,
-            float target, double scalar) {
+// Applies w <- scale * w + shift atomically. A run of EMA steps w <- w + s (t - w)
+// composes into one such map, so a node's steps from one decision land in one CAS.
+static inline std::pair<double, double> affineUpdate(std::atomic<uint64_t>& word,
+            double scale, double shift) {
     uint64_t old = word.load(std::memory_order_relaxed);
     uint64_t next;
     double value;
     do {
         value = std::bit_cast<double>(old);
-        float delta = target - value;
-        next = std::bit_cast<uint64_t>(value + scalar * delta);
+        next = std::bit_cast<uint64_t>(scale * value + shift);
     } while (!word.compare_exchange_weak(old, next,
         std::memory_order_relaxed, std::memory_order_relaxed));
     return {value, std::bit_cast<double>(next)};
 }
 
-static inline const char* optionName(int option) {
-    switch (option) {
-        case 0:  return "fold";
-        case 1:  return "call/check";
-        case 2:  return "raise 0.5x pot";
-        case 3:  return "raise 1.5x pot";
-        default: return "all in";
-    }
-}
+// A combo's node within a decision; see Engine::getGroup. NO_GROUP marks a combo that
+// was out of the range.
+inline constexpr int GROUP_COUNT = 256;
+inline constexpr uint8_t NO_GROUP = 0xFF;
 
-// One decision of the hand. Every combo of the acting seat that was still in its
-// range was looked up individually; entries holds the node each one reached, or
-// nullptr for a combo that was out of the range.
+// One decision of the hand. Every combo of the acting seat still in its range was
+// assigned to the node its key names; each node was looked up once.
 struct RangeDecision {
     int seat;
     int option;
     float chips;
     float pot;
-    std::array<Entry*, COMBO_COUNT> entries;
-};
-
-struct TraceNode {
-    Entry* entry;
-    uint64_t key;
-    int decision;
-    int combo;
-    int action;
-    int option;
-    uint8_t legal;
-    uint32_t visits;
-    float reach;
-    std::array<double, 4> weights;
-    std::array<double, 5> probabilities;
-    std::array<double, 5> aggregate;
-    float chips;
-    float pot;
-
-    bool updated;
-    double finalReach;
-    double scalar;
-    double target;
-    double before;
-    double after;
+    int groupCount;
+    std::array<uint8_t, GROUP_COUNT> liveGroups;
+    std::array<Entry*, GROUP_COUNT> entries;
+    std::array<uint8_t, COMBO_COUNT> groups;
 };
 
 struct Worker {
@@ -74,9 +49,15 @@ struct Worker {
     // Reused across hands; decisionCount is how many are live in this one.
     std::vector<RangeDecision> decisions;
     size_t decisionCount = 0;
-    std::array<uint64_t, COMBO_COUNT> keys;
-    std::array<std::array<double, 5>, COMBO_COUNT> policy;
-    std::array<std::array<float, COMBO_COUNT>, PLAYER_COUNT> rewards;
+    // Per node scratch, indexed by group.
+    std::array<uint64_t, GROUP_COUNT> keys;
+    std::array<int, GROUP_COUNT> firstCombo;
+    std::array<double, GROUP_COUNT> groupReach;
+    std::array<std::array<double, 5>, GROUP_COUNT> policy;
+    std::array<double, GROUP_COUNT> visitMass;
+    std::array<double, GROUP_COUNT> step;
+    std::array<double, GROUP_COUNT> scale;
+    std::array<double, GROUP_COUNT> shift;
     std::vector<TraceNode> tracePath;
 
     explicit Worker(unsigned t) : gen(15 + t) {
@@ -100,12 +81,15 @@ struct Explorer {
     unsigned threads;
     std::barrier<> bar;
     std::atomic<uint64_t> nextChunk;
+    // Chunks of the current phase block that have finished, as opposed to been claimed.
+    std::atomic<uint64_t> doneChunks;
     std::mutex printMutex;
 
-    explicit Explorer(unsigned threads) : threads(threads), bar(threads), nextChunk(0) {}
+    explicit Explorer(unsigned threads) : threads(threads), bar(threads), nextChunk(0), doneChunks(0) {}
 
-    // Finds the node for one combo's key, inserting it if new. Visits are not
-    // counted here: they are counted at the end of the hand, weighted by reach.
+    // Finds the node for one key, inserting it if new. combo is a combo that reaches the
+    // key, used only for the base key. Visits are not counted here: they are counted at
+    // the end of the hand, weighted by reach.
     Entry& locateNode(Engine& engine, int combo, uint64_t key, const std::array<bool, 5>& options) {
         bool inserted = false;
         uint64_t slotIndex = 0;
@@ -114,8 +98,8 @@ struct Explorer {
         if (inserted) {
             const BaseEntry* base = nullptr;
             if constexpr (USE_BASE) {
-                base = strategyBase.find(
-                    engine.getComboState(combo, BASE_METAS_BASIC, BASE_MEMORY_BASIC));
+                base = strategyBase.find(engine.getActionState(BASE_MEMORY_BASIC)
+                    | engine.getMetaState(BASE_METAS_BASIC)[combo] << 42);
             }
             uint8_t legal = 0;
             if (base == nullptr) {
@@ -141,7 +125,7 @@ struct Explorer {
                     sum += draw[j];
                 }
                 for (int j = 0; j < 5; j++) {
-                    if (options[j] && BASE_PRUNE_RATIO * draw[j] / sum >= 1.0) {
+                    if (options[j] && BASE_CONFIDENCE * draw[j] / sum >= 1.0) {
                         legal |= uint8_t(1u << j);
                     }
                 }
@@ -151,9 +135,7 @@ struct Explorer {
                 weights.weights[j].store(std::bit_cast<uint64_t>(seed),
                     std::memory_order_relaxed);
             }
-            weights.visits.store(0, std::memory_order_relaxed);
-            weights.options.store(legal, std::memory_order_relaxed);
-            weights.delta.store(255, std::memory_order_relaxed);
+            weights.stats.store(makeStats(legal, 65535), std::memory_order_relaxed);
             strategy.publish(slotIndex, word);
         }
         return weights;
@@ -162,7 +144,7 @@ struct Explorer {
     // The node's policy at INV_TEMP over its legal options. Fold's weight is the
     // exact 0, so it draws exp(0) = 1.
     static void nodePolicy(const Entry& weights, std::array<double, 5>& probabilities) {
-        const uint8_t legal = weights.options.load(std::memory_order_relaxed);
+        const uint8_t legal = entryOptions(weights.stats.load(std::memory_order_relaxed));
         double sum = 0;
         for (int j = 0; j < 5; j++) {
             double draw = 0;
@@ -179,30 +161,21 @@ struct Explorer {
         }
     }
 
-    // Samples the acting seat's action from its whole range: each combo still in the
-    // range reads its own node, the policies are summed weighted by reach, and one
-    // option is drawn from the sum. Every combo's reach is then multiplied by the
-    // probability it had of taking that option.
+    // Samples the acting seat's action from its whole range. Combos sharing a key share
+    // a node, so each node is looked up once and its policy weighted by the summed
+    // reach of its combos; one option is drawn from the sum. Every combo's reach is then
+    // multiplied by the probability its node gave that option, and dropped to 0 below
+    // RANGE_FLOOR times the largest reach left in the range.
     int chooseRangeOption(Worker& worker) {
         Engine& engine = worker.engine;
         const int seat = engine.getAction();
-        std::array<float, COMBO_COUNT>& range = engine.players[seat].range;
-        // getOptions() reads spr and cpr, which getState() writes, and neither
-        // depends on the combo - so legality is shared by the whole range.
-        engine.getState(METAS_BASIC, MEMORY_BASIC);
+        std::array<float, COMBO_COUNT>& range = engine.getRange(seat);
+        const std::array<bool, COMBO_COUNT>& commonRange = engine.getCommonRange();
+        // setActionState() wrote spr and cpr, which getOptions() reads; neither depends
+        // on the combo, so legality is shared by the whole range.
         const std::array<bool, 5> options = engine.getOptions();
-
-        // Keys first, prefetching each home slot, so the lookups below overlap
-        // their cache misses.
-        for (int combo = 0; combo < COMBO_COUNT; combo++) {
-            if (range[combo] < RANGE_FLOOR) {
-                range[combo] = 0.0f;
-                continue;
-            }
-            uint64_t key = engine.getComboState(combo, METAS_BASIC, MEMORY_BASIC);
-            worker.keys[combo] = key;
-            strategy.prefetch(key);
-        }
+        const uint64_t actionState = engine.getActionState(MEMORY_BASIC);
+        const std::array<uint64_t, COMBO_COUNT>& metaState = engine.getMetaState(METAS_BASIC);
 
         if (worker.decisionCount == worker.decisions.size()) {
             worker.decisions.emplace_back();
@@ -212,19 +185,38 @@ struct Explorer {
         decision.seat = seat;
         decision.chips = engine.getChips();
         decision.pot = engine.getPot();
+        decision.groupCount = 0;
+        decision.groups.fill(NO_GROUP);
+        worker.firstCombo.fill(-1);
 
-        std::array<double, 5> aggregate = {};
+        // Keys first, one per node, prefetching each home slot so the lookups below
+        // overlap their cache misses.
         for (int combo = 0; combo < COMBO_COUNT; combo++) {
-            if (range[combo] == 0.0f) {
-                decision.entries[combo] = nullptr;
+            if (!commonRange[combo] || !(range[combo] > 0.0f)) {
                 continue;
             }
-            Entry& weights = locateNode(engine, combo, worker.keys[combo], options);
-            decision.entries[combo] = &weights;
-            std::array<double, 5>& probabilities = worker.policy[combo];
+            const uint8_t group = engine.getGroup(METAS_BASIC, combo);
+            if (worker.firstCombo[group] < 0) {
+                worker.firstCombo[group] = combo;
+                worker.groupReach[group] = 0.0;
+                decision.liveGroups[decision.groupCount++] = group;
+                uint64_t key = actionState | metaState[combo] << 42;
+                worker.keys[group] = key;
+                strategy.prefetch(key);
+            }
+            worker.groupReach[group] += range[combo];
+            decision.groups[combo] = group;
+        }
+
+        std::array<double, 5> aggregate = {};
+        for (int k = 0; k < decision.groupCount; k++) {
+            const uint8_t group = decision.liveGroups[k];
+            Entry& weights = locateNode(engine, worker.firstCombo[group], worker.keys[group], options);
+            decision.entries[group] = &weights;
+            std::array<double, 5>& probabilities = worker.policy[group];
             nodePolicy(weights, probabilities);
             for (int j = 0; j < 5; j++) {
-                aggregate[j] += double(range[combo]) * probabilities[j];
+                aggregate[j] += worker.groupReach[group] * probabilities[j];
             }
         }
 
@@ -248,26 +240,29 @@ struct Explorer {
         decision.option = option;
 
         if constexpr (TRACE_KEY_ENABLED) {
-            for (int combo = 0; combo < COMBO_COUNT; combo++) {
-                if (decision.entries[combo] == nullptr || worker.keys[combo] != TRACE_KEY) {
+            for (int k = 0; k < decision.groupCount; k++) {
+                const uint8_t group = decision.liveGroups[k];
+                if (worker.keys[group] != TRACE_KEY) {
                     continue;
                 }
-                Entry& weights = *decision.entries[combo];
+                Entry& weights = *decision.entries[group];
+                const uint64_t stats = weights.stats.load(std::memory_order_relaxed);
                 TraceNode node{};
-                node.entry = &weights;
-                node.key = worker.keys[combo];
+                node.key = worker.keys[group];
                 node.decision = decisionIndex;
-                node.combo = combo;
+                node.group = group;
+                node.combo = worker.firstCombo[group];
                 node.action = seat;
                 node.option = option;
-                node.legal = weights.options.load(std::memory_order_relaxed);
-                node.visits = weights.visits.load(std::memory_order_relaxed);
-                node.reach = range[combo];
+                node.legal = entryOptions(stats);
+                node.visits = entryVisits(stats);
+                node.delta = entryDelta(stats);
+                node.reach = worker.groupReach[group];
                 for (int j = 0; j < 4; j++) {
                     node.weights[j] = std::bit_cast<double>(
                         weights.weights[j].load(std::memory_order_relaxed));
                 }
-                node.probabilities = worker.policy[combo];
+                node.probabilities = worker.policy[group];
                 for (int j = 0; j < 5; j++) {
                     node.aggregate[j] = aggregate[j] / running;
                 }
@@ -278,9 +273,21 @@ struct Explorer {
             }
         }
 
+        // The floor is relative to the seat's largest reach, so the range can never be
+        // emptied: an absolute floor drops a whole range whose reach has drifted down
+        // over a long line.
+        float maxReach = 0.0f;
         for (int combo = 0; combo < COMBO_COUNT; combo++) {
-            if (decision.entries[combo] != nullptr) {
-                range[combo] *= float(worker.policy[combo][option]);
+            const uint8_t group = decision.groups[combo];
+            if (group == NO_GROUP) {
+                continue;
+            }
+            range[combo] *= float(worker.policy[group][option]);
+            maxReach = std::max(maxReach, range[combo]);
+        }
+        for (int combo = 0; combo < COMBO_COUNT; combo++) {
+            if (decision.groups[combo] != NO_GROUP && range[combo] < RANGE_FLOOR * maxReach) {
+                range[combo] = 0.0f;
             }
         }
         return option;
@@ -291,120 +298,108 @@ struct Explorer {
             return;
         }
         std::ostringstream out;
-        out << std::fixed;
-        for (const TraceNode& node : worker.tracePath) {
-            const std::array<int, 2>& cards = comboTables.cards[node.combo];
-            out << "===== trace key 0x" << std::hex << std::setw(16) << std::setfill('0')
-                << node.key << std::dec << std::setfill(' ') << " =====\n";
-            out << std::setprecision(3);
-            out << "  seat " << node.action << "   combo " << node.combo
-                << " (cards " << cards[0] << ", " << cards[1] << ")"
-                << "   visits " << node.visits << "   invTemp " << INV_TEMP
-                << "   chips " << node.chips << "   pot " << node.pot << "\n";
-            out << std::setprecision(6);
-            out << "  reach     at decision " << node.reach
-                << "   at hand end " << node.finalReach << "\n";
-            out << "  weights ";
-            for (int j = 0; j < 5; j++) {
-                out << "  " << optionName(j) << " ";
-                if (!(node.legal & (1u << j))) {
-                    out << "-";
-                } else if (j == 0) {
-                    out << "0.000000 (exact)";
-                } else {
-                    out << node.weights[j - 1];
-                }
-            }
-            out << "\n";
-            out << std::setprecision(4);
-            out << "  policy  ";
-            for (int j = 0; j < 5; j++) {
-                out << "  " << optionName(j) << " " << 100.0 * node.probabilities[j] << "%";
-            }
-            out << "\n";
-            out << "  range   ";
-            for (int j = 0; j < 5; j++) {
-                out << "  " << optionName(j) << " " << 100.0 * node.aggregate[j] << "%";
-            }
-            out << "\n";
-            out << "  chosen    " << optionName(node.option) << "\n";
-            out << std::setprecision(6);
-            if (node.option == 0) {
-                out << "  update    none, fold has no stored weight\n";
-            } else if (!node.updated) {
-                out << "  update    none, the phase multiplier or the final reach is 0, "
-                       "or the combo clashes with the board\n";
-            } else {
-                out << "  return    " << node.target << " of the pot\n";
-                out << "  update    " << optionName(node.option) << " "
-                    << node.before << " -> " << node.after
-                    << "  (change " << (node.after - node.before)
-                    << ", step " << node.scalar << ")\n";
-            }
-        }
+        formatTrace(worker.tracePath, out);
         worker.tracePath.clear();
         std::lock_guard<std::mutex> lock(printMutex);
         std::cout << out.str() << std::flush;
     }
 
-    // At the end of the hand every combo that reached a decision takes one EMA step
-    // toward its own pot normalised return, scaled by its seat's final reach for it
-    // - the likelihood that combo played the whole line - so lines a combo would
-    // not have taken barely move it. The same reach decides, as a probability,
-    // whether the touch counts as a visit, which keeps the step size calibrated to
-    // the reach mass a node actually receives. Combos that clash with any of the five
-    // board cards are skipped, whether or not the hand reached them.
+    // At the end of the hand every combo still in its seat's range takes one EMA step
+    // toward its own pot normalised return, scaled by its final reach - the likelihood
+    // that combo played the whole line - so lines a combo would not have taken barely
+    // move it. A node's steps from one decision are composed and applied in one CAS,
+    // which equals applying them one combo at a time. Visits are the node's summed
+    // final reach, in 1/256 units with stochastic rounding.
     void updateRangeWeights(Worker& worker, double multiplier) {
         Engine& engine = worker.engine;
-        engine.getComboRewards(worker.rewards);
-        std::array<bool, COMBO_COUNT> onBoard;
+        const std::array<bool, COMBO_COUNT>& commonRange = engine.getCommonRange();
+        // At a showdown a combo must also miss all five board cards: a hand that ends all
+        // in before the river has not removed the turn and river from commonRange, and
+        // setRewards gives a combo holding one of them no share of the pot.
+        const bool showdown = engine.heads > 1;
+        std::array<bool, COMBO_COUNT> live;
         for (int combo = 0; combo < COMBO_COUNT; combo++) {
-            onBoard[combo] = engine.comboConflicts(combo, 5);
+            live[combo] = commonRange[combo] && !(showdown && engine.comboConflicts(combo, 5));
         }
         for (size_t d = 0; d < worker.decisionCount; d++) {
             const RangeDecision& decision = worker.decisions[d];
-            const std::array<float, COMBO_COUNT>& finalRange = engine.players[decision.seat].range;
-            const std::array<float, COMBO_COUNT>& rewards = worker.rewards[decision.seat];
+            const std::array<float, COMBO_COUNT>& finalRange = engine.getRange(decision.seat);
+            const std::array<float, COMBO_COUNT>& reward = engine.getReward(decision.seat);
+            const bool train = decision.option != 0 && multiplier != 0.0;
+            for (int k = 0; k < decision.groupCount; k++) {
+                const uint8_t group = decision.liveGroups[k];
+                worker.visitMass[group] = 0.0;
+                worker.scale[group] = 1.0;
+                worker.shift[group] = 0.0;
+                worker.step[group] = train ? LEARNING_RATE * multiplier * MIN_DELTA_INC
+                    * std::exp(DELTA_SCALAR * entryDelta(
+                        decision.entries[group]->stats.load(std::memory_order_relaxed))) : 0.0;
+            }
             for (int combo = 0; combo < COMBO_COUNT; combo++) {
-                Entry* weights = decision.entries[combo];
-                if (weights == nullptr || onBoard[combo]) {
+                const uint8_t group = decision.groups[combo];
+                if (group == NO_GROUP || !live[combo] || !(finalRange[combo] > 0.0f)) {
                     continue;
                 }
-                double reach = finalRange[combo];
-                if (!(reach > 0)) {
-                    continue;
+                const double reach = finalRange[combo];
+                worker.visitMass[group] += 256.0 * reach;
+                if (train) {
+                    const double s = worker.step[group] * reach;
+                    const double target = (reward[combo] - decision.chips) / decision.pot;
+                    worker.scale[group] *= 1.0 - s;
+                    worker.shift[group] = (1.0 - s) * worker.shift[group] + s * target;
                 }
-                if (worker.unit(worker.gen) < reach) {
-                    if (weights->visits.fetch_add(1, std::memory_order_relaxed) == VISITS_MAX) {
-                        throw std::runtime_error("a node reached 2^32 visits, so the visit "
-                            "counter wrapped and its step size would jump to the maximum");
+            }
+            for (int k = 0; k < decision.groupCount; k++) {
+                const uint8_t group = decision.liveGroups[k];
+                Entry& weights = *decision.entries[group];
+                const double mass = worker.visitMass[group];
+                if (mass > 0.0) {
+                    uint64_t add = uint64_t(mass);
+                    add += worker.unit(worker.gen) < mass - double(add);
+                    if (add > 0) {
+                        addVisits(weights, add);
                     }
                 }
-                if (decision.option == 0 || multiplier == 0.0) {
+                if (!train || mass == 0.0) {
                     continue;
                 }
-                double scalar = multiplier * reach * MIN_DELTA_INC * std::exp(DELTA_SCALAR
-                    * weights->delta.load(std::memory_order_relaxed));
-                float target = (rewards[combo] - decision.chips) / decision.pot;
-                auto [before, after] = emaUpdate(
-                    weights->weights[decision.option - 1], target, scalar);
+                auto [before, after] = affineUpdate(weights.weights[decision.option - 1],
+                    worker.scale[group], worker.shift[group]);
                 if constexpr (TRACE_KEY_ENABLED) {
                     for (TraceNode& node : worker.tracePath) {
-                        if (node.decision == int(d) && node.combo == combo) {
-                            node.updated = true;
-                            node.scalar = scalar;
-                            node.target = target;
-                            node.before = before;
-                            node.after = after;
+                        if (node.decision != int(d) || node.group != group) {
+                            continue;
                         }
+                        node.updated = true;
+                        node.step = 1.0 - worker.scale[group];
+                        node.target = worker.shift[group] / node.step;
+                        node.before = before;
+                        node.after = after;
+                        node.combos = 0;
+                        node.targetMin = std::numeric_limits<double>::max();
+                        node.targetMax = std::numeric_limits<double>::lowest();
+                        for (int combo = 0; combo < COMBO_COUNT; combo++) {
+                            if (decision.groups[combo] != group || !live[combo]
+                                    || !(finalRange[combo] > 0.0f)) {
+                                continue;
+                            }
+                            double target = (reward[combo] - decision.chips) / decision.pot;
+                            node.combos++;
+                            node.targetMin = std::min(node.targetMin, target);
+                            node.targetMax = std::max(node.targetMax, target);
+                        }
+                    }
+                }
+            }
+            if constexpr (TRACE_KEY_ENABLED) {
+                for (TraceNode& node : worker.tracePath) {
+                    if (node.decision == int(d)) {
+                        node.finalReach = worker.visitMass[node.group] / 256.0;
                     }
                 }
             }
         }
         if constexpr (TRACE_KEY_ENABLED) {
-            for (TraceNode& node : worker.tracePath) {
-                node.finalReach = engine.players[node.action].range[node.combo];
-            }
             printTrace(worker);
         }
         worker.decisionCount = 0;
@@ -413,11 +408,12 @@ struct Explorer {
     void updateDeltasRange(uint64_t begin, uint64_t end) {
         for (uint64_t i = begin; i < end; i++) {
             Entry& weights = strategy.dense[i];
-            uint32_t visits = weights.visits.load(std::memory_order_relaxed);
-            double alpha = -std::expm1(-1.0 / std::max(double(visits), double(VISIT_FLOOR)));
+            uint64_t stats = weights.stats.load(std::memory_order_relaxed);
+            double visits = std::clamp(double(entryVisits(stats)), VISITS_FLOOR, VISITS_CEIL);
+            double alpha = -std::expm1(-1.0 / std::pow(visits, FLEXIBILITY));
             long encoded = std::lround(std::log(alpha * INV_MIN_DELTA_INC) * INV_DELTA_SCALAR);
-            weights.delta.store(uint8_t(std::clamp(encoded, 0L, 255L)),
-                std::memory_order_relaxed);
+            stats = (stats & ~DELTA_MASK) | uint64_t(std::clamp(encoded, 0L, 65535L)) << 40;
+            weights.stats.store(stats, std::memory_order_relaxed);
         }
     }
 
@@ -432,6 +428,7 @@ struct Explorer {
         if (t == 0) {
             strategy.compact(keepVisits);
             nextChunk.store(0, std::memory_order_relaxed);
+            doneChunks.store(0, std::memory_order_relaxed);
         }
         bar.arrive_and_wait();
     }
@@ -439,12 +436,25 @@ struct Explorer {
     void playHand(Worker& worker, double multiplier) {
         Engine& engine = worker.engine;
         engine.shuffle(worker.gen);
-        engine.dealRanges();
+        engine.deal();
         worker.decisionCount = 0;
-        int option;
-        do {
-            option = chooseRangeOption(worker);
-        } while (engine.play(option));
+        while (true) {
+            do {
+                if (!MEMORY_BASIC || (USE_BASE && !BASE_MEMORY_BASIC)) {
+                    engine.setActionState(false);
+                }
+                if (MEMORY_BASIC || (USE_BASE && BASE_MEMORY_BASIC)) {
+                    engine.setActionState(true);
+                }
+            } while (engine.play(chooseRangeOption(worker)));
+            if (!engine.beginNewRound()) {
+                engine.setRewards();
+                break;
+            }
+            engine.setCommonRange();
+            engine.setMetaState(!METAS_BASIC || (USE_BASE && !BASE_METAS_BASIC),
+                METAS_BASIC || (USE_BASE && BASE_METAS_BASIC));
+        }
         updateRangeWeights(worker, multiplier);
     }
 
@@ -464,13 +474,20 @@ struct Explorer {
                 }
                 playHand(worker, multiplier);
             }
-            if (chunk % PRINT_CHUNKS == 0) {
-                report(phase, blockBase + base);
+            // Chunks finish out of order across threads, so progress is the count of
+            // finished chunks, not the offset of the one this thread just played.
+            uint64_t done = doneChunks.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (done % PRINT_CHUNKS == 0 || done == phaseChunks) {
+                report(phase, blockBase, phaseHands);
             }
         }
     }
 
-    void report(Phase phase, uint64_t globalHand) {
+    void report(Phase phase, uint64_t blockBase, uint64_t phaseHands) {
+        // The count is read under the lock, so successive prints never go backwards.
+        std::lock_guard<std::mutex> lock(printMutex);
+        const uint64_t globalHand = blockBase + std::min(
+            doneChunks.load(std::memory_order_relaxed) * CHUNK_HANDS, phaseHands);
         std::ostringstream out;
         out << std::fixed << std::setprecision(3);
         if (phase == Phase::Warmup) {
@@ -481,7 +498,6 @@ struct Explorer {
             out << "Cooldown: " << 100.0 * double(globalHand) / double(COOLDOWN_HANDS) << "% Complete\n";
         }
         out << "Strategy Size: " << strategy.count() << "\n";
-        std::lock_guard<std::mutex> lock(printMutex);
         std::cout << out.str() << std::flush;
     }
 
@@ -529,6 +545,10 @@ struct Explorer {
         std::ifstream file = openRead(path);
         uint64_t size;
         readExact(file, &size, sizeof(size), path);
+        if (bytes != STRATEGY_HEADER_BYTES + size * STRATEGY_RECORD_BYTES) {
+            throw std::runtime_error(path + " is not " + std::to_string(size) + " records of "
+                + std::to_string(STRATEGY_RECORD_BYTES) + " bytes");
+        }
         strategyBase.build(size);
         constexpr uint64_t BATCH = 1ULL << 16;
         std::vector<char> buffer(BATCH * STRATEGY_RECORD_BYTES);
@@ -564,7 +584,7 @@ struct Explorer {
                 out[j] = float(std::bit_cast<double>(
                     weights.weights[j].load(std::memory_order_relaxed)));
             }
-            uint32_t visits = weights.visits.load(std::memory_order_relaxed);
+            uint32_t visits = entryVisits(weights.stats.load(std::memory_order_relaxed));
             uint64_t key = weights.key.load(std::memory_order_relaxed);
             writeFile.write(&key, sizeof(key));
             writeFile.write(&out, sizeof(out));
@@ -586,10 +606,10 @@ struct Explorer {
 
 int main () {
     try {
-        MIN_DELTA_INC = -std::expm1(-1.0 / 4294967295.0);
+        MIN_DELTA_INC = -std::expm1(-1.0 / std::pow(VISITS_CEIL, FLEXIBILITY));
         INV_MIN_DELTA_INC = 1.0 / MIN_DELTA_INC;
-        const double maxAlpha = -std::expm1(-1.0 / 5.0);
-        DELTA_SCALAR = std::log(maxAlpha * INV_MIN_DELTA_INC) / 255.0;
+        DELTA_SCALAR = std::log(-std::expm1(-1.0 / std::pow(VISITS_FLOOR, FLEXIBILITY))
+            * INV_MIN_DELTA_INC) / 65535.0;
         INV_DELTA_SCALAR = 1.0 / DELTA_SCALAR;
 
         unsigned threads = std::thread::hardware_concurrency();

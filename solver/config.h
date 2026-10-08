@@ -11,20 +11,33 @@ constexpr bool MEMORY_BASIC = true;
 constexpr bool BASE_METAS_BASIC = true;
 constexpr bool BASE_MEMORY_BASIC = true;
 constexpr bool USE_BASE = false;
-constexpr uint64_t EPOCHS = 100 * 10000793600;
+constexpr uint64_t EPOCHS = 10000793600;
 
 // The fixed inverse temperature every phase samples at: P(j) proportional to
 // exp(INV_TEMP * w_j). log(256) means a weight one pot above another is drawn 256
 // times as often.
-inline const double INV_TEMP = std::log(256.0);
+constexpr double INV_TEMP = 5.545177444479562;
+
+// A node's step size is alpha = 1 - exp(-1 / visits^FLEXIBILITY), from the visits it
+// took in the block just ended, clamped to [VISITS_FLOOR, VISITS_CEIL].
+constexpr double FLEXIBILITY = 1.0;
+// Multiplies every weight step. Stable while LEARNING_RATE * (1 - exp(-1 / VISITS_FLOOR^FLEXIBILITY)) < 2,
+// and without overshoot below 1.
+constexpr double LEARNING_RATE = 1.0;
+// The visit counts the delta encoding spans: delta 65535 is the step at VISITS_FLOOR,
+// delta 0 the step at VISITS_CEIL. Nodes with more visits in a block are clamped to
+// the ceiling's step. A node with fewer than VISITS_FLOOR visits in a block is evicted.
+constexpr double VISITS_FLOOR = 5.0;
+constexpr double VISITS_CEIL = 4000317440.0;
 
 // Clamp on INV_TEMP * w before exp, so a runaway weight cannot turn the option total
 // into inf or zero.
 inline constexpr double MAX_EXP_ARG = 700.0;
 
-// A combo whose reach falls below this is dropped from its range: it is not looked
-// up at the decision and can carry at most this much weight into any update.
-constexpr float RANGE_FLOOR = 1e-6f;
+// A combo whose reach falls below this fraction of the largest reach in its range is
+// dropped: its reach is set to 0, it is not looked up again, and it takes no part in
+// updates or the showdown. Relative, so a range whose reach drifts down is never emptied.
+constexpr float RANGE_FLOOR = 0.0005f;
 
 // Every two card holding. For cards i < j the combo index is
 // i * (101 - i) / 2 + j - 1, the addressing used throughout handAnalysis.
@@ -41,20 +54,22 @@ constexpr uint64_t STRATEGY_RECORD_BYTES = 28;
 constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
 
 // An option survives the base prune when it would still be drawn at least once in
-// BASE_PRUNE_RATIO at the terminal inverse temperature.
-constexpr double BASE_PRUNE_RATIO = 16.0;
+// BASE_CONFIDENCE at INV_TEMP.
+constexpr double BASE_CONFIDENCE = 16.0;
 // The base table carries no fingerprint array, so a miss walks the whole cluster and
 // touches a 24 byte record at every step. Half the load is worth twice the slots.
 constexpr double BASE_MAX_LOAD = 0.5;
 
+// Prints every decision that reaches TRACE_KEY, and its update. The key is on the
+// current layout: action state in bits 0-41, meta state in bits 42-63.
 constexpr bool TRACE_KEY_ENABLED = false;
-constexpr uint64_t TRACE_KEY = 0x1404c85a4810de00;
+constexpr uint64_t TRACE_KEY = 0;
 
 constexpr uint64_t STRATEGY_CAP_LOG2 = 28;
 constexpr double MAX_LOAD = 0.95;
 
 constexpr uint64_t CHUNK_HANDS = 1ULL << 16;
-constexpr uint64_t PRINT_CHUNKS = 1ULL << 8;
+constexpr uint64_t PRINT_CHUNKS = 1ULL << 4;
 
 inline uint64_t mix64(uint64_t x) {
     x ^= x >> 33;
@@ -142,3 +157,5 @@ struct CheckedWriter {
         }
     }
 };
+
+//update skills soon

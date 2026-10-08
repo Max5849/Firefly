@@ -355,7 +355,7 @@ struct HandClusterer {
         for (int i = 4; i < 5; i++) {
             cardRanks[boardCards[i] / 4]++;
             cardSuits[boardCards[i] % 4]++;
-            if (cardSuits[boardCards[i] % 4] == 3 && flushSuit == -1) {
+            if (cardSuits[boardCards[i] % 4] == 3 && flushSuit != boardCards[i] % 4) {
                 flushSuit = boardCards[i] % 4;
                 backdoorFlush = true;
             }

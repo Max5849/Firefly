@@ -1,26 +1,28 @@
-#include "solver/config.h"
-#include "solver/engine.h"
+#include "solver/singleThread/config.h"
+#include "solver/singleThread/engine.h"
 
 double MIN_DELTA_INC;
 double DELTA_SCALAR;
 double INV_MIN_DELTA_INC;
 double INV_DELTA_SCALAR;
+uint64_t EPOCH_BLOCK;
 
 struct Explorer {
 
     struct EntryBase {
-        std::array<uint64_t, 4> weights;
+        std::array<double, 4> weights;
     };
 
     struct Entry {
-        std::array<uint64_t, 4> weights;
-        uint64_t visits : 40;
-        uint64_t delta : 16;
-        uint64_t options : 8;
+        std::array<double, 4> weights;
+        uint32_t visits;
+        uint8_t visitsFraction;
+        uint16_t delta;
+        uint8_t options;
     };
 
     struct EpochNode {
-        std::array<Entry*, 1326> entries;
+        std::array<uint64_t, 1326> keys;
         int option;
         int action;
         float chips;
@@ -29,26 +31,96 @@ struct Explorer {
 
     inline static ankerl::unordered_dense::map<uint64_t, Entry> strategy;
     inline static ankerl::unordered_dense::map<uint64_t, EntryBase> strategyBase;
+    Engine engine;
     std::mt19937 gen;
     std::uniform_real_distribution<double> drawUniform;
     std::vector<EpochNode> epochPath;
 
     Explorer() : gen(15) {}
 
-    int chooseOption(std::array<uint64_t, 1326>& keys, std::array<uint64_t, 1326>& keysBase, std::array<float, 1326>& range, 
-            std::array<bool, 1326>& commonRange, float pot, std::array<bool, 5> options, int action, float chips) {
+    void runPhase(int phase) {
+        if (phase == 0) {
+            for (int i = 0; i < EPOCH_BLOCK; i++) {
+                playHand(true, false, i);
+            }
+            eraseNoise();
+            updateDeltas();
+        } else if (phase == 1) {
+            for (int i = 0; i < 20; i++) {
+                for (int j = 0; j < EPOCH_BLOCK; j++) {
+                    playHand(false, false, j);
+                }
+                eraseNoise();
+                updateDeltas();
+            }
+        } else if (phase == 2) {
+            for (int i = 0; i < EPOCH_BLOCK; i++) {
+                playHand(false, true, i);
+            }
+            eraseNoise();
+        }
+    }
+
+    void playHand(bool warmUp, bool coolDown, uint64_t blockEpoch) {
+        engine.shuffle(gen);
+        engine.deal();
+        while (true) {
+            do {
+                if (!MEMORY_BASIC || !BASE_MEMORY_BASIC) {
+                    engine.setActionState(false);
+                }
+                if (MEMORY_BASIC || BASE_MEMORY_BASIC) {
+                    engine.setActionState(true);
+                }
+            } while (engine.play(chooseOption()));
+            if (!engine.beginNewRound()) {
+                engine.setRewards();
+                break;
+            }
+            engine.setCommonRange();
+            if (!METAS_BASIC || !BASE_METAS_BASIC) {
+                engine.setMetaState(false);
+            }
+            if (METAS_BASIC || BASE_METAS_BASIC) {
+                engine.setMetaState(true);
+            }
+        }
+        if (warmUp) {
+            recordVisits();
+            epochPath.clear();
+        } else if (coolDown) {
+            recordVisits();
+            updateWeights(1.0 - blockEpoch / double(EPOCH_BLOCK));
+            epochPath.clear();
+        } else {
+            recordVisits();
+            updateWeights(1.0);
+            epochPath.clear();
+        }
+    }
+
+    int chooseOption() {
         epochPath.emplace_back();
         EpochNode& epochNode = epochPath.back();
-        epochNode.action = action;
-        epochNode.chips = chips;
-        epochNode.pot = pot;
-        std::array<double, 5> drawTable = {0};
-        std::array<std::array<double, 5>, 1326> drawTableIndividual = {0};
+        std::array<bool, 5> options = engine.getOptions();
+        epochNode.action = engine.getAction();
+        epochNode.chips = engine.getChips();
+        epochNode.pot = engine.getPot();
+        std::array<bool, 1326>& commonRange = engine.getCommonRange();
+        std::array<float, 1326>& range = engine.getRange(epochNode.action);
+        std::array<uint64_t, 1326>& metaState = engine.getMetaState(METAS_BASIC);
+        uint64_t actionState = engine.getActionState(MEMORY_BASIC);
+        std::array<uint64_t, 1326>& metaStateBase = engine.getMetaState(BASE_METAS_BASIC);; 
+        uint64_t actionStateBase = engine.getActionState(BASE_MEMORY_BASIC);
+        
+        std::array<std::array<double, 5>, 1326> drawTable = {0};
+        std::array<double, 1326> drawTableSums = {0};
         for (int i = 0; i < 1326; i++) {
-            if (!commonRange[i]) {
+            if (!commonRange[i] || !(range[i] > 0.0f)) {
                 continue;
             }
-            auto [it, inserted] = strategy.try_emplace(keys[i]);
+            uint64_t key = actionState | metaState[i] << 42;
+            auto [it, inserted] = strategy.try_emplace(key);
             Entry& entry = it->second;
             if (inserted) {
                 uint8_t legal = 0;
@@ -58,11 +130,12 @@ struct Explorer {
                     }
                 }
                 if (USE_BASE) {
-                    auto it = strategyBase.find(keysBase[i]);
+                    uint64_t keyBase = actionStateBase | metaStateBase[i] << 42;
+                    auto it = strategyBase.find(keyBase);
                     if (it != strategyBase.end()) {
                         EntryBase& entryBase = it->second;
                         for (int j = 0; j < 4; j++) {
-                            entry.weights[j] = entryBase.weights[i];
+                            entry.weights[j] = entryBase.weights[j];
                         }
                         std::array<double, 5> drawTableBase = {0};
                         double sum = 0;
@@ -87,77 +160,118 @@ struct Explorer {
                 entry.options = legal;
             }
             if (entry.options & (1u)) {
-                drawTable[0] += range[i] * 1.0;
-                drawTableIndividual[i][0] += 1.0;
+                drawTable[i][0] += 1.0;
+                drawTableSums[i] += 1.0;
             }
             for (int j = 1; j < 5; j++) {
                 if (entry.options & (1u << j)) {
-                    drawTable[j] += range[i] * std::exp(INV_TEMP * entry.weights[j - 1]);
-                    drawTableIndividual[i][j] += std::exp(INV_TEMP * entry.weights[j - 1]);
+                    drawTable[i][j] += std::exp(INV_TEMP * entry.weights[j - 1]);
+                    drawTableSums[i] += std::exp(INV_TEMP * entry.weights[j - 1]);
                 }
             }
-            epochNode.entries[i] = &entry;
-            entry.visits++;
+            epochNode.keys[i] = key;
+        }
+        std::array<double, 5> drawTableCompressed = {0};
+        for (int i = 0; i < 1326; i++) {
+            if (!commonRange[i] || !(range[i] > 0.0f)) {
+                continue;
+            }
+            for (int j = 0; j < 5; j++) {
+                drawTableCompressed[j] += range[i] * drawTable[i][j] / drawTableSums[i];
+            }
         }
         for (int i = 1; i < 5; i++) {
-            drawTable[i] += drawTable[i - 1];
+            drawTableCompressed[i] += drawTableCompressed[i - 1];
         }
-        double draw = drawTable[4] * drawUniform(gen);
+        double draw = drawTableCompressed[4] * drawUniform(gen);
         int option = 0;
         for (int i = 0; i < 5; i++) {
-            if (draw < drawTable[i]) {
+            if (draw < drawTableCompressed[i]) {
                 option = i;
                 break;
             }
         }
         epochNode.option = option;
+        // The floor is relative to the seat's largest reach, so the range can never be
+        // emptied: an absolute floor drops a whole range whose reach has drifted down
+        // over a long line.
+        float maxReach = 0.0f;
         for (int i = 0; i < 1326; i++) {
-            if (!commonRange[i]) {
+            if (!commonRange[i] || !(range[i] > 0.0f)) {
                 continue;
             }
-            double sum = 0;
-            for (int j = 0; j < 5; j++) {
-                sum += drawTableIndividual[i][j];
+            range[i] *= drawTable[i][option] / drawTableSums[i];
+            maxReach = std::max(maxReach, range[i]);
+        }
+        for (int i = 0; i < 1326; i++) {
+            if (commonRange[i] && range[i] < 0.0005f * maxReach) {
+                range[i] = 0.0f;
             }
-            range[i] *= drawTableIndividual[i][option] / sum;
-            
         }
         return option;
     }
 
-    void updateWeights(std::array<std::array<float, 1326>, PLAYER_COUNT> rewards, 
-            std::array<bool, 1326>& commonRange, double strength) {
+    // At a showdown a combo must also miss all five board cards: a hand that ends all in
+    // before the river has not removed the turn and river from commonRange, and
+    // setRewards gives a combo holding one of them no share of the pot.
+    void recordVisits() {
+        std::array<bool, 1326>& commonRange = engine.getCommonRange();
+        const bool showdown = engine.heads > 1;
         for (auto& epochNode : epochPath) {
+            std::array<float, 1326>& range = engine.getRange(epochNode.action);
             for (int i = 0; i < 1326; i++) {
-                if (!commonRange[i]) {
+                if (!commonRange[i] || !(range[i] > 0.0f) || (showdown && engine.comboConflicts(i, 5))) {
                     continue;
                 }
-                Entry* entry = epochNode.entries[i];
-                float target = (rewards[epochNode.action][i] - epochNode.chips) / epochNode.pot;
-                double scalar = strength * MIN_DELTA_INC * std::exp(DELTA_SCALAR * entry->delta);
-                for (int j = 1; j < 5; j++) {
-                    float delta = target - entry->weights[j - 1];
-                    target += scalar * delta;
-                }
+                Entry& entry = strategy.at(epochNode.keys[i]);
+                float upscaledRange = 256.0f * range[i];
+                uint32_t add = uint32_t(upscaledRange);
+                add += drawUniform(gen) < (upscaledRange - add);
+                uint32_t overflowFraction = entry.visitsFraction + add;
+                uint64_t visits = uint64_t(entry.visits) + (overflowFraction >> 8);
+                entry.visits = uint32_t(std::min(visits, uint64_t(UINT32_MAX)));
+                entry.visitsFraction = uint8_t(overflowFraction);
             }
         }
     }
 
     void eraseNoise() {
-        for (auto& [key, entry] : strategy) {
-            uint64_t visits = entry.visits;
-            if (visits < 5) {
-                strategy.erase(key);
-            }
-        }
+        std::erase_if(strategy, [&](const auto& entry) { 
+            return entry.second.visits < 5; 
+        });
     }
 
     void updateDeltas() {
         for (auto& [key, entry] : strategy) {
-            uint64_t visits = entry.visits;
-            double alpha = -std::expm1(-1.0 / std::pow(std::max(double(visits), 500.0), FLEXIBILITY));
-            entry.delta = std::lround(std::log(alpha * INV_MIN_DELTA_INC) * INV_DELTA_SCALAR);
+            double visits = std::clamp(double(entry.visits), VISITS_FLOOR, VISITS_CEIL);
+            double alpha = -std::expm1(-1.0 / std::pow(visits, FLEXIBILITY));
+            long encoded = std::lround(std::log(alpha * INV_MIN_DELTA_INC) * INV_DELTA_SCALAR);
+            entry.delta = uint16_t(std::clamp(encoded, 0L, 65535L));
             entry.visits = 0;
+            entry.visitsFraction = 0;
+        }
+    }
+
+    void updateWeights(double strength) {
+        std::array<bool, 1326>& commonRange = engine.getCommonRange();
+        const bool showdown = engine.heads > 1;
+        for (auto& epochNode : epochPath) {
+            if (epochNode.option == 0) {
+                continue;
+            }
+            std::array<float, 1326>& range = engine.getRange(epochNode.action);
+            std::array<float, 1326>& reward = engine.getReward(epochNode.action);
+            for (int i = 0; i < 1326; i++) {
+                if (!commonRange[i] || !(range[i] > 0.0f) || (showdown && engine.comboConflicts(i, 5))) {
+                    continue;
+                }
+                Entry& entry = strategy.at(epochNode.keys[i]);
+                double target = (reward[i] - epochNode.chips) / epochNode.pot;
+                double scalar = LEARNING_RATE * strength * range[i]
+                    * MIN_DELTA_INC * std::exp(DELTA_SCALAR * entry.delta);
+                double& weight = entry.weights[epochNode.option - 1];
+                weight += scalar * (target - weight);
+            }
         }
     }
 
@@ -210,55 +324,23 @@ struct Explorer {
     }
 };
 
-void playHand(Engine& engine, Explorer& explorer, bool updateWeights, double strength) {
-    engine.shuffle(explorer.gen);
-    engine.deal();
-    int option;
-    do {
-        std::array<uint64_t, 1326> keys = engine.getState(MEMORY_BASIC, METAS_BASIC);
-        std::array<uint64_t, 1326> keysBase;
-        if (USE_BASE) {
-            keysBase = engine.getState(BASE_MEMORY_BASIC, BASE_METAS_BASIC);
-        } else {
-            keysBase = {0};
-        }
-        option = explorer.chooseOption(keys, keysBase, engine.getRange(), engine.getCommonRange(), 
-            engine.getPot(), engine.getOptions(), engine.getAction(), engine.getChips());
-    } while (engine.play(option));
-    if (updateWeights) {
-        explorer.updateWeights(engine.getRewards(), engine.getCommonRange(), strength);
-    }
-}
-
 int main () {
     try {
-        MIN_DELTA_INC = -std::expm1(-1.0 / std::pow(2, 40 * FLEXIBILITY));
+        MIN_DELTA_INC = -std::expm1(-1.0 / std::pow(VISITS_CEIL, FLEXIBILITY));
         INV_MIN_DELTA_INC = 1.0 / MIN_DELTA_INC;
-        DELTA_SCALAR = std::log(-std::expm1(-1.0 / 500.0) * INV_MIN_DELTA_INC) / 65536.0;
+        DELTA_SCALAR = std::log(-std::expm1(-1.0 / std::pow(VISITS_FLOOR, FLEXIBILITY)) * INV_MIN_DELTA_INC) / 65535.0;
         INV_DELTA_SCALAR = 1.0 / DELTA_SCALAR;
+        EPOCH_BLOCK = EPOCHS / 20;
         Engine::loadTables();
         if (USE_BASE) {
             Explorer::downloadStrategyBase();
         }
-        Engine engine;
         Explorer explorer;
 
-        for (int i = 0; i < EPOCHS / 20; i++) {
-            playHand(engine, explorer, false, 1.0);
-        }
-        explorer.eraseNoise();
-        explorer.updateDeltas();
-        for (int block = 0; block < 20; block++) {
-            for (int i = 0; i < EPOCHS / 20; i++) {
-                playHand(engine, explorer, true, 1.0);
-            }
-            explorer.eraseNoise();
-            explorer.updateDeltas();
-        }
-        for (int i = 0; i < EPOCHS / 20; i++) {
-            playHand(engine, explorer, true, 1.0 - i / double(EPOCHS / 20));
-        }
-        explorer.eraseNoise();
+        explorer.runPhase(0);
+        explorer.runPhase(1);
+        explorer.runPhase(2);
+
         explorer.uploadStrategy();
         return 0;
     } catch (const std::exception& e) {

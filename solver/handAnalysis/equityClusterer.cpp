@@ -2,43 +2,84 @@
 #include "solver/handAnalysis/handClusterer.h"
 #include "solver/handAnalysis/dealer.h"
 
-bool BASIC = false;
+bool BASIC = true;
 
-bool mergeClusterPair(std::vector<std::vector<uint64_t>>& clusterHands, std::vector<uint64_t>& clusterSizes,
-        std::vector<std::array<float, 165>>& clusterPoints, int begin, int end, int mergeCount, int maxClusters) {
-    double minDistance = std::numeric_limits<double>::max();
-    int a;
-    int b;
-    for (int i = begin; i < end - mergeCount - 1; i++) {
-        for (int q = i + 1; q < end - mergeCount; q++) {
-            double distance = 0;
-            double aSum = 0;
-            double bSum = 0;
-            for (int p = 0; p < 165; p++) {
-                aSum += clusterPoints[i][p];
-                bSum += clusterPoints[q][p];
-                distance += (164.5 - p) * (164.5 - p) * std::abs(aSum - bSum);
+void computeCdf(const std::array<float, 165>& point, std::array<double, 165>& cdf) {
+    double sum = 0;
+    for (int p = 0; p < 165; p++) {
+        sum += point[p];
+        cdf[p] = sum;
+    }
+}
+
+double cdfDistance(const std::array<double, 165>& a, const std::array<double, 165>& b) {
+    double distance = 0;
+    for (int p = 0; p < 165; p++) {
+        distance += (164.5 - p) * (164.5 - p) * std::abs(a[p] - b[p]);
+    }
+    return distance;
+}
+
+void mergeDivision(std::vector<std::vector<uint64_t>>& clusterHands, std::vector<uint64_t>& clusterSizes,
+        std::vector<std::array<float, 165>>& clusterPoints, std::vector<char>& alive,
+        int begin, int end, int maxClusters) {
+    int n = end - begin;
+    std::vector<std::array<double, 165>> cdfs(n);
+    std::vector<int> nn(n);
+    std::vector<double> nnDist(n);
+    for (int i = 0; i < n; i++) {
+        computeCdf(clusterPoints[begin + i], cdfs[i]);
+    }
+    auto rescan = [&](int i) {
+        nn[i] = -1;
+        nnDist[i] = std::numeric_limits<double>::max();
+        for (int j = i + 1; j < n; j++) {
+            if (!alive[begin + j]) continue;
+            double distance = cdfDistance(cdfs[i], cdfs[j]);
+            if (distance < nnDist[i]) {
+                nnDist[i] = distance;
+                nn[i] = j;
             }
-            if (distance < minDistance) {
-                minDistance = distance;
+        }
+    };
+    for (int i = 0; i < n; i++) {
+        rescan(i);
+    }
+    for (int live = n; live > maxClusters; live--) {
+        int a = -1;
+        double minDistance = std::numeric_limits<double>::max();
+        for (int i = 0; i < n; i++) {
+            if (alive[begin + i] && nnDist[i] < minDistance) {
+                minDistance = nnDist[i];
                 a = i;
-                b = q;
+            }
+        }
+        int b = nn[a];
+        int ga = begin + a;
+        int gb = begin + b;
+        for (int i = 0; i < 165; i++) {
+            clusterPoints[ga][i] = (clusterPoints[ga][i] * clusterSizes[ga] + clusterPoints[gb][i]
+                * clusterSizes[gb]) / (clusterSizes[ga] + clusterSizes[gb]);
+        }
+        clusterHands[ga].insert(clusterHands[ga].end(), clusterHands[gb].begin(), clusterHands[gb].end());
+        clusterSizes[ga] += clusterSizes[gb];
+        alive[gb] = 0;
+        computeCdf(clusterPoints[ga], cdfs[a]);
+        rescan(a);
+        // Only clusters below b can have pointed at a or b; those below a may now prefer the new a.
+        for (int i = 0; i < b; i++) {
+            if (!alive[begin + i] || i == a) continue;
+            if (nn[i] == a || nn[i] == b) {
+                rescan(i);
+            } else if (i < a) {
+                double distance = cdfDistance(cdfs[i], cdfs[a]);
+                if (distance < nnDist[i] || (distance == nnDist[i] && a < nn[i])) {
+                    nnDist[i] = distance;
+                    nn[i] = a;
+                }
             }
         }
     }
-    if (end - begin - mergeCount <= maxClusters) {
-        return false;
-    }
-    for (int i = 0; i < 165; i++) { 
-        clusterPoints[a][i] = (clusterPoints[a][i] * clusterSizes[a] + clusterPoints[b][i]
-            * clusterSizes[b]) / (clusterSizes[a] + clusterSizes[b]);
-    }
-    clusterHands[a].insert(clusterHands[a].end(), clusterHands[b].begin(), clusterHands[b].end());
-    clusterSizes[a] += clusterSizes[b];
-    clusterSizes.erase(clusterSizes.begin() + b);
-    clusterHands.erase(clusterHands.begin() + b);
-    clusterPoints.erase(clusterPoints.begin() + b);
-    return true;
 }
 
 void clusterDists(std::unordered_map<uint64_t, std::array<float, 165>>& handDists, 
@@ -77,16 +118,16 @@ void clusterDists(std::unordered_map<uint64_t, std::array<float, 165>>& handDist
         }
     }
     divisions.push_back(static_cast<int>(keys.size()));
+    std::vector<char> alive(keys.size(), 1);
     for (int i = divisions.size() - 2; i >= 0; i--) {
-        int mergeCount = 0;
-        while (mergeClusterPair(clusterHands, clusterSizes, clusterPoints,
-                divisions[i], divisions[i + 1], mergeCount, maxClusters)) {
-            mergeCount++;
-        }
-        for (int j = divisions[i]; j < divisions[i + 1] - mergeCount; j++) {
+        mergeDivision(clusterHands, clusterSizes, clusterPoints, alive, divisions[i], divisions[i + 1], maxClusters);
+        int cluster = 0;
+        for (int j = divisions[i]; j < divisions[i + 1]; j++) {
+            if (!alive[j]) continue;
             for (auto& q : clusterHands[j]) {
-                handMetas[q] = j - divisions[i];
+                handMetas[uint64_t(q) & ~uint64_t(0xFFFF)] = cluster;
             }
+            cluster++;
         }
     }
 }
@@ -197,12 +238,12 @@ int main() {
                             if (referenceRanks[i] == -1) {
                                 continue;
                             }
-                            flopHandDists[(uint64_t)(flopClassSig) | ((uint64_t)flopClass << 16) 
-                                | ((uint64_t)flopHandClasses[i] << 32)][referenceRank]++;
-                            turnHandDists[(uint64_t)(turnClassSig) | ((uint64_t)turnClass << 16) 
-                                | ((uint64_t)turnHandClasses[i] << 32)][referenceRank]++;
-                            riverHandDists[(uint64_t)(riverClassSig) | ((uint64_t)riverClass << 16) 
-                                | ((uint64_t)riverHandClasses[i] << 32)][referenceRank]++;
+                            flopHandDists[uint64_t(flopClassSig) | uint64_t(flopClass) << 16
+                                | uint64_t(flopHandClasses[i]) << 32][referenceRank]++;
+                            turnHandDists[uint64_t(turnClassSig) | uint64_t(turnClass) << 16
+                                | uint64_t(turnHandClasses[i]) << 32][referenceRank]++;
+                            riverHandDists[uint64_t(riverClassSig) | uint64_t(riverClass) << 16
+                                | uint64_t(riverHandClasses[i]) << 32][referenceRank]++;
                         }
                         dealer.riverSet();
                     }
@@ -211,9 +252,9 @@ int main() {
                 dealer.flopSet();
             }
             std::unordered_map<uint64_t, uint8_t> localMetas;
-            clusterDists(flopHandDists, localMetas, 32);
-            clusterDists(turnHandDists, localMetas, 32);
-            clusterDists(riverHandDists, localMetas, 16);
+            clusterDists(flopHandDists, localMetas, 24);
+            clusterDists(turnHandDists, localMetas, 18);
+            clusterDists(riverHandDists, localMetas, 12);
             std::lock_guard<std::mutex> lock(metaMutex);
             for (auto& [key, value] : localMetas) {
                 handMetas[key] = value;
