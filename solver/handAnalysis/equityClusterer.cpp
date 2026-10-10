@@ -2,7 +2,7 @@
 #include "solver/handAnalysis/handClusterer.h"
 #include "solver/handAnalysis/dealer.h"
 
-bool BASIC = true;
+bool BASIC = false;
 
 void computeCdf(const std::array<float, 165>& point, std::array<double, 165>& cdf) {
     double sum = 0;
@@ -252,9 +252,9 @@ int main() {
                 dealer.flopSet();
             }
             std::unordered_map<uint64_t, uint8_t> localMetas;
-            clusterDists(flopHandDists, localMetas, 24);
-            clusterDists(turnHandDists, localMetas, 18);
-            clusterDists(riverHandDists, localMetas, 12);
+            clusterDists(flopHandDists, localMetas, 64);
+            clusterDists(turnHandDists, localMetas, 32);
+            clusterDists(riverHandDists, localMetas, 16);
             std::lock_guard<std::mutex> lock(metaMutex);
             for (auto& [key, value] : localMetas) {
                 handMetas[key] = value;

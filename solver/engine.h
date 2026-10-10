@@ -22,6 +22,9 @@ struct Engine {
     struct Player {
         std::array<float, 1326> range;
         std::array<float, 1326> reward;
+        // The odds of this seat's betting pattern: the product, over its decisions, of
+        // the chosen option's share of the range's aggregate policy.
+        double odds;
         float chips;
         bool inHand;
         uint8_t position;
@@ -38,6 +41,7 @@ struct Engine {
         void set(int position) {
             std::fill(range.begin(), range.end(), 1.0f);
             reward = {0};
+            odds = 1.0;
             chips = CHIP_COUNT;
             inHand = true;
             this->position = position;
@@ -330,9 +334,9 @@ struct Engine {
         for (int i = 0; i < 4; ++i) {
             heroVillanStory *= 3;
             if (i != round) {
-                heroVillanStory += 2 * player.lastActions[i] + !memoryBasic * villan.lastActions[i];
+                heroVillanStory += 2 * player.lastActions[i] + villan.lastActions[i];
             } else {
-                heroVillanStory += player.lastActions[i] + !memoryBasic * villan.lastActions[i];
+                heroVillanStory += player.lastActions[i] + villan.lastActions[i];
             }
         }
         heroVillanStory *= 5;
@@ -428,6 +432,10 @@ struct Engine {
 
     std::array<float, 1326>& getRange(int action) {
         return players[action].range;
+    }
+
+    double& getOdds(int action) {
+        return players[action].odds;
     }
 
     std::array<float, 1326>& getReward(int action) {

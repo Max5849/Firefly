@@ -11,22 +11,17 @@ constexpr bool MEMORY_BASIC = true;
 constexpr bool BASE_METAS_BASIC = true;
 constexpr bool BASE_MEMORY_BASIC = true;
 constexpr bool USE_BASE = false;
+// Which trainer wrote a strategy file: this range trainer or the single hand one in
+// solver/singleHand. The key layouts match, so a base may come from either.
+constexpr bool RANGED = true;
+constexpr bool BASE_RANGED = true;
 constexpr uint64_t EPOCHS = 10000793600;
 
-// The fixed inverse temperature every phase samples at: P(j) proportional to
-// exp(INV_TEMP * w_j). log(256) means a weight one pot above another is drawn 256
-// times as often.
 constexpr double INV_TEMP = 5.545177444479562;
-
-// A node's step size is alpha = 1 - exp(-1 / visits^FLEXIBILITY), from the visits it
-// took in the block just ended, clamped to [VISITS_FLOOR, VISITS_CEIL].
+constexpr double SAMPLE_INV_TEMP = 2.772588722239781;
 constexpr double FLEXIBILITY = 1.0;
-// Multiplies every weight step. Stable while LEARNING_RATE * (1 - exp(-1 / VISITS_FLOOR^FLEXIBILITY)) < 2,
-// and without overshoot below 1.
 constexpr double LEARNING_RATE = 1.0;
-// The visit counts the delta encoding spans: delta 65535 is the step at VISITS_FLOOR,
-// delta 0 the step at VISITS_CEIL. Nodes with more visits in a block are clamped to
-// the ceiling's step. A node with fewer than VISITS_FLOOR visits in a block is evicted.
+
 constexpr double VISITS_FLOOR = 5.0;
 constexpr double VISITS_CEIL = 4000317440.0;
 
@@ -34,10 +29,10 @@ constexpr double VISITS_CEIL = 4000317440.0;
 // into inf or zero.
 inline constexpr double MAX_EXP_ARG = 700.0;
 
-// A combo whose reach falls below this fraction of the largest reach in its range is
-// dropped: its reach is set to 0, it is not looked up again, and it takes no part in
-// updates or the showdown. Relative, so a range whose reach drifts down is never emptied.
-constexpr float RANGE_FLOOR = 0.0005f;
+// A combo whose reach falls below this fraction of its range's summed reach is dropped:
+// its reach is set to 0, so the draw, the visits, the update and the showdown all skip
+// it. Relative, so a range whose reach drifts down is never emptied.
+constexpr double RANGE_FLOOR = 0.00003771;
 
 // Every two card holding. For cards i < j the combo index is
 // i * (101 - i) / 2 + j - 1, the addressing used throughout handAnalysis.

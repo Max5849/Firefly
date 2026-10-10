@@ -30,6 +30,7 @@ struct TraceNode {
     std::array<double, 4> weights;
     std::array<double, 5> probabilities;
     std::array<double, 5> aggregate;
+    std::array<double, 5> sampled;
     float chips;
     float pot;
 
@@ -58,7 +59,7 @@ inline void formatTrace(const std::vector<TraceNode>& tracePath, std::ostringstr
             << "   chips " << node.chips << "   pot " << node.pot << "\n";
         out << std::setprecision(6);
         out << "  reach     at decision " << node.reach
-            << "   at hand end " << node.finalReach << "\n";
+            << "   visits added " << node.finalReach << "\n";
         out << "  weights ";
         for (int j = 0; j < 5; j++) {
             out << "  " << optionName(j) << " ";
@@ -80,6 +81,11 @@ inline void formatTrace(const std::vector<TraceNode>& tracePath, std::ostringstr
         out << "  range   ";
         for (int j = 0; j < 5; j++) {
             out << "  " << optionName(j) << " " << 100.0 * node.aggregate[j] << "%";
+        }
+        out << "\n";
+        out << "  sampled ";
+        for (int j = 0; j < 5; j++) {
+            out << "  " << optionName(j) << " " << 100.0 * node.sampled[j] << "%";
         }
         out << "\n";
         out << "  chosen    " << optionName(node.option) << "\n";

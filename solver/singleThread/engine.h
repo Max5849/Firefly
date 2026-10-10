@@ -7,6 +7,7 @@ struct Engine {
     struct Player {
         std::array<float, 1326> range;
         std::array<float, 1326> reward;
+        double odds;
         float chips;
         bool inHand;
         uint8_t position;
@@ -23,6 +24,7 @@ struct Engine {
         void set(int position) {
             std::fill(range.begin(), range.end(), 1.0f);
             reward = {0};
+            odds = 1.0;
             chips = CHIP_COUNT;
             inHand = true;
             this->position = position;
@@ -74,7 +76,6 @@ struct Engine {
     uint8_t hiddenRaiseStrength;
     uint8_t hiddenRaiseActionPosition;
     uint8_t calls;
-    // Showdown scratch, allocated on first use.
     std::vector<double> rangeBelow;
     std::vector<double> rangeEqual;
     std::vector<double> rangeTotal;
@@ -410,6 +411,10 @@ struct Engine {
         return players[action].range;
     }
 
+    double& getOdds(int action) {
+        return players[action].odds;
+    }
+
     std::array<float, 1326>& getReward(int action) {
         return players[action].reward;
     }
@@ -580,15 +585,6 @@ struct Engine {
         return false;
     }
 
-    // Every player's chips at the end of the hand for each combo it might hold. Only a
-    // showdown makes this depend on the combo.
-    //
-    // At a showdown each combo's share of the pot is its expectation against every
-    // other live player's final range, excluding opponent combos that share a card
-    // with it. Opponents are treated as independent of each other, so card removal
-    // between opponents is ignored; ties split the pot exactly. The whole pot goes to
-    // the winners, with no side pots. Combos clashing with the full board are left at
-    // the player's chips and must not be used.
     void setRewards() {
         for (int i = 0; i < PLAYER_COUNT; i++) {
             players[i].reward.fill(players[i].chips);
@@ -644,9 +640,6 @@ struct Engine {
                 totalCard[comboCards[combo][1]] += r;
             }
 
-            // One ascending pass. For combo c on cards a, b, the weight of combos
-            // that do not share a card with c is W - W[a] - W[b] + w(c) by inclusion-
-            // exclusion, and c is never below itself.
             double belowAll = 0;
             std::array<double, 52> belowCard = {};
             std::array<double, 52> equalCard = {};
@@ -692,8 +685,6 @@ struct Engine {
                 if (players[i].range[combo] <= 0.0f) {
                     continue;
                 }
-                // Coefficient m: every opponent at or below this combo, with exactly
-                // m of them tied.
                 std::array<double, PLAYER_COUNT> poly = {};
                 poly[0] = 1.0;
                 int degree = 0;

@@ -36,6 +36,10 @@ struct RangeDecision {
     int option;
     float chips;
     float pot;
+    // The seat's odds and every combo's reach just before the decision; reach / odds is
+    // the expected weight of a combo's touch given the hand reached it.
+    double odds;
+    std::array<float, COMBO_COUNT> reach;
     int groupCount;
     std::array<uint8_t, GROUP_COUNT> liveGroups;
     std::array<Entry*, GROUP_COUNT> entries;
@@ -54,6 +58,7 @@ struct Worker {
     std::array<int, GROUP_COUNT> firstCombo;
     std::array<double, GROUP_COUNT> groupReach;
     std::array<std::array<double, 5>, GROUP_COUNT> policy;
+    std::array<std::array<double, 5>, GROUP_COUNT> sampling;
     std::array<double, GROUP_COUNT> visitMass;
     std::array<double, GROUP_COUNT> step;
     std::array<double, GROUP_COUNT> scale;
@@ -141,31 +146,42 @@ struct Explorer {
         return weights;
     }
 
-    // The node's policy at INV_TEMP over its legal options. Fold's weight is the
-    // exact 0, so it draws exp(0) = 1.
-    static void nodePolicy(const Entry& weights, std::array<double, 5>& probabilities) {
+    // The node's policy at INV_TEMP, and its sampling policy at SAMPLE_TEMP, over its
+    // legal options. Fold's weight is the exact 0, so it draws exp(0) = 1 in both.
+    static void nodePolicy(const Entry& weights, std::array<double, 5>& probabilities,
+            std::array<double, 5>& sampling) {
         const uint8_t legal = entryOptions(weights.stats.load(std::memory_order_relaxed));
         double sum = 0;
+        double sampleSum = 0;
         for (int j = 0; j < 5; j++) {
             double draw = 0;
+            double sampleDraw = 0;
             if (legal & (1u << j)) {
                 double w = j == 0 ? 0.0 : std::bit_cast<double>(
                     weights.weights[j - 1].load(std::memory_order_relaxed));
                 draw = std::exp(std::clamp(INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
+                sampleDraw = std::exp(std::clamp(SAMPLE_INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
             }
             probabilities[j] = draw;
             sum += draw;
+            sampling[j] = sampleDraw;
+            sampleSum += sampleDraw;
         }
         for (int j = 0; j < 5; j++) {
             probabilities[j] /= sum;
+            sampling[j] /= sampleSum;
         }
     }
 
     // Samples the acting seat's action from its whole range. Combos sharing a key share
-    // a node, so each node is looked up once and its policy weighted by the summed
-    // reach of its combos; one option is drawn from the sum. Every combo's reach is then
-    // multiplied by the probability its node gave that option, and dropped to 0 below
-    // RANGE_FLOOR times the largest reach left in the range.
+    // a node, so each node is looked up once and its sampling policy weighted by the
+    // summed reach of its combos; one option is drawn from the sum. Every combo's reach
+    // is then multiplied by the probability its node's INV_TEMP policy gave that option,
+    // and dropped to 0 below RANGE_FLOOR times the range's summed reach.
+    //
+    // The seat's odds take the option's sampled share. Every other seat still in the
+    // hand takes sampled share / INV_TEMP share, so its weights count this action at the
+    // frequency the range really plays it rather than the softer one it was drawn at.
     int chooseRangeOption(Worker& worker) {
         Engine& engine = worker.engine;
         const int seat = engine.getAction();
@@ -185,6 +201,7 @@ struct Explorer {
         decision.seat = seat;
         decision.chips = engine.getChips();
         decision.pot = engine.getPot();
+        decision.odds = engine.getOdds(seat);
         decision.groupCount = 0;
         decision.groups.fill(NO_GROUP);
         worker.firstCombo.fill(-1);
@@ -206,24 +223,26 @@ struct Explorer {
             }
             worker.groupReach[group] += range[combo];
             decision.groups[combo] = group;
+            decision.reach[combo] = range[combo];
         }
 
         std::array<double, 5> aggregate = {};
+        std::array<double, 5> sampled = {};
         for (int k = 0; k < decision.groupCount; k++) {
             const uint8_t group = decision.liveGroups[k];
             Entry& weights = locateNode(engine, worker.firstCombo[group], worker.keys[group], options);
             decision.entries[group] = &weights;
-            std::array<double, 5>& probabilities = worker.policy[group];
-            nodePolicy(weights, probabilities);
+            nodePolicy(weights, worker.policy[group], worker.sampling[group]);
             for (int j = 0; j < 5; j++) {
-                aggregate[j] += worker.groupReach[group] * probabilities[j];
+                aggregate[j] += worker.groupReach[group] * worker.policy[group][j];
+                sampled[j] += worker.groupReach[group] * worker.sampling[group][j];
             }
         }
 
         double running = 0;
         std::array<double, 5> dividers;
         for (int j = 0; j < 5; j++) {
-            running += aggregate[j];
+            running += sampled[j];
             dividers[j] = running;
         }
         if (!(running > 0)) {
@@ -232,12 +251,20 @@ struct Explorer {
         int option = 0;
         double sample = worker.unit(worker.gen) * running;
         for (int j = 0; j < 5; j++) {
-            if (sample < dividers[j] && aggregate[j] > 0) {
+            if (sample < dividers[j] && sampled[j] > 0) {
                 option = j;
                 break;
             }
         }
         decision.option = option;
+        const double sampledShare = sampled[option] / running;
+        const double targetShare = aggregate[option] / running;
+        engine.getOdds(seat) *= sampledShare;
+        for (int other = 0; other < PLAYER_COUNT; other++) {
+            if (other != seat && engine.players[other].inHand) {
+                engine.getOdds(other) *= sampledShare / targetShare;
+            }
+        }
 
         if constexpr (TRACE_KEY_ENABLED) {
             for (int k = 0; k < decision.groupCount; k++) {
@@ -265,6 +292,7 @@ struct Explorer {
                 node.probabilities = worker.policy[group];
                 for (int j = 0; j < 5; j++) {
                     node.aggregate[j] = aggregate[j] / running;
+                    node.sampled[j] = sampled[j] / running;
                 }
                 node.chips = decision.chips;
                 node.pot = decision.pot;
@@ -273,20 +301,20 @@ struct Explorer {
             }
         }
 
-        // The floor is relative to the seat's largest reach, so the range can never be
+        // The floor is relative to the range's summed reach, so the range can never be
         // emptied: an absolute floor drops a whole range whose reach has drifted down
         // over a long line.
-        float maxReach = 0.0f;
+        double rangeSum = 0;
         for (int combo = 0; combo < COMBO_COUNT; combo++) {
             const uint8_t group = decision.groups[combo];
             if (group == NO_GROUP) {
                 continue;
             }
             range[combo] *= float(worker.policy[group][option]);
-            maxReach = std::max(maxReach, range[combo]);
+            rangeSum += range[combo];
         }
         for (int combo = 0; combo < COMBO_COUNT; combo++) {
-            if (decision.groups[combo] != NO_GROUP && range[combo] < RANGE_FLOOR * maxReach) {
+            if (decision.groups[combo] != NO_GROUP && range[combo] < RANGE_FLOOR * rangeSum) {
                 range[combo] = 0.0f;
             }
         }
@@ -305,11 +333,20 @@ struct Explorer {
     }
 
     // At the end of the hand every combo still in its seat's range takes one EMA step
-    // toward its own pot normalised return, scaled by its final reach - the likelihood
-    // that combo played the whole line - so lines a combo would not have taken barely
-    // move it. A node's steps from one decision are composed and applied in one CAS,
-    // which equals applying them one combo at a time. Visits are the node's summed
-    // final reach, in 1/256 units with stochastic rounding.
+    // toward its own pot normalised return, scaled by its final reach over its seat's
+    // odds. The line was drawn at the sampled odds of the whole range's betting pattern
+    // and of every opponent's, but the combo plays it at its own reach against the
+    // opponents' real frequencies, so reach / odds weights each touch by how often it
+    // would really have happened. A node's steps from one decision are composed and
+    // applied in one CAS, which equals applying them one combo at a time.
+    //
+    // Visits add each combo's expected weight given the hand reached the decision -
+    // its reach / odds just before it - rather than the weight itself: everything from
+    // the decision on averages to 1, so the expectation drops that noise. Every combo
+    // live at the decision counts, with no end of hand filter: whether the board later
+    // rules a combo out depends on how the hand ends, which the sampling temperature
+    // changes, so filtering here would bias visits. In 1/256 units with stochastic
+    // rounding.
     void updateRangeWeights(Worker& worker, double multiplier) {
         Engine& engine = worker.engine;
         const std::array<bool, COMBO_COUNT>& commonRange = engine.getCommonRange();
@@ -325,6 +362,7 @@ struct Explorer {
             const RangeDecision& decision = worker.decisions[d];
             const std::array<float, COMBO_COUNT>& finalRange = engine.getRange(decision.seat);
             const std::array<float, COMBO_COUNT>& reward = engine.getReward(decision.seat);
+            const double odds = engine.getOdds(decision.seat);
             const bool train = decision.option != 0 && multiplier != 0.0;
             for (int k = 0; k < decision.groupCount; k++) {
                 const uint8_t group = decision.liveGroups[k];
@@ -337,13 +375,17 @@ struct Explorer {
             }
             for (int combo = 0; combo < COMBO_COUNT; combo++) {
                 const uint8_t group = decision.groups[combo];
-                if (group == NO_GROUP || !live[combo] || !(finalRange[combo] > 0.0f)) {
+                if (group == NO_GROUP) {
                     continue;
                 }
-                const double reach = finalRange[combo];
-                worker.visitMass[group] += 256.0 * reach;
-                if (train) {
-                    const double s = worker.step[group] * reach;
+                worker.visitMass[group] += 256.0 * decision.reach[combo] / decision.odds;
+                if (!live[combo]) {
+                    continue;
+                }
+                const double reach = finalRange[combo] / odds;
+                if (train && reach > 0.0) {
+                    // A touch of weight w is w unit steps: it keeps exp(-rate * w).
+                    const double s = -std::expm1(-worker.step[group] * reach);
                     const double target = (reward[combo] - decision.chips) / decision.pot;
                     worker.scale[group] *= 1.0 - s;
                     worker.shift[group] = (1.0 - s) * worker.shift[group] + s * target;
@@ -360,7 +402,7 @@ struct Explorer {
                         addVisits(weights, add);
                     }
                 }
-                if (!train || mass == 0.0) {
+                if (!train || worker.scale[group] == 1.0) {
                     continue;
                 }
                 auto [before, after] = affineUpdate(weights.weights[decision.option - 1],
@@ -410,8 +452,8 @@ struct Explorer {
             Entry& weights = strategy.dense[i];
             uint64_t stats = weights.stats.load(std::memory_order_relaxed);
             double visits = std::clamp(double(entryVisits(stats)), VISITS_FLOOR, VISITS_CEIL);
-            double alpha = -std::expm1(-1.0 / std::pow(visits, FLEXIBILITY));
-            long encoded = std::lround(std::log(alpha * INV_MIN_DELTA_INC) * INV_DELTA_SCALAR);
+            double rate = 1.0 / std::pow(visits, FLEXIBILITY);
+            long encoded = std::lround(std::log(rate * INV_MIN_DELTA_INC) * INV_DELTA_SCALAR);
             stats = (stats & ~DELTA_MASK) | uint64_t(std::clamp(encoded, 0L, 65535L)) << 40;
             weights.stats.store(stats, std::memory_order_relaxed);
         }
@@ -533,14 +575,15 @@ struct Explorer {
         }
     }
 
-    static std::string spec(bool metasBasic, bool memoryBasic) {
-        return std::to_string((int)(10000 * PLAYER_COUNT + 10 * CHIP_COUNT
-            + 10 * metasBasic + memoryBasic));
+    // The last digit names the trainer: 1 for this range trainer, 0 for single hand.
+    static std::string spec(bool metasBasic, bool memoryBasic, bool ranged) {
+        return std::to_string((int)(100000 * PLAYER_COUNT + 100 * CHIP_COUNT
+            + 100 * metasBasic + 10 * memoryBasic + ranged));
     }
     
     void downloadStrategyBase() {
         std::string path = "solver/strategies/strategy_"
-            + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC) + ".bin";
+            + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC, BASE_RANGED) + ".bin";
         uint64_t bytes = fileSize(path);
         std::ifstream file = openRead(path);
         uint64_t size;
@@ -574,7 +617,7 @@ struct Explorer {
 
     void uploadStrategy() {
         CheckedWriter writeFile("solver/strategies/strategy_"
-            + spec(METAS_BASIC, MEMORY_BASIC) + ".bin");
+            + spec(METAS_BASIC, MEMORY_BASIC, RANGED) + ".bin");
         uint64_t size = strategy.count();
         writeFile.write(&size, sizeof(size));
         for (uint64_t i = 0; i < size; i++) {
@@ -606,9 +649,11 @@ struct Explorer {
 
 int main () {
     try {
-        MIN_DELTA_INC = -std::expm1(-1.0 / std::pow(VISITS_CEIL, FLEXIBILITY));
+        // delta encodes the node's rate per unit of visit weight, 1 / visits^FLEXIBILITY,
+        // logarithmically between the rates at VISITS_CEIL (delta 0) and VISITS_FLOOR.
+        MIN_DELTA_INC = 1.0 / std::pow(VISITS_CEIL, FLEXIBILITY);
         INV_MIN_DELTA_INC = 1.0 / MIN_DELTA_INC;
-        DELTA_SCALAR = std::log(-std::expm1(-1.0 / std::pow(VISITS_FLOOR, FLEXIBILITY))
+        DELTA_SCALAR = std::log(1.0 / std::pow(VISITS_FLOOR, FLEXIBILITY)
             * INV_MIN_DELTA_INC) / 65535.0;
         INV_DELTA_SCALAR = 1.0 / DELTA_SCALAR;
 

@@ -66,8 +66,8 @@ inline uint64_t strategySlotBits(uint64_t records) {
 // depth and the abstraction, so a strategy file only answers for the config that
 // produced it.
 inline std::string fireflySpec() {
-    return std::to_string(int(10000 * PLAYER_COUNT + 10 * CHIP_COUNT
-        + 10 * METAS_BASIC + MEMORY_BASIC));
+    return std::to_string(int(100000 * PLAYER_COUNT + 100 * CHIP_COUNT
+        + 100 * METAS_BASIC + 10 * MEMORY_BASIC + RANGED));
 }
 
 inline std::string defaultStrategyPath() {
