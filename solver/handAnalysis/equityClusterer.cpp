@@ -20,6 +20,16 @@ double cdfDistance(const std::array<double, 165>& a, const std::array<double, 16
     return distance;
 }
 
+float distStrength(const std::array<float, 165>& point) {
+    double sum = 0;
+    double strength = 0;
+    for (int p = 0; p < 165; p++) {
+        sum += point[p];
+        strength += (164.5 - p) * sum;
+    }
+    return float(strength / (165 * 164.5 - 164 * 165 / 2));
+}
+
 void mergeDivision(std::vector<std::vector<uint64_t>>& clusterHands, std::vector<uint64_t>& clusterSizes,
         std::vector<std::array<float, 165>>& clusterPoints, std::vector<char>& alive,
         int begin, int end, int maxClusters) {
@@ -27,15 +37,27 @@ void mergeDivision(std::vector<std::vector<uint64_t>>& clusterHands, std::vector
     std::vector<std::array<double, 165>> cdfs(n);
     std::vector<int> nn(n);
     std::vector<double> nnDist(n);
+    std::vector<double> strengths(n);
     for (int i = 0; i < n; i++) {
         computeCdf(clusterPoints[begin + i], cdfs[i]);
+        strengths[i] = distStrength(clusterPoints[begin + i]);
     }
+    // Ward's merge cost: the cdf distance scaled by na * nb / (na + nb), so merging two
+    // large clusters costs more than folding a small one into a large one, and by
+    // sqrt(sa^2 + sb^2) over distStrength, so any merge involving a strong cluster costs more.
+    auto linkage = [&](int i, int j) {
+        double na = clusterSizes[begin + i];
+        double nb = clusterSizes[begin + j];
+        double sa = strengths[i];
+        double sb = strengths[j];
+        return std::sqrt(na * nb / (na + nb)) * (sa * sa + sb * sb) * cdfDistance(cdfs[i], cdfs[j]);
+    };
     auto rescan = [&](int i) {
         nn[i] = -1;
         nnDist[i] = std::numeric_limits<double>::max();
         for (int j = i + 1; j < n; j++) {
             if (!alive[begin + j]) continue;
-            double distance = cdfDistance(cdfs[i], cdfs[j]);
+            double distance = linkage(i, j);
             if (distance < nnDist[i]) {
                 nnDist[i] = distance;
                 nn[i] = j;
@@ -65,6 +87,7 @@ void mergeDivision(std::vector<std::vector<uint64_t>>& clusterHands, std::vector
         clusterSizes[ga] += clusterSizes[gb];
         alive[gb] = 0;
         computeCdf(clusterPoints[ga], cdfs[a]);
+        strengths[a] = distStrength(clusterPoints[ga]);
         rescan(a);
         // Only clusters below b can have pointed at a or b; those below a may now prefer the new a.
         for (int i = 0; i < b; i++) {
@@ -72,7 +95,7 @@ void mergeDivision(std::vector<std::vector<uint64_t>>& clusterHands, std::vector
             if (nn[i] == a || nn[i] == b) {
                 rescan(i);
             } else if (i < a) {
-                double distance = cdfDistance(cdfs[i], cdfs[a]);
+                double distance = linkage(i, a);
                 if (distance < nnDist[i] || (distance == nnDist[i] && a < nn[i])) {
                     nnDist[i] = distance;
                     nn[i] = a;
@@ -252,8 +275,8 @@ int main() {
                 dealer.flopSet();
             }
             std::unordered_map<uint64_t, uint8_t> localMetas;
-            clusterDists(flopHandDists, localMetas, 64);
-            clusterDists(turnHandDists, localMetas, 32);
+            clusterDists(flopHandDists, localMetas, 32);
+            clusterDists(turnHandDists, localMetas, 24);
             clusterDists(riverHandDists, localMetas, 16);
             std::lock_guard<std::mutex> lock(metaMutex);
             for (auto& [key, value] : localMetas) {
@@ -270,7 +293,7 @@ int main() {
     for (auto& t : threads) {
         t.join();
     }
-    std::string name = !BASIC ? "handMetas.bin" : "handMetasBasic.bin";
+    std::string name = !BASIC ? "solver/handAnalysis/handMetas.bin" : "solver/handAnalysis/handMetasBasic.bin";
     std::ofstream fileBasic(name, std::ios::binary);
     uint64_t size = handMetas.size();
     fileBasic.write(reinterpret_cast<const char*>(&size), sizeof(size));

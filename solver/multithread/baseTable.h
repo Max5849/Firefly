@@ -1,6 +1,6 @@
 #pragma once
 
-#include "solver/config.h"
+#include "solver/multithread/config.h"
 
 struct BaseEntry {
     uint64_t key;

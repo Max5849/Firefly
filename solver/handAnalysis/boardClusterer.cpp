@@ -71,7 +71,7 @@ int main() {
         dealer.flopSet();
     }
     std::cout << boardClassIndex;
-    std::string name = !BASIC ? "boardClasses.bin" : "boardClassesBasic.bin";
+    std::string name = !BASIC ? "solver/handAnalysis/boardClasses.bin" : "solver/handAnalysis/boardClassesBasic.bin";
     std::ofstream writeFile(name, std::ios::binary);
     writeFile.write(reinterpret_cast<char*>(boardClasses.data()), boardClasses.size() * sizeof(uint16_t));
     writeFile.close();

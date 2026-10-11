@@ -1,18 +1,30 @@
 #pragma once
 
-#include "solver/singleHand/config.h"
+#include "solver/multithread/config.h"
 #include "solver/handAnalysis/handClusterer.h"
+
+// The two cards of every combo in holePairIndex order. Built once.
+struct ComboTables {
+    std::array<std::array<int, 2>, COMBO_COUNT> cards;
+
+    ComboTables() {
+        for (int first = 0; first < 52; first++) {
+            for (int second = first + 1; second < 52; second++) {
+                cards[holePairIndex(first, second)] = {first, second};
+            }
+        }
+    }
+};
+
+inline const ComboTables comboTables;
 
 struct Engine {
     struct Player {
-        std::array<int, 2> holeCards;
-        uint64_t metaState;
-        uint64_t metaStateBasic;
-        uint32_t handScore;
-        // The importance ratio of the line: the product, over every decision made while
-        // this seat was in the hand, of the chosen option's INV_TEMP probability over its
-        // sampled probability.
-        double ratio;
+        std::array<float, 1326> range;
+        std::array<float, 1326> reward;
+        // The odds of this seat's betting pattern: the product, over its decisions, of
+        // the chosen option's share of the range's aggregate policy.
+        double odds;
         float chips;
         bool inHand;
         uint8_t position;
@@ -26,12 +38,10 @@ struct Engine {
         uint8_t relativePosition;
         uint8_t calls;
 
-        void set(std::array<int, 2> holeCards, uint64_t preflopHandClass, int position) {
-            this->holeCards = holeCards;
-            metaState = preflopHandClass;
-            metaStateBasic = preflopHandClass;
-            handScore = 0;
-            ratio = 1.0;
+        void set(int position) {
+            std::fill(range.begin(), range.end(), 1.0f);
+            reward = {0};
+            odds = 1.0;
             chips = CHIP_COUNT;
             inHand = true;
             this->position = position;
@@ -58,8 +68,11 @@ struct Engine {
     std::array<Player, PLAYER_COUNT> players;
     std::array<int, 52> deck;
     std::array<int, 5> boardCards;
+    std::array<bool, 1326> commonRange;
     uint64_t actionState;
     uint64_t actionStateBasic;
+    std::array<uint64_t, 1326> metaState;
+    std::array<uint64_t, 1326> metaStateBasic;
     uint8_t round;
     int heads;
     uint8_t headsBasic;
@@ -79,6 +92,10 @@ struct Engine {
     uint8_t hiddenRaiseStrength;
     uint8_t hiddenRaiseActionPosition;
     uint8_t calls;
+    // Showdown scratch, allocated on first use.
+    std::vector<double> rangeBelow;
+    std::vector<double> rangeEqual;
+    std::vector<double> rangeTotal;
 
     uint32_t getHandIndex(std::array<int, 2>& holeCards) {
         std::array<int, 7> handCards = {boardCards[0], boardCards[1], boardCards[2], 
@@ -201,23 +218,23 @@ struct Engine {
     std::uniform_int_distribution<int> cardDist;
     void shuffle(std::mt19937& gen) {
         using param = std::uniform_int_distribution<int>::param_type;
-        for (int i = 0; i < 2 * PLAYER_COUNT + 5; i++) {
+        for (int i = 0; i < 5; i++) {
             std::swap(deck[i], deck[cardDist(gen, param(i, 51))]);
         }
     }
 
     void deal() {
+        for (int i = 0; i < PLAYER_COUNT; i++) {
+            players[i].set(i);
+        }
         boardCards = {deck[0], deck[1], deck[2], deck[3], deck[4]};
         std::sort(boardCards.begin(), boardCards.begin() + 3, [](int a, int b) {
             return a < b;
         });
-        for (int i = 0; i < PLAYER_COUNT; i++) {
-            std::array<int, 2> holeCards = {deck[2 * i + 5], deck[2 * i + 6]};
-            std::sort(holeCards.begin(), holeCards.end(), [](int a, int b) {
-                return a < b;
-            });
-            players[i].set(holeCards,
-                preflopHandClasses[holePairIndex(holeCards[0], holeCards[1])], i);
+        std::fill(commonRange.begin(), commonRange.end(), 1);
+        for (int i = 0; i < 1326; i++) {
+            metaStateBasic[i] = preflopHandClasses[i];
+            metaState[i] = preflopHandClasses[i];
         }
         round = 0;
         heads = PLAYER_COUNT;
@@ -317,9 +334,9 @@ struct Engine {
         for (int i = 0; i < 4; ++i) {
             heroVillanStory *= 3;
             if (i != round) {
-                heroVillanStory += 2 * player.lastActions[i] + villan.lastActions[i];
+                heroVillanStory += 2 * player.lastActions[i] + !memoryBasic * villan.lastActions[i];
             } else {
-                heroVillanStory += player.lastActions[i] + villan.lastActions[i];
+                heroVillanStory += player.lastActions[i] + !memoryBasic * villan.lastActions[i];
             }
         }
         heroVillanStory *= 5;
@@ -409,21 +426,28 @@ struct Engine {
         return pot + (bet - players[action].bet);
     }
 
-    double& getRatio(int action) {
-        return players[action].ratio;
+    std::array<bool, 1326>& getCommonRange() {
+        return commonRange;
     }
 
-    int getHoleCombo(int action) {
-        return holePairIndex(players[action].holeCards[0], players[action].holeCards[1]);
+    std::array<float, 1326>& getRange(int action) {
+        return players[action].range;
+    }
+
+    double& getOdds(int action) {
+        return players[action].odds;
+    }
+
+    std::array<float, 1326>& getReward(int action) {
+        return players[action].reward;
     }
 
     uint64_t getActionState(bool memoryBasic) {
         return !memoryBasic ? actionState : actionStateBasic;
     }
 
-    // The acting player's meta state, the high part of its key.
-    uint64_t getMetaState(bool metasBasic) {
-        return !metasBasic ? players[action].metaState : players[action].metaStateBasic;
+    std::array<uint64_t, 1326>& getMetaState(bool metasBasic) {
+        return !metasBasic ? metaState : metaStateBasic;
     }
 
     bool play(int option) {
@@ -510,28 +534,62 @@ struct Engine {
         }
     }
 
-    // Classifies each live player's hand once and fills whichever meta states are
-    // needed.
+    void setCommonRange() {
+        for (int i = 0; i < 51; i++) {
+            for (int j = i + 1; j < 52; j++) {
+                for (int k = 0; k < round + 2; k++) {
+                    if (i == deck[k] || j == deck[k]) {
+                        commonRange[i * (101 - i) / 2 + j - 1] = 0;
+                        break;
+                    } 
+                }
+            }
+        }
+    }
+
+    // Classifies each combo once and fills whichever meta states are needed. Combos out
+    // of every live range are skipped: reach only falls, so they are never looked up
+    // again this hand.
     void setMetaState(bool needFull, bool needBasic) {
         uint32_t boardIndex = getBoardIndex();
         boardClass = boardClassTable[boardIndex];
         boardClassBasic = boardClassBasicTable[boardIndex];
-        for (int p = 0; p < PLAYER_COUNT; p++) {
-            Player& player = players[p];
-            if (!player.inHand) {
-                continue;
-            }
-            uint32_t handClass = handClusterer.classifyHand(boardCards, player.holeCards, round);
-            uint64_t key = uint64_t(boardClass) << 16 | uint64_t(handClass) << 32;
-            if (needFull) {
-                player.metaState = (uint64_t(boardClass + 169)
-                    | uint64_t(handMetas.at(key)) << 16) & 0x3FFFFF;
-            }
-            if (needBasic) {
-                player.metaStateBasic = (uint64_t(boardClassBasic + 169)
-                    | uint64_t(handMetasBasic.at(key)) << 16) & 0x3FFFFF;
+        for (int i = 0; i < 51; i++) {
+            for (int j = i + 1; j < 52; j++) {
+                int index = i * (101 - i) / 2 + j - 1;
+                if (!commonRange[index]) {
+                    continue;
+                }
+                bool live = false;
+                for (int p = 0; p < PLAYER_COUNT; p++) {
+                    if (players[p].inHand && players[p].range[index] > 0.0f) {
+                        live = true;
+                        break;
+                    }
+                }
+                if (!live) {
+                    continue;
+                }
+                uint32_t handClass = handClusterer.classifyHand(boardCards, {i, j}, round);
+                uint64_t key = uint64_t(boardClass) << 16 | uint64_t(handClass) << 32;
+                if (needFull) {
+                    metaState[index] = (uint64_t(boardClass + 169)
+                        | uint64_t(handMetas.at(key)) << 16) & 0x3FFFFF;
+                }
+                if (needBasic) {
+                    metaStateBasic[index] = (uint64_t(boardClassBasic + 169)
+                        | uint64_t(handMetasBasic.at(key)) << 16) & 0x3FFFFF;
+                }
             }
         }
+    }
+
+    // The combo's node within the current decision: combos with the same group share a
+    // key, because the action state and the board part of the meta state are common to
+    // the whole range. Preflop it is the 169 class, postflop the hand meta.
+    uint8_t getGroup(bool metasBasic, int combo) {
+        uint64_t meta = getMetaState(metasBasic)[combo];
+        return uint8_t(round == 0 ? meta : meta >> 16);
     }
 
     bool beginNewRound() {
@@ -562,36 +620,153 @@ struct Engine {
         return true;
     }
 
-    // Pays the pot to the best remaining hand, splitting ties. With one player left
-    // that is simply the pot going to them. The whole pot goes to the winners, with no
-    // side pots.
-    void showdown() {
-        uint32_t handMax = 0;
-        int handMaxCount = 0;
-        for (int i = 0; i < PLAYER_COUNT; i++) {
-            if (players[i].inHand) {
-                players[i].handScore = handScoreTable[getHandIndex(players[i].holeCards)];
-                if (players[i].handScore > handMax) {
-                    handMax = players[i].handScore;
-                    handMaxCount = 1;
-                } else if (players[i].handScore == handMax) {
-                    handMaxCount++;
-                }
+    bool comboConflicts(int combo, int boardCount) const {
+        const std::array<int, 2>& cards = comboTables.cards[combo];
+        for (int i = 0; i < boardCount; i++) {
+            if (boardCards[i] == cards[0] || boardCards[i] == cards[1]) {
+                return true;
             }
         }
-        for (int i = 0; i < PLAYER_COUNT; i++) {
-            if (players[i].inHand && players[i].handScore == handMax) {
-                players[i].chips += pot / handMaxCount;
-            }
-        }
+        return false;
     }
 
-    // Every player's chips at the end of the hand.
-    std::array<float, PLAYER_COUNT> getRewards() {
-        std::array<float, PLAYER_COUNT> rewards;
+    // Every player's chips at the end of the hand for each combo it might hold. Only a
+    // showdown makes this depend on the combo.
+    //
+    // At a showdown each combo's share of the pot is its expectation against every
+    // other live player's final range, excluding opponent combos that share a card
+    // with it. Opponents are treated as independent of each other, so card removal
+    // between opponents is ignored; ties split the pot exactly. The whole pot goes to
+    // the winners, with no side pots. Combos clashing with the full board are left at
+    // the player's chips and must not be used.
+    void setRewards() {
         for (int i = 0; i < PLAYER_COUNT; i++) {
-            rewards[i] = players[i].chips;
+            players[i].reward.fill(players[i].chips);
         }
-        return rewards;
+        if (heads == 1) {
+            for (int i = 0; i < PLAYER_COUNT; i++) {
+                if (players[i].inHand) {
+                    for (int combo = 0; combo < COMBO_COUNT; combo++) {
+                        players[i].reward[combo] += pot;
+                    }
+                }
+            }
+            return;
+        }
+
+        std::array<int, COMBO_COUNT> order;
+        std::array<uint32_t, COMBO_COUNT> scores;
+        int count = 0;
+        for (int combo = 0; combo < COMBO_COUNT; combo++) {
+            if (comboConflicts(combo, 5)) {
+                continue;
+            }
+            std::array<int, 2> cards = comboTables.cards[combo];
+            scores[combo] = handScoreTable[getHandIndex(cards)];
+            order[count++] = combo;
+        }
+        std::sort(order.begin(), order.begin() + count, [&](int a, int b) {
+            return scores[a] < scores[b];
+        });
+
+        rangeBelow.resize(PLAYER_COUNT * COMBO_COUNT);
+        rangeEqual.resize(PLAYER_COUNT * COMBO_COUNT);
+        rangeTotal.resize(PLAYER_COUNT * COMBO_COUNT);
+        std::array<int, PLAYER_COUNT> live;
+        int liveCount = 0;
+        for (int j = 0; j < PLAYER_COUNT; j++) {
+            if (!players[j].inHand) {
+                continue;
+            }
+            live[liveCount++] = j;
+            const std::array<float, COMBO_COUNT>& range = players[j].range;
+            double* below = &rangeBelow[j * COMBO_COUNT];
+            double* equal = &rangeEqual[j * COMBO_COUNT];
+            double* total = &rangeTotal[j * COMBO_COUNT];
+
+            double totalAll = 0;
+            std::array<double, 52> totalCard = {};
+            for (int k = 0; k < count; k++) {
+                int combo = order[k];
+                double r = range[combo];
+                totalAll += r;
+                totalCard[comboTables.cards[combo][0]] += r;
+                totalCard[comboTables.cards[combo][1]] += r;
+            }
+
+            // One ascending pass. For combo c on cards a, b, the weight of combos
+            // that do not share a card with c is W - W[a] - W[b] + w(c) by inclusion-
+            // exclusion, and c is never below itself.
+            double belowAll = 0;
+            std::array<double, 52> belowCard = {};
+            std::array<double, 52> equalCard = {};
+            for (int start = 0; start < count; ) {
+                int end = start;
+                double equalAll = 0;
+                while (end < count && scores[order[end]] == scores[order[start]]) {
+                    int combo = order[end];
+                    double r = range[combo];
+                    equalAll += r;
+                    equalCard[comboTables.cards[combo][0]] += r;
+                    equalCard[comboTables.cards[combo][1]] += r;
+                    end++;
+                }
+                for (int k = start; k < end; k++) {
+                    int combo = order[k];
+                    int a = comboTables.cards[combo][0];
+                    int b = comboTables.cards[combo][1];
+                    double r = range[combo];
+                    below[combo] = std::max(0.0, belowAll - belowCard[a] - belowCard[b]);
+                    equal[combo] = std::max(0.0, equalAll - equalCard[a] - equalCard[b] + r);
+                    total[combo] = std::max(0.0, totalAll - totalCard[a] - totalCard[b] + r);
+                }
+                for (int k = start; k < end; k++) {
+                    int combo = order[k];
+                    int a = comboTables.cards[combo][0];
+                    int b = comboTables.cards[combo][1];
+                    double r = range[combo];
+                    belowAll += r;
+                    belowCard[a] += r;
+                    belowCard[b] += r;
+                    equalCard[a] = 0;
+                    equalCard[b] = 0;
+                }
+                start = end;
+            }
+        }
+
+        for (int x = 0; x < liveCount; x++) {
+            int i = live[x];
+            for (int k = 0; k < count; k++) {
+                int combo = order[k];
+                if (players[i].range[combo] <= 0.0f) {
+                    continue;
+                }
+                // Coefficient m: every opponent at or below this combo, with exactly
+                // m of them tied.
+                std::array<double, PLAYER_COUNT> poly = {};
+                poly[0] = 1.0;
+                int degree = 0;
+                for (int y = 0; y < liveCount; y++) {
+                    int j = live[y];
+                    double z = rangeTotal[j * COMBO_COUNT + combo];
+                    if (j == i || z <= 0.0) {
+                        continue;
+                    }
+                    double lo = rangeBelow[j * COMBO_COUNT + combo] / z;
+                    double eq = rangeEqual[j * COMBO_COUNT + combo] / z;
+                    degree++;
+                    for (int m = degree; m > 0; m--) {
+                        poly[m] = poly[m] * lo + poly[m - 1] * eq;
+                    }
+                    poly[0] *= lo;
+                }
+                double share = 0;
+                for (int m = 0; m <= degree; m++) {
+                    share += poly[m] / (m + 1);
+                }
+                players[i].reward[combo] += float(pot * share);
+            }
+        }
     }
 };

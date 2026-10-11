@@ -1,8 +1,8 @@
-#include "solver/config.h"
-#include "solver/engine.h"
-#include "solver/strategyTable.h"
-#include "solver/baseTable.h"
-#include "solver/trace.h"
+#include "solver/multithread/config.h"
+#include "solver/multithread/engine.h"
+#include "solver/multithread/strategyTable.h"
+#include "solver/multithread/baseTable.h"
+#include "solver/multithread/trace.h"
 
 double MIN_DELTA_INC;
 double DELTA_SCALAR;
@@ -577,13 +577,13 @@ struct Explorer {
 
     // The last digit names the trainer: 1 for this range trainer, 0 for single hand.
     static std::string spec(bool metasBasic, bool memoryBasic, bool ranged) {
-        return std::to_string((int)(100000 * PLAYER_COUNT + 100 * CHIP_COUNT
-            + 100 * metasBasic + 10 * memoryBasic + ranged));
+        return std::to_string((int)(10000 * PLAYER_COUNT + 10 * CHIP_COUNT
+            + 10 * metasBasic + 1 * memoryBasic));
     }
     
     void downloadStrategyBase() {
         std::string path = "solver/strategies/strategy_"
-            + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC, BASE_RANGED) + ".bin";
+            + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC) + ".bin";
         uint64_t bytes = fileSize(path);
         std::ifstream file = openRead(path);
         uint64_t size;
@@ -617,7 +617,7 @@ struct Explorer {
 
     void uploadStrategy() {
         CheckedWriter writeFile("solver/strategies/strategy_"
-            + spec(METAS_BASIC, MEMORY_BASIC, RANGED) + ".bin");
+            + spec(METAS_BASIC, MEMORY_BASIC) + ".bin");
         uint64_t size = strategy.count();
         writeFile.write(&size, sizeof(size));
         for (uint64_t i = 0; i < size; i++) {

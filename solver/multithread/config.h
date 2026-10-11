@@ -11,57 +11,37 @@ constexpr bool MEMORY_BASIC = true;
 constexpr bool BASE_METAS_BASIC = true;
 constexpr bool BASE_MEMORY_BASIC = true;
 constexpr bool USE_BASE = false;
-// Which trainer wrote a strategy file: the range trainer (solver/explorer.cpp) or this
-// single hand one. The key layouts match, so a base may come from either.
-constexpr bool RANGED = false;
-constexpr bool BASE_RANGED = false;
-constexpr uint64_t EPOCHS = 100 * 10000793600;
-
+constexpr double BASE_CONFIDENCE = 16.0;
+constexpr uint64_t EPOCHS = 10000793600;
 constexpr double INV_TEMP = 5.545177444479562;
 constexpr double SAMPLE_INV_TEMP = 2.772588722239781;
 constexpr double FLEXIBILITY = 1.0;
 constexpr double LEARNING_RATE = 1.0;
-
 constexpr double VISITS_FLOOR = 5.0;
 constexpr double VISITS_CEIL = 4000317440.0;
-// Visits saturate at UINT32_MAX whole visits, which a hot node reaches within a block.
-static_assert(VISITS_CEIL <= 4294967295.0, "VISITS_CEIL must be a representable visit count");
+constexpr double RANGE_FLOOR = 0.00003771;
 
-// Clamp on INV_TEMP * w before exp, so a runaway weight cannot turn the option total
-// into inf or zero.
+
+constexpr bool TRACE_KEY_ENABLED = false;
+constexpr uint64_t TRACE_KEY = 0;
+
+constexpr uint64_t STRATEGY_RECORD_BYTES = 28;
+constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
+
+constexpr uint64_t STRATEGY_CAP_LOG2 = 28;
+constexpr double MAX_LOAD = 0.95;
+constexpr double BASE_MAX_LOAD = 0.5;
+
+constexpr uint64_t CHUNK_HANDS = 1ULL << 16;
+constexpr uint64_t PRINT_CHUNKS = 1ULL << 4;
+
 inline constexpr double MAX_EXP_ARG = 700.0;
 
-// Every two card holding. For cards i < j the combo index is
-// i * (101 - i) / 2 + j - 1, the addressing used throughout handAnalysis.
 inline constexpr int COMBO_COUNT = 1326;
 
 inline int holePairIndex(int i, int j) {
     return i * (101 - i) / 2 + j - 1;
 }
-
-// A strategy_<spec>.bin record: uint64 key, float weights[4] for options 1..4, and
-// uint32 visits. Weights are doubles only while the run holds them; every file the
-// solver writes or reads carries floats.
-constexpr uint64_t STRATEGY_RECORD_BYTES = 28;
-constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
-
-// An option survives the base prune when it would still be drawn at least once in
-// BASE_CONFIDENCE at INV_TEMP.
-constexpr double BASE_CONFIDENCE = 16.0;
-// The base table carries no fingerprint array, so a miss walks the whole cluster and
-// touches a 24 byte record at every step. Half the load is worth twice the slots.
-constexpr double BASE_MAX_LOAD = 0.5;
-
-// Prints every decision that reaches TRACE_KEY, and its update. The key is on the
-// current layout: action state in bits 0-41, meta state in bits 42-63.
-constexpr bool TRACE_KEY_ENABLED = false;
-constexpr uint64_t TRACE_KEY = 0;
-
-constexpr uint64_t STRATEGY_CAP_LOG2 = 28;
-constexpr double MAX_LOAD = 0.95;
-
-constexpr uint64_t CHUNK_HANDS = 1ULL << 16;
-constexpr uint64_t PRINT_CHUNKS = 1ULL << 4;
 
 inline uint64_t mix64(uint64_t x) {
     x ^= x >> 33;
@@ -149,3 +129,5 @@ struct CheckedWriter {
         }
     }
 };
+
+//update skills soon
