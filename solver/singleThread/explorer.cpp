@@ -288,16 +288,16 @@ struct Explorer {
         }
     }
 
-    static std::string spec(bool metasBasic, bool memoryBasic, bool ranged) {
+    static std::string spec(bool metasBasic, bool memoryBasic) {
         return std::to_string((int)(100000 * PLAYER_COUNT + 100 * CHIP_COUNT
-            + 100 * metasBasic + 10 * memoryBasic + ranged));
+            + 100 * metasBasic + 10 * memoryBasic));
     }
     
     static void downloadStrategyBase() {
         static std::once_flag loadFlag;
         std::call_once(loadFlag, [] {
             std::ifstream readFile("solver/strategies/strategy_"
-                + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC, BASE_RANGED) + ".bin", std::ios::binary);
+                + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC) + ".bin", std::ios::binary);
             uint64_t size = 0;
             readFile.read(reinterpret_cast<char*>(&size), sizeof(size));
             strategyBase.reserve(size);  
@@ -320,7 +320,7 @@ struct Explorer {
 
     void uploadStrategy() {
         std::ofstream writeFile("solver/strategies/strategy_"
-            + spec(METAS_BASIC, MEMORY_BASIC, RANGED) + ".bin");
+            + spec(METAS_BASIC, MEMORY_BASIC) + ".bin");
         uint64_t size = strategy.size();
         writeFile.write(reinterpret_cast<const char*>(&size), sizeof(size));
         for (auto& [key, entry] : strategy) {

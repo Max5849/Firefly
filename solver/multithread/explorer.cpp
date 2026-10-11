@@ -576,7 +576,7 @@ struct Explorer {
     }
 
     // The last digit names the trainer: 1 for this range trainer, 0 for single hand.
-    static std::string spec(bool metasBasic, bool memoryBasic, bool ranged) {
+    static std::string spec(bool metasBasic, bool memoryBasic) {
         return std::to_string((int)(10000 * PLAYER_COUNT + 10 * CHIP_COUNT
             + 10 * metasBasic + 1 * memoryBasic));
     }
