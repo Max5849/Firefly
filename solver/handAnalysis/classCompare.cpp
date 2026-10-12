@@ -198,9 +198,10 @@ std::string boardString(const std::array<int, 5>& cards, int street) {
     return text;
 }
 
-// Every board of the street whose class in the chosen tables matches the input's. Board
-// classes are cumulative, so only flops and turns that share the input's flop and turn
-// classes need to be walked.
+// Every board of the street whose class in the chosen tables matches the input's, tagged
+// with that class. Full classes are cumulative, so only flops and turns that share the
+// input's flop and turn classes need to be walked. Basic classes need not be, so every
+// earlier street is walked for them.
 std::vector<Board> matchingBoards(const std::array<int, 5>& input, int street, bool basic) {
     const std::vector<uint16_t>& table = basic ? boardClassesBasic : boardClasses;
     Dealer dealer;
@@ -209,23 +210,26 @@ std::vector<Board> matchingBoards(const std::array<int, 5>& input, int street, b
     for (int s = 1; s <= street; s++) {
         targets[s] = table[dealer.getBoardIndex(s)];
     }
+    auto matches = [&](int s) {
+        return (basic && s < street) || table[dealer.getBoardIndex(s)] == targets[s];
+    };
     std::vector<Board> boards;
     auto add = [&]() {
-        boards.push_back({dealer.boardCards, boardClasses[dealer.getBoardIndex(street)]});
+        boards.push_back({dealer.boardCards, table[dealer.getBoardIndex(street)]});
     };
     dealer = Dealer();
     while (dealer.flopGen()) {
-        if (table[dealer.getBoardIndex(1)] == targets[1]) {
+        if (matches(1)) {
             if (street == 1) {
                 add();
             }
             while (street > 1 && dealer.turnGen()) {
-                if (table[dealer.getBoardIndex(2)] == targets[2]) {
+                if (matches(2)) {
                     if (street == 2) {
                         add();
                     }
                     while (street > 2 && dealer.riverGen()) {
-                        if (table[dealer.getBoardIndex(3)] == targets[3]) {
+                        if (matches(3)) {
                             add();
                         }
                         dealer.riverSet();
@@ -259,13 +263,13 @@ void showClusters(const std::string& boardText, bool basic) {
     }
     std::vector<Board> boards = matchingBoards(input, street, basic);
     // Every cluster any of these boards can produce, so the scan can stop once all are full.
-    std::set<uint16_t> fullClasses;
+    std::set<uint16_t> classes;
     for (const Board& board : boards) {
-        fullClasses.insert(board.boardClass);
+        classes.insert(board.boardClass);
     }
     std::map<int, std::vector<std::string>> examples;
     for (const auto& [key, meta] : metas) {
-        if (fullClasses.count(uint16_t(key >> 16))) {
+        if (classes.count(uint16_t(key))) {
             examples[meta];
         }
     }
@@ -302,7 +306,7 @@ void showClusters(const std::string& boardText, bool basic) {
                 uint64_t id = b * 1326 + hole[0] * (101 - hole[0]) / 2 + hole[1] - 1;
                 if (clash || used.count(id)) continue;
                 uint32_t handClass = handClusterer.classifyHand(board.cards, hole, street);
-                auto found = metas.find(uint64_t(board.boardClass) << 16 | uint64_t(handClass) << 32);
+                auto found = metas.find(uint64_t(board.boardClass) | uint64_t(handClass) << 16);
                 int meta = found == metas.end() ? -1 : found->second;
                 std::vector<std::string>& list = examples[meta];
                 if (list.size() >= EXAMPLES || (pass == 0 && taken.count(meta))) continue;
@@ -335,7 +339,7 @@ void showClusters(const std::string& boardText, bool basic) {
         for (const std::array<int, 2>& hole : holes) {
             if (onBoard[hole[0]] || onBoard[hole[1]]) continue;
             uint32_t handClass = handClusterer.classifyHand(board.cards, hole, street);
-            auto found = metas.find(uint64_t(board.boardClass) << 16 | uint64_t(handClass) << 32);
+            auto found = metas.find(uint64_t(board.boardClass) | uint64_t(handClass) << 16);
             clusterOf[hole[0] * (101 - hole[0]) / 2 + hole[1] - 1] = found == metas.end() ? -1 : found->second;
         }
         for (size_t r = 0; r < runouts; r++) {

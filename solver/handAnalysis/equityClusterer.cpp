@@ -4,6 +4,10 @@
 
 bool BASIC = false;
 
+// Showdown histograms keyed by boardClass | handClass << 16, where boardClass is the full
+// class, or the basic class when BASIC is set.
+using HandDists = std::unordered_map<uint64_t, std::array<uint32_t, 165>>;
+
 void computeCdf(const std::array<float, 165>& point, std::array<double, 165>& cdf) {
     double sum = 0;
     for (int p = 0; p < 165; p++) {
@@ -50,7 +54,7 @@ void mergeDivision(std::vector<std::vector<uint64_t>>& clusterHands, std::vector
         double nb = clusterSizes[begin + j];
         double sa = strengths[i];
         double sb = strengths[j];
-        return std::sqrt(na * nb / (na + nb)) * (sa * sa + sb * sb) * cdfDistance(cdfs[i], cdfs[j]);
+        return na * nb / (na + nb) * std::sqrt(sa * sa + sb * sb) * cdfDistance(cdfs[i], cdfs[j]);
     };
     auto rescan = [&](int i) {
         nn[i] = -1;
@@ -105,54 +109,94 @@ void mergeDivision(std::vector<std::vector<uint64_t>>& clusterHands, std::vector
     }
 }
 
-void clusterDists(std::unordered_map<uint64_t, std::array<float, 165>>& handDists, 
-        std::unordered_map<uint64_t, uint8_t>& handMetas, int maxClusters) {
-    std::vector<std::vector<uint64_t>> clusterHands;
-    std::vector<uint64_t> clusterSizes;
-    std::vector<std::array<float, 165>> clusterPoints;
-    std::vector<uint64_t> keys;
-    keys.reserve(handDists.size());
+// Moves every histogram in from into into, summing those whose key both hold.
+void mergeDists(HandDists& into, HandDists& from) {
+    into.merge(from);
+    for (auto& [key, dist] : from) {
+        std::array<uint32_t, 165>& target = into[key];
+        for (int p = 0; p < 165; p++) {
+            target[p] += dist[p];
+        }
+    }
+    from.clear();
+}
+
+// Clusters each board class's hands independently, spread across threads. A key that
+// handMetas already holds is left alone and counted, since it means two streets share a
+// board class id. Returns that count.
+uint64_t clusterDists(HandDists& handDists, std::unordered_map<uint64_t, uint8_t>& handMetas, int maxClusters) {
+    std::vector<std::pair<uint64_t, const std::array<uint32_t, 165>*>> entries;
+    entries.reserve(handDists.size());
     for (auto& q : handDists) {
-        keys.push_back(q.first);
+        entries.push_back({q.first, &q.second});
     }
-    std::sort(keys.begin(), keys.end(), [](uint64_t x, uint64_t y) {
-        uint16_t bx = static_cast<uint16_t>(x), by = static_cast<uint16_t>(y);
-        return bx != by ? bx < by : x < y;
+    std::sort(entries.begin(), entries.end(), [](const auto& x, const auto& y) {
+        uint16_t bx = static_cast<uint16_t>(x.first), by = static_cast<uint16_t>(y.first);
+        return bx != by ? bx < by : x.first < y.first;
     });
-    for (uint64_t key : keys) {
-        std::array<float, 165>& dist = handDists[key];
-        clusterHands.push_back({key});
-        float sum = 0.0f;
-        for (int i = 0; i < 165; i++) {
-            sum += dist[i];
-        }
-        for (int i = 0; i < 165; i++) {
-            dist[i] /= sum;
-        }
-        clusterSizes.push_back(sum);
-        clusterPoints.push_back(dist);
-    }
-    std::vector<int> divisions;
-    for (size_t i = 0; i < keys.size();) {
-        divisions.push_back(static_cast<int>(i));
-        uint32_t boardClass = static_cast<uint16_t>(keys[i]);
-        while (i < keys.size() && static_cast<uint16_t>(keys[i]) == boardClass) {
+    std::vector<std::pair<size_t, size_t>> divisions;
+    for (size_t i = 0; i < entries.size();) {
+        size_t begin = i;
+        uint16_t boardClass = static_cast<uint16_t>(entries[i].first);
+        while (i < entries.size() && static_cast<uint16_t>(entries[i].first) == boardClass) {
             i++;
         }
+        divisions.push_back({begin, i});
     }
-    divisions.push_back(static_cast<int>(keys.size()));
-    std::vector<char> alive(keys.size(), 1);
-    for (int i = divisions.size() - 2; i >= 0; i--) {
-        mergeDivision(clusterHands, clusterSizes, clusterPoints, alive, divisions[i], divisions[i + 1], maxClusters);
-        int cluster = 0;
-        for (int j = divisions[i]; j < divisions[i + 1]; j++) {
-            if (!alive[j]) continue;
-            for (auto& q : clusterHands[j]) {
-                handMetas[uint64_t(q) & ~uint64_t(0xFFFF)] = cluster;
+    // Largest first, so a big division does not start last and run alone.
+    std::sort(divisions.begin(), divisions.end(), [](const auto& x, const auto& y) {
+        return x.second - x.first > y.second - y.first;
+    });
+    std::cout << entries.size() << " keys in " << divisions.size() << " board classes, largest "
+        << (divisions.empty() ? 0 : divisions[0].second - divisions[0].first) << "\n";
+
+    std::mutex metaMutex;
+    std::atomic<size_t> nextDivision{0};
+    uint64_t collisions = 0;
+    auto worker = [&]() {
+        while (true) {
+            size_t d = nextDivision.fetch_add(1);
+            if (d >= divisions.size()) break;
+            auto [begin, end] = divisions[d];
+            int n = static_cast<int>(end - begin);
+            std::vector<std::vector<uint64_t>> clusterHands(n);
+            std::vector<uint64_t> clusterSizes(n);
+            std::vector<std::array<float, 165>> clusterPoints(n);
+            for (int i = 0; i < n; i++) {
+                const auto& [key, dist] = entries[begin + i];
+                clusterHands[i] = {key};
+                uint64_t sum = 0;
+                for (int p = 0; p < 165; p++) {
+                    sum += (*dist)[p];
+                }
+                for (int p = 0; p < 165; p++) {
+                    clusterPoints[i][p] = float(double((*dist)[p]) / double(sum));
+                }
+                clusterSizes[i] = sum;
             }
-            cluster++;
+            std::vector<char> alive(n, 1);
+            mergeDivision(clusterHands, clusterSizes, clusterPoints, alive, 0, n, maxClusters);
+            std::lock_guard<std::mutex> lock(metaMutex);
+            int cluster = 0;
+            for (int i = 0; i < n; i++) {
+                if (!alive[i]) continue;
+                for (uint64_t key : clusterHands[i]) {
+                    if (!handMetas.try_emplace(key, cluster).second) {
+                        collisions++;
+                    }
+                }
+                cluster++;
+            }
         }
+    };
+    std::vector<std::thread> threads;
+    for (unsigned t = 0; t < std::max(1u, std::thread::hardware_concurrency()); t++) {
+        threads.emplace_back(worker);
     }
+    for (auto& t : threads) {
+        t.join();
+    }
+    return collisions;
 }
 
 int main() {
@@ -165,19 +209,22 @@ int main() {
     boardClassesBasic.resize(60929700);
     std::ifstream otherFile("solver/handAnalysis/boardClassesBasic.bin", std::ios::binary);
     otherFile.read(reinterpret_cast<char*>(boardClassesBasic.data()), boardClassesBasic.size() * sizeof(uint16_t));
-    std::unordered_map<uint64_t, uint8_t> handMetas;
+    const std::vector<uint16_t>& classTable = !BASIC ? boardClasses : boardClassesBasic;
+
+    // Work is split by full flop class only to divide the enumeration. Histograms are
+    // merged into global maps and clustered once every board has been walked, so a board
+    // class may draw its boards from any number of flops.
     std::set<uint32_t> flopClasses;
     while (dealer.flopGen()) {
-        if (!BASIC) {
-            flopClasses.insert(boardClasses[dealer.getBoardIndex(1)]);
-        } else {
-            flopClasses.insert(boardClassesBasic[dealer.getBoardIndex(1)]);
-        }
+        flopClasses.insert(boardClasses[dealer.getBoardIndex(1)]);
         dealer.flopSet();
     }
 
     std::vector<uint32_t> flopClassList(flopClasses.begin(), flopClasses.end());
-    std::mutex metaMutex;
+    HandDists flopHandDists;
+    HandDists turnHandDists;
+    HandDists riverHandDists;
+    std::mutex distMutex;
     std::atomic<size_t> nextIndex{0};
     std::atomic<int> done{0};
     unsigned numThreads = std::max(1u, std::thread::hardware_concurrency());
@@ -190,22 +237,16 @@ int main() {
             if (ci >= flopClassList.size()) break;
             uint32_t u = flopClassList[ci];
 
-            std::unordered_map<uint64_t, std::array<float, 165>> flopHandDists;
-            std::unordered_map<uint64_t, std::array<float, 165>> turnHandDists;
-            std::unordered_map<uint64_t, std::array<float, 165>> riverHandDists;
+            HandDists localFlopDists;
+            HandDists localTurnDists;
+            HandDists localRiverDists;
             dealer = Dealer();
             while (dealer.flopGen()) {
-                uint32_t flopClass = boardClasses[dealer.getBoardIndex(1)];
-                uint32_t flopClassSig;
-                if (!BASIC) {
-                    flopClassSig = boardClasses[dealer.getBoardIndex(1)];
-                } else {
-                    flopClassSig = boardClassesBasic[dealer.getBoardIndex(1)];
-                }
-                if (flopClassSig != u) {
+                if (boardClasses[dealer.getBoardIndex(1)] != u) {
                     dealer.flopSet();
                     continue;
                 }
+                uint64_t flopClass = classTable[dealer.getBoardIndex(1)];
                 std::array<uint32_t, 1326> flopHandClasses;
                 bool onFlop[52] = {false};
                 for (int k = 0; k < 3; k++) onFlop[dealer.boardCards[k]] = true;
@@ -218,13 +259,7 @@ int main() {
                     }
                 }
                 while (dealer.turnGen()) {
-                    uint32_t turnClass = boardClasses[dealer.getBoardIndex(2)];
-                    uint32_t turnClassSig;
-                    if (!BASIC) {
-                        turnClassSig = boardClasses[dealer.getBoardIndex(2)];
-                    } else {
-                        turnClassSig = boardClassesBasic[dealer.getBoardIndex(2)];
-                    }
+                    uint64_t turnClass = classTable[dealer.getBoardIndex(2)];
                     std::array<uint32_t, 1326> turnHandClasses;
                     bool onTurn[52] = {false};
                     for (int k = 0; k < 4; k++) onTurn[dealer.boardCards[k]] = true;
@@ -237,13 +272,7 @@ int main() {
                         }
                     }
                     while (dealer.riverGen()) {
-                        uint32_t riverClass = boardClasses[dealer.getBoardIndex(3)];
-                        uint32_t riverClassSig;
-                        if (!BASIC) {
-                            riverClassSig = boardClasses[dealer.getBoardIndex(3)];
-                        } else {
-                            riverClassSig = boardClassesBasic[dealer.getBoardIndex(3)];
-                        }
+                        uint64_t riverClass = classTable[dealer.getBoardIndex(3)];
                         std::array<uint32_t, 1326> riverHandClasses;
                         bool onRiver[52] = {false};
                         for (int k = 0; k < 5; k++) onRiver[dealer.boardCards[k]] = true;
@@ -261,12 +290,9 @@ int main() {
                             if (referenceRanks[i] == -1) {
                                 continue;
                             }
-                            flopHandDists[uint64_t(flopClassSig) | uint64_t(flopClass) << 16
-                                | uint64_t(flopHandClasses[i]) << 32][referenceRank]++;
-                            turnHandDists[uint64_t(turnClassSig) | uint64_t(turnClass) << 16
-                                | uint64_t(turnHandClasses[i]) << 32][referenceRank]++;
-                            riverHandDists[uint64_t(riverClassSig) | uint64_t(riverClass) << 16
-                                | uint64_t(riverHandClasses[i]) << 32][referenceRank]++;
+                            localFlopDists[flopClass | uint64_t(flopHandClasses[i]) << 16][referenceRank]++;
+                            localTurnDists[turnClass | uint64_t(turnHandClasses[i]) << 16][referenceRank]++;
+                            localRiverDists[riverClass | uint64_t(riverHandClasses[i]) << 16][referenceRank]++;
                         }
                         dealer.riverSet();
                     }
@@ -274,15 +300,11 @@ int main() {
                 }
                 dealer.flopSet();
             }
-            std::unordered_map<uint64_t, uint8_t> localMetas;
-            clusterDists(flopHandDists, localMetas, 32);
-            clusterDists(turnHandDists, localMetas, 24);
-            clusterDists(riverHandDists, localMetas, 16);
-            std::lock_guard<std::mutex> lock(metaMutex);
-            for (auto& [key, value] : localMetas) {
-                handMetas[key] = value;
-            }
-            std::cout << ++done << " / " << flopClassList.size() << " flop classes processed\n";
+            std::lock_guard<std::mutex> lock(distMutex);
+            mergeDists(flopHandDists, localFlopDists);
+            mergeDists(turnHandDists, localTurnDists);
+            mergeDists(riverHandDists, localRiverDists);
+            std::cout << ++done << " / " << flopClassList.size() << " flop classes accumulated\n";
         }
     };
 
@@ -293,6 +315,23 @@ int main() {
     for (auto& t : threads) {
         t.join();
     }
+
+    std::unordered_map<uint64_t, uint8_t> handMetas;
+    uint64_t collisions = 0;
+    std::cout << "clustering flop: ";
+    collisions += clusterDists(flopHandDists, handMetas, 32);
+    flopHandDists = HandDists();
+    std::cout << "clustering turn: ";
+    collisions += clusterDists(turnHandDists, handMetas, 24);
+    turnHandDists = HandDists();
+    std::cout << "clustering river: ";
+    collisions += clusterDists(riverHandDists, handMetas, 16);
+    riverHandDists = HandDists();
+    if (collisions > 0) {
+        std::cout << "warning: " << collisions << " keys share a board class id across streets;"
+            << " the first street clustered kept its cluster id\n";
+    }
+
     std::string name = !BASIC ? "solver/handAnalysis/handMetas.bin" : "solver/handAnalysis/handMetasBasic.bin";
     std::ofstream fileBasic(name, std::ios::binary);
     uint64_t size = handMetas.size();

@@ -571,12 +571,13 @@ struct Engine {
                     continue;
                 }
                 uint32_t handClass = handClusterer.classifyHand(boardCards, {i, j}, round);
-                uint64_t key = uint64_t(boardClass) << 16 | uint64_t(handClass) << 32;
                 if (needFull) {
+                    uint64_t key = uint64_t(boardClass) | uint64_t(handClass) << 16;
                     metaState[index] = (uint64_t(boardClass + 169)
                         | uint64_t(handMetas.at(key)) << 16) & 0x3FFFFF;
                 }
                 if (needBasic) {
+                    uint64_t key = uint64_t(boardClassBasic) | uint64_t(handClass) << 16;
                     metaStateBasic[index] = (uint64_t(boardClassBasic + 169)
                         | uint64_t(handMetasBasic.at(key)) << 16) & 0x3FFFFF;
                 }

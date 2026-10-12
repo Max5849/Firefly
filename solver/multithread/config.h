@@ -129,5 +129,3 @@ struct CheckedWriter {
         }
     }
 };
-
-//update skills soon
