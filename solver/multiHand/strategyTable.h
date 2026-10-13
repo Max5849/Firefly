@@ -1,6 +1,6 @@
 #pragma once
 
-#include "solver/multithread/config.h"
+#include "solver/multiHand/config.h"
 
 inline void cpuRelax() {
 #if defined(__aarch64__)

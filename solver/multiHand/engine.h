@@ -1,6 +1,6 @@
 #pragma once
 
-#include "solver/multithread/config.h"
+#include "solver/multiHand/config.h"
 #include "solver/handAnalysis/handClusterer.h"
 
 // The two cards of every combo in holePairIndex order, and as a 52-bit card mask. Built once.

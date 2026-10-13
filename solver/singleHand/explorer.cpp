@@ -1,16 +1,16 @@
-#include "solver/multithread/config.h"
-#include "solver/multithread/engine.h"
-#include "solver/multithread/strategyTable.h"
-#include "solver/multithread/baseTable.h"
-#include "solver/multithread/trace.h"
+#include "solver/singleHand/config.h"
+#include "solver/singleHand/engine.h"
+#include "solver/singleHand/strategyTable.h"
+#include "solver/singleHand/baseTable.h"
+#include "solver/singleHand/trace.h"
 
 double MIN_DELTA_INC;
 double DELTA_SCALAR;
 double INV_MIN_DELTA_INC;
 double INV_DELTA_SCALAR;
 
-// Applies w <- scale * w + shift atomically. A run of EMA steps w <- w + s (t - w)
-// composes into one such map, so a node's steps from one decision land in one CAS.
+// Applies w <- scale * w + shift atomically. An EMA step w <- w + s (t - w) is the map
+// with scale 1 - s and shift s * t.
 static inline std::pair<double, double> affineUpdate(std::atomic<uint64_t>& word,
             double scale, double shift) {
     uint64_t old = word.load(std::memory_order_relaxed);
@@ -24,50 +24,23 @@ static inline std::pair<double, double> affineUpdate(std::atomic<uint64_t>& word
     return {value, std::bit_cast<double>(next)};
 }
 
-// A combo's node within a decision; see Engine::getGroup. NO_GROUP marks a combo that
-// was out of the range.
-inline constexpr int GROUP_COUNT = 256;
-inline constexpr uint8_t NO_GROUP = 0xFF;
-
-// One decision of the hand. Every combo of the acting seat still in its range was
-// assigned to the node its key names; each node was looked up once.
-struct RangeDecision {
+// One decision of the hand: the acting seat's hand looked up its one node.
+struct Decision {
+    Entry* entry;
     int seat;
     int option;
     float chips;
     float pot;
-    // The line's odds and every combo's line reach (Engine::lineReach) just before the
-    // decision; reach / odds is the expected weight of a combo's touch given the hand
-    // reached it.
-    double odds;
-    std::array<double, COMBO_COUNT> reach;
-    int groupCount;
-    std::array<uint8_t, GROUP_COUNT> liveGroups;
-    std::array<Entry*, GROUP_COUNT> entries;
-    std::array<uint8_t, COMBO_COUNT> groups;
+    // The seat's ratio just before the decision: the expected weight of the touch given
+    // the hand reached it.
+    double ratio;
 };
 
 struct Worker {
     Engine engine;
     std::mt19937 gen;
     std::uniform_real_distribution<double> unit{0.0, 1.0};
-    // Reused across hands; decisionCount is how many are live in this one.
-    std::vector<RangeDecision> decisions;
-    size_t decisionCount = 0;
-    // Per node scratch, indexed by group.
-    std::array<uint64_t, GROUP_COUNT> keys;
-    std::array<int, GROUP_COUNT> firstCombo;
-    std::array<double, GROUP_COUNT> groupReach;
-    std::array<std::array<double, 5>, GROUP_COUNT> policy;
-    std::array<std::array<double, 5>, GROUP_COUNT> sampling;
-    std::array<double, GROUP_COUNT> visitMass;
-    std::array<double, GROUP_COUNT> step;
-    std::array<double, GROUP_COUNT> scale;
-    std::array<double, GROUP_COUNT> shift;
-    // Per seat scratch for updateRangeWeights: each combo's final line reach, filled the
-    // first time one of the seat's decisions trains.
-    std::array<std::array<double, COMBO_COUNT>, PLAYER_COUNT> lineWeight;
-    std::array<bool, PLAYER_COUNT> lineWeighed;
+    std::vector<Decision> decisions;
     std::vector<TraceNode> tracePath;
 
     explicit Worker(unsigned t) : gen(15 + t) {
@@ -104,10 +77,9 @@ struct Explorer {
     explicit Explorer(unsigned threads) : threads(threads), bar(threads), nextChunk(0), doneChunks(0),
         totalHands(0), lastReportHands(0), lastReportTime(std::chrono::steady_clock::now()) {}
 
-    // Finds the node for one key, inserting it if new. combo is a combo that reaches the
-    // key, used only for the base key. Visits are not counted here: they are counted at
-    // the end of the hand, weighted by reach.
-    Entry& locateNode(Engine& engine, int combo, uint64_t key, const std::array<bool, 5>& options) {
+    // Finds the node for one key, inserting it if new. Visits are not counted here: they
+    // are counted at the end of the hand, weighted by the ratio.
+    Entry& locateNode(Engine& engine, uint64_t key, const std::array<bool, 5>& options) {
         bool inserted = false;
         uint64_t slotIndex = 0;
         uint64_t word = 0;
@@ -116,7 +88,7 @@ struct Explorer {
             const BaseEntry* base = nullptr;
             if constexpr (USE_BASE) {
                 base = strategyBase.find(engine.getActionState(BASE_MEMORY_BASIC)
-                    | engine.getMetaState(BASE_METAS_BASIC)[combo] << 42);
+                    | engine.getMetaState(BASE_METAS_BASIC) << 42);
             }
             uint8_t legal = 0;
             if (base == nullptr) {
@@ -185,166 +157,74 @@ struct Explorer {
         }
     }
 
-    // Samples the acting seat's action from its whole range. Combos sharing a key share
-    // a node, so each node is looked up once and its sampling policy weighted by the
-    // summed reach of its combos; one option is drawn from the sum. Every combo's reach
-    // is then multiplied by the probability its node's INV_TEMP policy gave that option,
-    // and dropped to 0 below RANGE_FLOOR times the range's summed reach.
+    // Draws the acting seat's action from its node's sampling policy.
     //
-    // The line's odds take the option's sampled share. What the INV_TEMP policies make of
-    // the action is not a scalar: it lives in the ranges, and Engine::lineReach reads it
-    // per combo with each combo's card removal, so a combo that blocks the hands an
-    // opponent continues with sees that opponent fold more often.
-    int chooseRangeOption(Worker& worker) {
+    // Every seat still in the hand, the acting one included, multiplies its ratio by the
+    // option's INV_TEMP probability over its sampled probability, so its weights count
+    // the line at the frequency the policy really plays it rather than the softer one it
+    // was drawn at. This is the range trainer's reach / odds for a range of one combo.
+    int chooseOption(Worker& worker) {
         Engine& engine = worker.engine;
         const int seat = engine.getAction();
-        std::array<float, COMBO_COUNT>& range = engine.getRange(seat);
-        const std::array<bool, COMBO_COUNT>& commonRange = engine.getCommonRange();
-        // setActionState() wrote spr and cpr, which getOptions() reads; neither depends
-        // on the combo, so legality is shared by the whole range.
+        // setActionState() wrote spr and cpr, which getOptions() reads.
         const std::array<bool, 5> options = engine.getOptions();
-        const uint64_t actionState = engine.getActionState(MEMORY_BASIC);
-        const std::array<uint64_t, COMBO_COUNT>& metaState = engine.getMetaState(METAS_BASIC);
-
-        if (worker.decisionCount == worker.decisions.size()) {
-            worker.decisions.emplace_back();
-        }
-        const int decisionIndex = int(worker.decisionCount++);
-        RangeDecision& decision = worker.decisions[decisionIndex];
-        decision.seat = seat;
-        decision.chips = engine.getChips();
-        decision.pot = engine.getPot();
-        decision.odds = engine.lineOdds;
-        decision.groupCount = 0;
-        decision.groups.fill(NO_GROUP);
-        worker.firstCombo.fill(-1);
-
-        // Keys first, one per node, prefetching each home slot so the lookups below
-        // overlap their cache misses.
-        for (int combo = 0; combo < COMBO_COUNT; combo++) {
-            if (!commonRange[combo] || !(range[combo] > 0.0f)) {
-                continue;
-            }
-            const uint8_t group = engine.getGroup(METAS_BASIC, combo);
-            if (worker.firstCombo[group] < 0) {
-                worker.firstCombo[group] = combo;
-                worker.groupReach[group] = 0.0;
-                decision.liveGroups[decision.groupCount++] = group;
-                uint64_t key = actionState | metaState[combo] << 42;
-                worker.keys[group] = key;
-                strategy.prefetch(key);
-            }
-            worker.groupReach[group] += range[combo];
-            decision.groups[combo] = group;
-        }
-        // Every combo's line reach, read only for combos with a group. Filled here, while
-        // the prefetches above are in flight.
-        engine.lineReach(seat, decision.reach);
-
-        std::array<double, 5> aggregate = {};
-        std::array<double, 5> sampled = {};
-        for (int k = 0; k < decision.groupCount; k++) {
-            const uint8_t group = decision.liveGroups[k];
-            Entry& weights = locateNode(engine, worker.firstCombo[group], worker.keys[group], options);
-            decision.entries[group] = &weights;
-            nodePolicy(weights, worker.policy[group], worker.sampling[group]);
-            for (int j = 0; j < 5; j++) {
-                aggregate[j] += worker.groupReach[group] * worker.policy[group][j];
-                sampled[j] += worker.groupReach[group] * worker.sampling[group][j];
-            }
-        }
+        const uint64_t key = engine.getActionState(MEMORY_BASIC)
+            | engine.getMetaState(METAS_BASIC) << 42;
+        Entry& weights = locateNode(engine, key, options);
+        std::array<double, 5> policy;
+        std::array<double, 5> sampling;
+        nodePolicy(weights, policy, sampling);
 
         double running = 0;
         std::array<double, 5> dividers;
         for (int j = 0; j < 5; j++) {
-            running += sampled[j];
+            running += sampling[j];
             dividers[j] = running;
-        }
-        if (!(running > 0)) {
-            throw std::runtime_error("the acting seat's range is empty");
         }
         int option = 0;
         double sample = worker.unit(worker.gen) * running;
         for (int j = 0; j < 5; j++) {
-            if (sample < dividers[j] && sampled[j] > 0) {
+            if (sample < dividers[j] && sampling[j] > 0) {
                 option = j;
                 break;
             }
         }
-        decision.option = option;
-        engine.lineOdds *= sampled[option] / running;
+
+        const int decisionIndex = int(worker.decisions.size());
+        worker.decisions.push_back({&weights, seat, option, engine.getChips(),
+            engine.getPot(), engine.getRatio(seat)});
+        const double ratio = policy[option] / sampling[option];
+        for (int other = 0; other < PLAYER_COUNT; other++) {
+            if (engine.players[other].inHand) {
+                engine.getRatio(other) *= ratio;
+            }
+        }
 
         if constexpr (TRACE_KEY_ENABLED) {
-            for (int k = 0; k < decision.groupCount; k++) {
-                const uint8_t group = decision.liveGroups[k];
-                if (worker.keys[group] != TRACE_KEY) {
-                    continue;
-                }
-                Entry& weights = *decision.entries[group];
+            if (key == TRACE_KEY) {
                 const uint64_t stats = weights.stats.load(std::memory_order_relaxed);
                 TraceNode node{};
-                node.key = worker.keys[group];
+                node.key = key;
                 node.decision = decisionIndex;
-                node.group = group;
-                node.combo = worker.firstCombo[group];
+                node.combo = engine.getHoleCombo(seat);
                 node.action = seat;
                 node.option = option;
                 node.legal = entryOptions(stats);
                 node.visits = entryVisits(stats);
                 node.delta = entryDelta(stats);
-                node.reach = worker.groupReach[group];
+                node.ratio = worker.decisions.back().ratio;
                 for (int j = 0; j < 4; j++) {
                     node.weights[j] = std::bit_cast<double>(
                         weights.weights[j].load(std::memory_order_relaxed));
                 }
-                node.probabilities = worker.policy[group];
-                for (int j = 0; j < 5; j++) {
-                    node.aggregate[j] = aggregate[j] / running;
-                    node.sampled[j] = sampled[j] / running;
-                }
-                node.chips = decision.chips;
-                node.pot = decision.pot;
+                node.probabilities = policy;
+                node.sampled = sampling;
+                node.chips = worker.decisions.back().chips;
+                node.pot = worker.decisions.back().pot;
                 node.updated = false;
                 worker.tracePath.push_back(node);
             }
         }
-
-        // The floor is relative to the range's summed reach, so the range can never be
-        // emptied: an absolute floor drops a whole range whose reach has drifted down
-        // over a long line.
-        double rangeSum = 0;
-        for (int combo = 0; combo < COMBO_COUNT; combo++) {
-            const uint8_t group = decision.groups[combo];
-            if (group == NO_GROUP) {
-                continue;
-            }
-            range[combo] *= float(worker.policy[group][option]);
-            rangeSum += range[combo];
-        }
-        // The seat's card removal sums (Engine::lineReach) are rebuilt in the same pass. The
-        // combos with a group are exactly those that miss the revealed board, which is what
-        // blockMask holds between streets. Combos run in holePairIndex order, first card a
-        // then second card b, so a's sum stays in a register and b's adds are contiguous.
-        const double floor = RANGE_FLOOR * rangeSum;
-        double blockTotal = 0;
-        std::array<double, 52>& blockCard = engine.blockCard[seat];
-        blockCard.fill(0.0);
-        int combo = 0;
-        for (int a = 0; a < 51; a++) {
-            double cardA = 0;
-            for (int b = a + 1; b < 52; b++, combo++) {
-                const bool kept = decision.groups[combo] != NO_GROUP;
-                if (kept && range[combo] < floor) {
-                    range[combo] = 0.0f;
-                }
-                const double r = kept ? range[combo] : 0.0;
-                cardA += r;
-                blockCard[b] += r;
-            }
-            blockCard[a] += cardA;
-            blockTotal += cardA;
-        }
-        engine.blockTotal[seat] = blockTotal;
         return option;
     }
 
@@ -359,118 +239,60 @@ struct Explorer {
         std::cout << out.str() << std::flush;
     }
 
-    // At the end of the hand every combo still in its seat's range takes one EMA step
-    // toward its own pot normalised return, scaled by its line reach over the line's
-    // odds. The line was drawn at the sampling policies of the whole ranges, but the
-    // combo plays it at its own reach, against the opponents' real frequencies given the
-    // cards it and the board remove, so lineReach / lineOdds weights each touch by how
-    // often it would really have happened. A node's steps from one decision are composed
-    // and applied in one CAS, which equals applying them one combo at a time.
+    // At the end of the hand every decision takes one EMA step toward its seat's pot
+    // normalised return, scaled by the seat's final ratio: the line was drawn at the
+    // sampled frequencies of every seat, so the ratio weights the touch by how often it
+    // would really have happened.
     //
-    // Visits add each combo's expected weight given the hand reached the decision -
-    // its line reach / odds just before it - rather than the weight itself: everything
-    // from the decision on averages to 1, so the expectation drops that noise. Every
-    // combo live at the decision counts, with no end of hand filter: lineReach's board
-    // scale already pays back the combos a later board card rules out. In 1/256 units
-    // with stochastic rounding.
-    void updateRangeWeights(Worker& worker, double multiplier) {
+    // Visits add each decision's expected weight given the hand reached it - the ratio
+    // just before it - rather than the weight itself: everything from the decision on
+    // averages to 1, so the expectation drops that noise. Folds count too. In 1/256
+    // units with stochastic rounding.
+    void updateWeights(Worker& worker, double multiplier) {
         Engine& engine = worker.engine;
-        // At a showdown a combo must also miss all five board cards: a hand that ends all
-        // in before the river has not removed the turn and river from commonRange, and
-        // setRewards gives a combo holding one of them no share of the pot. Otherwise the
-        // revealed board, which the removal sums already hold, is the whole board. Weights
-        // are only needed by a decision that trains, so warm-up and folds skip them.
-        const bool showdown = engine.heads > 1;
-        if (showdown && multiplier != 0.0 && engine.blockCount != 5) {
-            engine.setBlocks(5);
-        }
-        worker.lineWeighed.fill(false);
-        for (size_t d = 0; d < worker.decisionCount; d++) {
-            const RangeDecision& decision = worker.decisions[d];
-            const std::array<float, COMBO_COUNT>& reward = engine.getReward(decision.seat);
-            const bool train = decision.option != 0 && multiplier != 0.0;
-            std::array<double, COMBO_COUNT>& lineWeight = worker.lineWeight[decision.seat];
-            if (train && !worker.lineWeighed[decision.seat]) {
-                worker.lineWeighed[decision.seat] = true;
-                engine.lineReach(decision.seat, lineWeight);
-            }
-            for (int k = 0; k < decision.groupCount; k++) {
-                const uint8_t group = decision.liveGroups[k];
-                worker.visitMass[group] = 0.0;
-                worker.scale[group] = 1.0;
-                worker.shift[group] = 0.0;
-                worker.step[group] = train ? LEARNING_RATE * multiplier * MIN_DELTA_INC
-                    * std::exp(DELTA_SCALAR * entryDelta(
-                        decision.entries[group]->stats.load(std::memory_order_relaxed))) : 0.0;
-            }
-            for (int combo = 0; combo < COMBO_COUNT; combo++) {
-                const uint8_t group = decision.groups[combo];
-                if (group == NO_GROUP) {
-                    continue;
-                }
-                worker.visitMass[group] += 256.0 * decision.reach[combo] / decision.odds;
-                const double reach = train ? lineWeight[combo] / engine.lineOdds : 0.0;
-                if (reach > 0.0) {
-                    // A touch of weight w is w unit steps: it keeps exp(-rate * w).
-                    const double s = -std::expm1(-worker.step[group] * reach);
-                    const double target = (reward[combo] - decision.chips) / decision.pot;
-                    worker.scale[group] *= 1.0 - s;
-                    worker.shift[group] = (1.0 - s) * worker.shift[group] + s * target;
+        const std::array<float, PLAYER_COUNT> rewards = engine.getRewards();
+        for (size_t d = 0; d < worker.decisions.size(); d++) {
+            const Decision& decision = worker.decisions[d];
+            Entry& weights = *decision.entry;
+            const double mass = 256.0 * decision.ratio;
+            if (mass > 0.0) {
+                uint64_t add = uint64_t(mass);
+                add += worker.unit(worker.gen) < mass - double(add);
+                if (add > 0) {
+                    addVisits(weights, add);
                 }
             }
-            for (int k = 0; k < decision.groupCount; k++) {
-                const uint8_t group = decision.liveGroups[k];
-                Entry& weights = *decision.entries[group];
-                const double mass = worker.visitMass[group];
-                if (mass > 0.0) {
-                    uint64_t add = uint64_t(mass);
-                    add += worker.unit(worker.gen) < mass - double(add);
-                    if (add > 0) {
-                        addVisits(weights, add);
-                    }
-                }
-                if (!train || worker.scale[group] == 1.0) {
-                    continue;
-                }
-                auto [before, after] = affineUpdate(weights.weights[decision.option - 1],
-                    worker.scale[group], worker.shift[group]);
-                if constexpr (TRACE_KEY_ENABLED) {
-                    for (TraceNode& node : worker.tracePath) {
-                        if (node.decision != int(d) || node.group != group) {
-                            continue;
-                        }
-                        node.updated = true;
-                        node.step = 1.0 - worker.scale[group];
-                        node.target = worker.shift[group] / node.step;
-                        node.before = before;
-                        node.after = after;
-                        node.combos = 0;
-                        node.targetMin = std::numeric_limits<double>::max();
-                        node.targetMax = std::numeric_limits<double>::lowest();
-                        for (int combo = 0; combo < COMBO_COUNT; combo++) {
-                            if (decision.groups[combo] != group || !(lineWeight[combo] > 0.0)) {
-                                continue;
-                            }
-                            double target = (reward[combo] - decision.chips) / decision.pot;
-                            node.combos++;
-                            node.targetMin = std::min(node.targetMin, target);
-                            node.targetMax = std::max(node.targetMax, target);
-                        }
-                    }
-                }
+            const double ratio = engine.getRatio(decision.seat);
+            if (decision.option == 0 || multiplier == 0.0 || !(ratio > 0.0)) {
+                continue;
             }
+            const double step = LEARNING_RATE * multiplier * MIN_DELTA_INC
+                * std::exp(DELTA_SCALAR * entryDelta(weights.stats.load(std::memory_order_relaxed)));
+            // A touch of weight w is w unit steps: it keeps exp(-rate * w).
+            const double s = -std::expm1(-step * ratio);
+            const double target = (rewards[decision.seat] - decision.chips) / decision.pot;
+            auto [before, after] = affineUpdate(weights.weights[decision.option - 1],
+                1.0 - s, s * target);
             if constexpr (TRACE_KEY_ENABLED) {
                 for (TraceNode& node : worker.tracePath) {
-                    if (node.decision == int(d)) {
-                        node.finalReach = worker.visitMass[node.group] / 256.0;
+                    if (node.decision != int(d)) {
+                        continue;
                     }
+                    node.updated = true;
+                    node.step = s;
+                    node.target = target;
+                    node.before = before;
+                    node.after = after;
                 }
             }
         }
         if constexpr (TRACE_KEY_ENABLED) {
+            for (TraceNode& node : worker.tracePath) {
+                node.finalRatio = engine.getRatio(node.action);
+            }
             printTrace(worker);
         }
-        worker.decisionCount = 0;
+        worker.decisions.clear();
     }
 
     void updateDeltasRange(uint64_t begin, uint64_t end) {
@@ -505,7 +327,7 @@ struct Explorer {
         Engine& engine = worker.engine;
         engine.shuffle(worker.gen);
         engine.deal();
-        worker.decisionCount = 0;
+        worker.decisions.clear();
         while (true) {
             do {
                 if (!MEMORY_BASIC || (USE_BASE && !BASE_MEMORY_BASIC)) {
@@ -514,16 +336,15 @@ struct Explorer {
                 if (MEMORY_BASIC || (USE_BASE && BASE_MEMORY_BASIC)) {
                     engine.setActionState(true);
                 }
-            } while (engine.play(chooseRangeOption(worker)));
+            } while (engine.play(chooseOption(worker)));
             if (!engine.beginNewRound()) {
-                engine.setRewards();
+                engine.showdown();
                 break;
             }
-            engine.setCommonRange();
             engine.setMetaState(!METAS_BASIC || (USE_BASE && !BASE_METAS_BASIC),
                 METAS_BASIC || (USE_BASE && BASE_METAS_BASIC));
         }
-        updateRangeWeights(worker, multiplier);
+        updateWeights(worker, multiplier);
     }
 
     void runBlock(Worker& worker, Phase phase, uint64_t blockBase, uint64_t phaseHands) {
@@ -581,15 +402,14 @@ struct Explorer {
     }
 
     void workerMain(unsigned t) {
-        // On the heap: the range scratch makes a Worker too large for a thread stack.
-        auto worker = std::make_unique<Worker>(t);
-        runBlock(*worker, Phase::Warmup, 0, WARMUP_HANDS);
+        Worker worker(t);
+        runBlock(worker, Phase::Warmup, 0, WARMUP_HANDS);
         for (uint64_t block = 0; block < BLOCKS; block++) {
             deltaPass(t);
-            runBlock(*worker, Phase::Training, block * BLOCK, BLOCK);
+            runBlock(worker, Phase::Training, block * BLOCK, BLOCK);
         }
         deltaPass(t);
-        runBlock(*worker, Phase::Cooldown, 0, COOLDOWN_HANDS);
+        runBlock(worker, Phase::Cooldown, 0, COOLDOWN_HANDS);
         deltaPass(t, true);
     }
 
@@ -613,12 +433,13 @@ struct Explorer {
         }
     }
 
-    // The last digit names the trainer: 1 for this range trainer, 0 for single hand.
+    // The trailing s marks a single hand strategy, keeping it apart from the range
+    // trainer's file at the same spec.
     static std::string spec(bool metasBasic, bool memoryBasic) {
         return std::to_string((int)(10000 * PLAYER_COUNT + 10 * CHIP_COUNT
-            + 10 * metasBasic + 1 * memoryBasic));
+            + 10 * metasBasic + 1 * memoryBasic)) + "s";
     }
-    
+
     void downloadStrategyBase() {
         std::string path = "solver/strategies/strategy_"
             + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC) + ".bin";
@@ -718,8 +539,7 @@ int main () {
                   << "FLEXIBILITY: " << FLEXIBILITY << "\n"
                   << "LEARNING_RATE: " << LEARNING_RATE << "\n"
                   << "VISITS_FLOOR: " << VISITS_FLOOR << "\n"
-                  << "VISITS_CEIL: " << VISITS_CEIL << "\n"
-                  << "RANGE_FLOOR: " << RANGE_FLOOR << std::endl;
+                  << "VISITS_CEIL: " << VISITS_CEIL << std::endl;
 
         Engine::loadTables();
 
