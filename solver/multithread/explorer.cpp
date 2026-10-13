@@ -36,10 +36,11 @@ struct RangeDecision {
     int option;
     float chips;
     float pot;
-    // The seat's odds and every combo's reach just before the decision; reach / odds is
-    // the expected weight of a combo's touch given the hand reached it.
+    // The line's odds and every combo's line reach (Engine::lineReach) just before the
+    // decision; reach / odds is the expected weight of a combo's touch given the hand
+    // reached it.
     double odds;
-    std::array<float, COMBO_COUNT> reach;
+    std::array<double, COMBO_COUNT> reach;
     int groupCount;
     std::array<uint8_t, GROUP_COUNT> liveGroups;
     std::array<Entry*, GROUP_COUNT> entries;
@@ -63,6 +64,10 @@ struct Worker {
     std::array<double, GROUP_COUNT> step;
     std::array<double, GROUP_COUNT> scale;
     std::array<double, GROUP_COUNT> shift;
+    // Per seat scratch for updateRangeWeights: each combo's final line reach, filled the
+    // first time one of the seat's decisions trains.
+    std::array<std::array<double, COMBO_COUNT>, PLAYER_COUNT> lineWeight;
+    std::array<bool, PLAYER_COUNT> lineWeighed;
     std::vector<TraceNode> tracePath;
 
     explicit Worker(unsigned t) : gen(15 + t) {
@@ -88,9 +93,16 @@ struct Explorer {
     std::atomic<uint64_t> nextChunk;
     // Chunks of the current phase block that have finished, as opposed to been claimed.
     std::atomic<uint64_t> doneChunks;
-    std::mutex printMutex;
+    // Hands finished over the whole run, across every phase. On its own cache line, since
+    // every thread bumps it once a hand (128 bytes covers Apple silicon's line size).
+    alignas(128) std::atomic<uint64_t> totalHands;
+    alignas(128) std::mutex printMutex;
+    // The hand count and time at the last report, guarded by printMutex.
+    uint64_t lastReportHands;
+    std::chrono::steady_clock::time_point lastReportTime;
 
-    explicit Explorer(unsigned threads) : threads(threads), bar(threads), nextChunk(0), doneChunks(0) {}
+    explicit Explorer(unsigned threads) : threads(threads), bar(threads), nextChunk(0), doneChunks(0),
+        totalHands(0), lastReportHands(0), lastReportTime(std::chrono::steady_clock::now()) {}
 
     // Finds the node for one key, inserting it if new. combo is a combo that reaches the
     // key, used only for the base key. Visits are not counted here: they are counted at
@@ -179,9 +191,10 @@ struct Explorer {
     // is then multiplied by the probability its node's INV_TEMP policy gave that option,
     // and dropped to 0 below RANGE_FLOOR times the range's summed reach.
     //
-    // The seat's odds take the option's sampled share. Every other seat still in the
-    // hand takes sampled share / INV_TEMP share, so its weights count this action at the
-    // frequency the range really plays it rather than the softer one it was drawn at.
+    // The line's odds take the option's sampled share. What the INV_TEMP policies make of
+    // the action is not a scalar: it lives in the ranges, and Engine::lineReach reads it
+    // per combo with each combo's card removal, so a combo that blocks the hands an
+    // opponent continues with sees that opponent fold more often.
     int chooseRangeOption(Worker& worker) {
         Engine& engine = worker.engine;
         const int seat = engine.getAction();
@@ -201,7 +214,7 @@ struct Explorer {
         decision.seat = seat;
         decision.chips = engine.getChips();
         decision.pot = engine.getPot();
-        decision.odds = engine.getOdds(seat);
+        decision.odds = engine.lineOdds;
         decision.groupCount = 0;
         decision.groups.fill(NO_GROUP);
         worker.firstCombo.fill(-1);
@@ -223,8 +236,10 @@ struct Explorer {
             }
             worker.groupReach[group] += range[combo];
             decision.groups[combo] = group;
-            decision.reach[combo] = range[combo];
         }
+        // Every combo's line reach, read only for combos with a group. Filled here, while
+        // the prefetches above are in flight.
+        engine.lineReach(seat, decision.reach);
 
         std::array<double, 5> aggregate = {};
         std::array<double, 5> sampled = {};
@@ -257,14 +272,7 @@ struct Explorer {
             }
         }
         decision.option = option;
-        const double sampledShare = sampled[option] / running;
-        const double targetShare = aggregate[option] / running;
-        engine.getOdds(seat) *= sampledShare;
-        for (int other = 0; other < PLAYER_COUNT; other++) {
-            if (other != seat && engine.players[other].inHand) {
-                engine.getOdds(other) *= sampledShare / targetShare;
-            }
-        }
+        engine.lineOdds *= sampled[option] / running;
 
         if constexpr (TRACE_KEY_ENABLED) {
             for (int k = 0; k < decision.groupCount; k++) {
@@ -313,11 +321,30 @@ struct Explorer {
             range[combo] *= float(worker.policy[group][option]);
             rangeSum += range[combo];
         }
-        for (int combo = 0; combo < COMBO_COUNT; combo++) {
-            if (decision.groups[combo] != NO_GROUP && range[combo] < RANGE_FLOOR * rangeSum) {
-                range[combo] = 0.0f;
+        // The seat's card removal sums (Engine::lineReach) are rebuilt in the same pass. The
+        // combos with a group are exactly those that miss the revealed board, which is what
+        // blockMask holds between streets. Combos run in holePairIndex order, first card a
+        // then second card b, so a's sum stays in a register and b's adds are contiguous.
+        const double floor = RANGE_FLOOR * rangeSum;
+        double blockTotal = 0;
+        std::array<double, 52>& blockCard = engine.blockCard[seat];
+        blockCard.fill(0.0);
+        int combo = 0;
+        for (int a = 0; a < 51; a++) {
+            double cardA = 0;
+            for (int b = a + 1; b < 52; b++, combo++) {
+                const bool kept = decision.groups[combo] != NO_GROUP;
+                if (kept && range[combo] < floor) {
+                    range[combo] = 0.0f;
+                }
+                const double r = kept ? range[combo] : 0.0;
+                cardA += r;
+                blockCard[b] += r;
             }
+            blockCard[a] += cardA;
+            blockTotal += cardA;
         }
+        engine.blockTotal[seat] = blockTotal;
         return option;
     }
 
@@ -333,37 +360,40 @@ struct Explorer {
     }
 
     // At the end of the hand every combo still in its seat's range takes one EMA step
-    // toward its own pot normalised return, scaled by its final reach over its seat's
-    // odds. The line was drawn at the sampled odds of the whole range's betting pattern
-    // and of every opponent's, but the combo plays it at its own reach against the
-    // opponents' real frequencies, so reach / odds weights each touch by how often it
-    // would really have happened. A node's steps from one decision are composed and
-    // applied in one CAS, which equals applying them one combo at a time.
+    // toward its own pot normalised return, scaled by its line reach over the line's
+    // odds. The line was drawn at the sampling policies of the whole ranges, but the
+    // combo plays it at its own reach, against the opponents' real frequencies given the
+    // cards it and the board remove, so lineReach / lineOdds weights each touch by how
+    // often it would really have happened. A node's steps from one decision are composed
+    // and applied in one CAS, which equals applying them one combo at a time.
     //
     // Visits add each combo's expected weight given the hand reached the decision -
-    // its reach / odds just before it - rather than the weight itself: everything from
-    // the decision on averages to 1, so the expectation drops that noise. Every combo
-    // live at the decision counts, with no end of hand filter: whether the board later
-    // rules a combo out depends on how the hand ends, which the sampling temperature
-    // changes, so filtering here would bias visits. In 1/256 units with stochastic
-    // rounding.
+    // its line reach / odds just before it - rather than the weight itself: everything
+    // from the decision on averages to 1, so the expectation drops that noise. Every
+    // combo live at the decision counts, with no end of hand filter: lineReach's board
+    // scale already pays back the combos a later board card rules out. In 1/256 units
+    // with stochastic rounding.
     void updateRangeWeights(Worker& worker, double multiplier) {
         Engine& engine = worker.engine;
-        const std::array<bool, COMBO_COUNT>& commonRange = engine.getCommonRange();
         // At a showdown a combo must also miss all five board cards: a hand that ends all
         // in before the river has not removed the turn and river from commonRange, and
-        // setRewards gives a combo holding one of them no share of the pot.
+        // setRewards gives a combo holding one of them no share of the pot. Otherwise the
+        // revealed board, which the removal sums already hold, is the whole board. Weights
+        // are only needed by a decision that trains, so warm-up and folds skip them.
         const bool showdown = engine.heads > 1;
-        std::array<bool, COMBO_COUNT> live;
-        for (int combo = 0; combo < COMBO_COUNT; combo++) {
-            live[combo] = commonRange[combo] && !(showdown && engine.comboConflicts(combo, 5));
+        if (showdown && multiplier != 0.0 && engine.blockCount != 5) {
+            engine.setBlocks(5);
         }
+        worker.lineWeighed.fill(false);
         for (size_t d = 0; d < worker.decisionCount; d++) {
             const RangeDecision& decision = worker.decisions[d];
-            const std::array<float, COMBO_COUNT>& finalRange = engine.getRange(decision.seat);
             const std::array<float, COMBO_COUNT>& reward = engine.getReward(decision.seat);
-            const double odds = engine.getOdds(decision.seat);
             const bool train = decision.option != 0 && multiplier != 0.0;
+            std::array<double, COMBO_COUNT>& lineWeight = worker.lineWeight[decision.seat];
+            if (train && !worker.lineWeighed[decision.seat]) {
+                worker.lineWeighed[decision.seat] = true;
+                engine.lineReach(decision.seat, lineWeight);
+            }
             for (int k = 0; k < decision.groupCount; k++) {
                 const uint8_t group = decision.liveGroups[k];
                 worker.visitMass[group] = 0.0;
@@ -379,11 +409,8 @@ struct Explorer {
                     continue;
                 }
                 worker.visitMass[group] += 256.0 * decision.reach[combo] / decision.odds;
-                if (!live[combo]) {
-                    continue;
-                }
-                const double reach = finalRange[combo] / odds;
-                if (train && reach > 0.0) {
+                const double reach = train ? lineWeight[combo] / engine.lineOdds : 0.0;
+                if (reach > 0.0) {
                     // A touch of weight w is w unit steps: it keeps exp(-rate * w).
                     const double s = -std::expm1(-worker.step[group] * reach);
                     const double target = (reward[combo] - decision.chips) / decision.pot;
@@ -421,8 +448,7 @@ struct Explorer {
                         node.targetMin = std::numeric_limits<double>::max();
                         node.targetMax = std::numeric_limits<double>::lowest();
                         for (int combo = 0; combo < COMBO_COUNT; combo++) {
-                            if (decision.groups[combo] != group || !live[combo]
-                                    || !(finalRange[combo] > 0.0f)) {
+                            if (decision.groups[combo] != group || !(lineWeight[combo] > 0.0)) {
                                 continue;
                             }
                             double target = (reward[combo] - decision.chips) / decision.pot;
@@ -515,6 +541,8 @@ struct Explorer {
                     multiplier = 1.0 - double(base + j) / double(phaseHands);
                 }
                 playHand(worker, multiplier);
+                // Counted per hand, not per chunk, so a report's rate is not quantised to chunks.
+                totalHands.fetch_add(1, std::memory_order_relaxed);
             }
             // Chunks finish out of order across threads, so progress is the count of
             // finished chunks, not the offset of the one this thread just played.
@@ -540,6 +568,15 @@ struct Explorer {
             out << "Cooldown: " << 100.0 * double(globalHand) / double(COOLDOWN_HANDS) << "% Complete\n";
         }
         out << "Strategy Size: " << strategy.count() << "\n";
+        // The rate covers only the hands finished since the last report.
+        const uint64_t hands = totalHands.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        const double hours = std::chrono::duration<double, std::ratio<3600>>(now - lastReportTime).count();
+        if (hours > 0.0) {
+            out << std::setprecision(0) << "Hands/Hour: " << double(hands - lastReportHands) / hours << "\n";
+        }
+        lastReportHands = hands;
+        lastReportTime = now;
         std::cout << out.str() << std::flush;
     }
 
@@ -557,6 +594,7 @@ struct Explorer {
     }
 
     void run() {
+        lastReportTime = std::chrono::steady_clock::now();
         std::vector<std::thread> pool;
         pool.reserve(threads);
         for (unsigned t = 0; t < threads; t++) {
@@ -665,6 +703,23 @@ int main () {
             threads = 1;
         }
         std::cout << "Threads: " << threads << std::endl;
+        std::cout << std::boolalpha << std::setprecision(12)
+                  << "PLAYER_COUNT: " << PLAYER_COUNT << "\n"
+                  << "CHIP_COUNT: " << CHIP_COUNT << "\n"
+                  << "METAS_BASIC: " << METAS_BASIC << "\n"
+                  << "MEMORY_BASIC: " << MEMORY_BASIC << "\n"
+                  << "BASE_METAS_BASIC: " << BASE_METAS_BASIC << "\n"
+                  << "BASE_MEMORY_BASIC: " << BASE_MEMORY_BASIC << "\n"
+                  << "USE_BASE: " << USE_BASE << "\n"
+                  << "BASE_CONFIDENCE: " << BASE_CONFIDENCE << "\n"
+                  << "EPOCHS: " << EPOCHS << "\n"
+                  << "INV_TEMP: " << INV_TEMP << "\n"
+                  << "SAMPLE_INV_TEMP: " << SAMPLE_INV_TEMP << "\n"
+                  << "FLEXIBILITY: " << FLEXIBILITY << "\n"
+                  << "LEARNING_RATE: " << LEARNING_RATE << "\n"
+                  << "VISITS_FLOOR: " << VISITS_FLOOR << "\n"
+                  << "VISITS_CEIL: " << VISITS_CEIL << "\n"
+                  << "RANGE_FLOOR: " << RANGE_FLOOR << std::endl;
 
         Engine::loadTables();
 

@@ -3,14 +3,16 @@
 #include "solver/multithread/config.h"
 #include "solver/handAnalysis/handClusterer.h"
 
-// The two cards of every combo in holePairIndex order. Built once.
+// The two cards of every combo in holePairIndex order, and as a 52-bit card mask. Built once.
 struct ComboTables {
     std::array<std::array<int, 2>, COMBO_COUNT> cards;
+    std::array<uint64_t, COMBO_COUNT> masks;
 
     ComboTables() {
         for (int first = 0; first < 52; first++) {
             for (int second = first + 1; second < 52; second++) {
                 cards[holePairIndex(first, second)] = {first, second};
+                masks[holePairIndex(first, second)] = 1ULL << first | 1ULL << second;
             }
         }
     }
@@ -22,9 +24,6 @@ struct Engine {
     struct Player {
         std::array<float, 1326> range;
         std::array<float, 1326> reward;
-        // The odds of this seat's betting pattern: the product, over its decisions, of
-        // the chosen option's share of the range's aggregate policy.
-        double odds;
         float chips;
         bool inHand;
         uint8_t position;
@@ -41,7 +40,6 @@ struct Engine {
         void set(int position) {
             std::fill(range.begin(), range.end(), 1.0f);
             reward = {0};
-            odds = 1.0;
             chips = CHIP_COUNT;
             inHand = true;
             this->position = position;
@@ -96,6 +94,22 @@ struct Engine {
     std::vector<double> rangeBelow;
     std::vector<double> rangeEqual;
     std::vector<double> rangeTotal;
+    // The odds the hand's line was sampled at: the product, over every decision, of the
+    // chosen option's share of the acting range's sampling policy.
+    double lineOdds;
+    // Card removal for lineReach. Per seat, the summed range over the combos that miss
+    // the board cards in blockMask, in total and per card. blockCount is the number of
+    // board cards in the mask.
+    int blockCount;
+    uint64_t blockMask;
+    std::array<double, PLAYER_COUNT> blockTotal;
+    std::array<std::array<double, 52>, PLAYER_COUNT> blockCard;
+    // Indexed by blockCount k. boardScale is P(board | combo) over the board's sampled
+    // odds: dealt from 52 cards, a combo misses k of them only Π (50 - i) / (52 - i) of
+    // the time. pairScale is one over the combos an opponent could hold beside the
+    // combo and the board.
+    inline static std::array<double, 6> boardScale;
+    inline static std::array<double, 6> pairScale;
 
     uint32_t getHandIndex(std::array<int, 2>& holeCards) {
         std::array<int, 7> handCards = {boardCards[0], boardCards[1], boardCards[2], 
@@ -212,6 +226,14 @@ struct Engine {
                     preflopHandClasses[i * (101 - i) / 2 + j - 1] = preflopHandMeta;
                 }
             }
+            boardScale[0] = 1.0;
+            for (int k = 0; k <= 5; k++) {
+                if (k > 0) {
+                    boardScale[k] = boardScale[k - 1] * (52 - (k - 1)) / (50 - (k - 1));
+                }
+                const int free = USE_BLOCKERS ? 50 - k : 52 - k;
+                pairScale[k] = 2.0 / (free * (free - 1));
+            }
         });
     }
 
@@ -257,6 +279,14 @@ struct Engine {
         hiddenRaiseStrength = 0;
         hiddenRaiseActionPosition = 0;
         calls = 0;
+        lineOdds = 1.0;
+        // Every range is uniform and no board is out: each card is in 51 of the combos.
+        blockCount = 0;
+        blockMask = 0;
+        blockTotal.fill(double(COMBO_COUNT));
+        for (std::array<double, 52>& card : blockCard) {
+            card.fill(51.0);
+        }
     }
 
     void setActionState(bool memoryBasic) {
@@ -340,9 +370,9 @@ struct Engine {
             }
         }
         heroVillanStory *= 5;
-        heroVillanStory += (!memoryBasic || round < 2) * player.positionBasic;
+        heroVillanStory += (!memoryBasic || round < 1) * player.positionBasic;
         heroVillanStory *= 5;
-        heroVillanStory += (!memoryBasic || round < 2) * villan.positionBasic;
+        heroVillanStory += (!memoryBasic || round < 1) * villan.positionBasic;
         state |= uint64_t(heroVillanStory & 0x7FF) << shift;
         shift += 11;
         uint64_t actionPositionState = 0;
@@ -406,7 +436,7 @@ struct Engine {
                     options[2] = true;
                 }
             }
-            if (raiseHistory[0] == 0 || player.raisesFaced > 1 || player.calls > 1
+            if (raiseHistory[0] == 0 || player.raisesFaced > 2 || player.calls > 1
                 || (calls > 1 && (raiseHistory[0] > 1 || round != 0))) {
                 options[1] = false;
             }
@@ -432,10 +462,6 @@ struct Engine {
 
     std::array<float, 1326>& getRange(int action) {
         return players[action].range;
-    }
-
-    double& getOdds(int action) {
-        return players[action].odds;
     }
 
     std::array<float, 1326>& getReward(int action) {
@@ -541,7 +567,84 @@ struct Engine {
                     if (i == deck[k] || j == deck[k]) {
                         commonRange[i * (101 - i) / 2 + j - 1] = 0;
                         break;
-                    } 
+                    }
+                }
+            }
+        }
+        setBlocks(round + 2);
+    }
+
+    // Extends the card removal sums from the first blockCount board cards to the first
+    // boardCount: each new card takes the combos holding it, and no earlier board card,
+    // out of every seat's sums. The sums must be current for the seats' ranges, which
+    // deal() and chooseRangeOption's floor pass keep them.
+    void setBlocks(int boardCount) {
+        for (int i = blockCount; i < boardCount; i++) {
+            const int dealt = boardCards[i];
+            for (int seat = 0; seat < PLAYER_COUNT; seat++) {
+                const std::array<float, COMBO_COUNT>& range = players[seat].range;
+                std::array<double, 52>& card = blockCard[seat];
+                for (int other = 0; other < 52; other++) {
+                    if (other == dealt || (blockMask >> other & 1)) {
+                        continue;
+                    }
+                    const double r = range[holePairIndex(std::min(dealt, other), std::max(dealt, other))];
+                    blockTotal[seat] -= r;
+                    card[dealt] -= r;
+                    card[other] -= r;
+                }
+            }
+            blockMask |= 1ULL << dealt;
+        }
+        blockCount = std::max(blockCount, boardCount);
+    }
+
+    // The probability of the hand's line for this seat holding combo, against the board
+    // in blockMask, over boardScale's sampled odds: the combo's own reach, times each other
+    // seat's reach summed over the combos it could hold beside the combo and the board, as
+    // a share of those combos. Every other seat counts, folded or not; a seat that never
+    // acted counts 1. The sum is by inclusion-exclusion, W - W[a] - W[b] + w(combo), as
+    // in setRewards, and treats the other seats as independent of each other.
+    //
+    // It is 0 when the combo clashes with the board, or when it blocks every combo some
+    // other seat could have played the line with: then the line is impossible for it.
+    // Divided by lineOdds it is the combo's importance weight.
+    //
+    // Fills every combo at once. Combos run in holePairIndex order, which walks the
+    // second card for each first card, so the first card's sums are constant across
+    // an inner loop that reads contiguously and has no branches.
+    void lineReach(int seat, std::array<double, COMBO_COUNT>& out) const {
+        // 1 for a card off the board, 0 for one on it.
+        std::array<double, 52> free;
+        for (int card = 0; card < 52; card++) {
+            free[card] = (blockMask >> card & 1) ? 0.0 : 1.0;
+        }
+        const std::array<float, COMBO_COUNT>& own = players[seat].range;
+        int combo = 0;
+        for (int a = 0; a < 51; a++) {
+            const double base = free[a] * boardScale[blockCount];
+            for (int b = a + 1; b < 52; b++, combo++) {
+                out[combo] = own[combo] * base * free[b];
+            }
+        }
+        for (int other = 0; other < PLAYER_COUNT; other++) {
+            if (other == seat) {
+                continue;
+            }
+            const std::array<float, COMBO_COUNT>& range = players[other].range;
+            const std::array<double, 52>& card = blockCard[other];
+            const double total = blockTotal[other];
+            // The sums cancel to rounding error when the combo blocks everything; a real
+            // remainder is at least RANGE_FLOOR of the total.
+            const double floor = 1e-9 * total;
+            const double scale = pairScale[blockCount];
+            combo = 0;
+            for (int a = 0; a < 51; a++) {
+                const double rest = total - card[a];
+                for (int b = a + 1; b < 52; b++, combo++) {
+                    double unblocked = USE_BLOCKERS ? rest - card[b] + range[combo] : total;
+                    unblocked = unblocked > floor ? unblocked : 0.0;
+                    out[combo] *= unblocked * scale;
                 }
             }
         }

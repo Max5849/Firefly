@@ -16,6 +16,7 @@
 #include <barrier>
 #include <mutex>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <filesystem>
