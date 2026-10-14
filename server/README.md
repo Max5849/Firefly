@@ -1,54 +1,58 @@
 # server — the strategy API
 
-Serves the trained strategy over HTTP. Given an action sequence and a board, it
-returns the weights, frequencies and visits of all 1326 hole card combinations at
-the node that sequence reaches, for the player to act.
+Serves the trained range strategy over HTTP. Given a config, an action sequence and
+a board, it returns three things at the node that sequence reaches:
+
+- **`game`**: the table as a player sees it. Seats, stacks, bets, pot, board, whose
+  turn it is, what they may do and for how much, and the hand so far.
+- **`key`**: the acting seat's state key, decoded field by field from its own bits.
+- **`spot`**: for all 1326 hole card combinations, the actions, the acting seat's
+  range (reach), the EV in chips, and the visits.
 
 ## Why it replays
 
-The 64-bit state key is the accumulated residue of `Engine::play()`. Nine of its
-fields — `raiseHistoryCompressed`, both `lastActions` nibbles, `villanPosition`,
-`relativePosition`, `raisesFaced`, `calls`, `player.calls` and the `hiddenRaise*`
-pair — exist nowhere but in that accumulation, and several cannot be recovered
-from a snapshot of stacks, bets and pot at all. So the API drives the real
-`Engine` through the action list rather than reconstructing a node.
+The 64-bit state key is the accumulated residue of `Engine::play()`. Most of its
+fields (`raiseHistoryCompressed`, the story digits, `villanPosition`,
+`relativePosition`, `raisesFaced`, the two `calls` counters, the raise descriptors
+and both raise action positions) exist nowhere but in that accumulation. So the API
+replays the action list through an engine rather than reconstructing a node.
 
-Everything under `server/` reuses `solver/engine.h` unchanged: `deal()`, `play()`,
-`newRound()`, `getState()` and `getOptions()` are the solver's own. A
-reimplementation would not error on a divergence, it would silently return another
-state's weights.
+That engine is `TableEngine<P>` in [engine/tableEngine.h](engine/tableEngine.h). It
+holds the game rules of [solver/multiHand/engine.h](../solver/multiHand/engine.h)
+(deal, play, setActionState, getOptions, beginNewRound, the meta state) for any table
+size from 3 to 7. It leaves out the trainer's rewards, line odds and card removal
+sums. The trainer's engine fixes `PLAYER_COUNT` at compile time and is left
+untouched.
 
-Two facts make the 1326 sweep cheap:
+Because the rules are a copy, `build/keyEquivalence` plays `TableEngine<PLAYER_COUNT>`
+in lockstep with the trainer's `Engine` and fails on any difference. **A rule change
+in solver/multiHand/engine.h has to be copied into tableEngine.h.**
+[engine/tables.h](engine/tables.h) loads the lookup tables through `Engine`'s own
+loaders, minus `handScores.bin`.
 
-- Hole cards enter the key only through its 20-bit board/meta field, and
-  `getState()` never reads a villain's hand. One replay serves all 1326 combos;
-  each costs a `classifyHand`, two map lookups and a `getState`.
-- `getOptions()` is hand-independent at a node, so legality — and the softmax
-  denominator — is computed once.
+A range is the same kind of residue. Every combo's reach is the product of its
+seat's own `INV_TEMP` policy along the line. So at every past decision the replay
+looks up the acting seat's nodes in the strategy and narrows the range with
+`TableEngine::applyPolicy`, the range pass of `Explorer::chooseRangeOption`
+(RANGE_FLOOR included). A
+node with **no record drops the combos that reach it**, and the response counts
+those drops (`spot.replayDrops`).
+
+The replay uses the server's compiled `INV_TEMP` and `RANGE_FLOOR`. A strategy
+trained with other values replays differently.
 
 ## Building
 
 From the repository root, always:
 
 ```
-clang++ -std=c++2b -O2 -I. -o build/indexBuilder    server/indexBuilder.cpp
 clang++ -std=c++2b -O2 -I. -pthread -o build/server server/server.cpp -lz
+clang++ -std=c++2b -O2 -I. -o build/indexBuilder    server/indexBuilder.cpp
 clang++ -std=c++2b -O2 -I. -o build/keyEquivalence  server/tests/keyEquivalence.cpp
 clang++ -std=c++2b -O2 -I. -o build/storeProbe      server/tests/storeProbe.cpp
 ```
 
 On the Oracle VM substitute `g++` (13 or newer) and install `zlib1g-dev`.
-
-`build/indexBuilder` must be run once per strategy file, and again whenever the
-solver writes a new one:
-
-```
-./build/indexBuilder
-```
-
-It writes `solver/strategies/strategy_<spec>.idx` and verifies every key is
-reachable through it before returning. The server refuses to start if the index
-and the strategy file disagree on the record count.
 
 ## Running
 
@@ -56,10 +60,19 @@ and the strategy file disagree on the record count.
 ./build/server --host 127.0.0.1 --port 8080 --warm
 ```
 
-Must be run from the repository root — `engine.h` resolves the handAnalysis tables
-through relative paths. `--warm` faults both mappings in at boot so the first
-requests are not disk-bound. `--strategy` and `--index` override the paths;
-`--threads` sizes the worker pool.
+Must be run from the repository root, because the handAnalysis tables and
+`solver/strategies/` are resolved through relative paths. `--threads` sizes the
+worker pool. `--warm` faults each strategy's mappings in when it is first opened.
+
+Strategy files are opened **on first request** for their spec, and stay open after
+that. If `strategy_<spec>.idx` is missing or does not match the `.bin` file, the
+server rebuilds it beside the strategy file. That takes about a second at 15M
+records. `build/indexBuilder` does the same ahead of time:
+
+```
+./build/indexBuilder                                        # the spec config.h names
+./build/indexBuilder --players 3 --chips 200 --metas 1 --memory 1
+```
 
 ## Endpoints
 
@@ -67,179 +80,191 @@ requests are not disk-bound. `--strategy` and `--index` override the paths;
 
 ```json
 {
-  "actions": [2, 0, 0, 0, 0, 0, 1],
+  "config": { "players": 3, "chips": 200, "metasBasic": true, "memoryBasic": true },
+  "actions": [2, 1, 1],
   "board": "As7h2d",
-  "invTemp": 11.0904,
-  "include": { "transition": true, "combos": { "weights": true } }
+  "include": { "game": true, "key": true, "spot": true }
 }
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `actions` | Option indices in order: 0 fold, 1 call/check, 2 raise to half pot, 3 raise to one and a half pot, 4 all in. Empty means the first preflop decision, UTG. |
-| `board` | `"As7h2d"`, `"As 7h 2d"` or `"As,7h,2d"`. Must hold exactly the cards for the street the actions reach: 0, 3, 4 or 5. |
-| `invTemp` | Optional. Defaults to `log(65536)` ≈ 11.0904, the inverse temperature the run finished at. |
-| `include` | Which sections to return. **Everything is off unless named**, so a request with no `include` returns `{}`. |
+| `config` | Which strategy to read. Each field is optional and defaults to `config.h`. `players` is 3–7. `chips` must be a positive even integer, because the spec `10000·players + 10·chips + 10·metasBasic + memoryBasic` is ambiguous for odd stacks. |
+| `actions` | Option indices in order: 0 fold, 1 call/check, 2 raise to half pot, 3 raise to one and a half pot, 4 all in. Empty means the first preflop decision (seat `3 % players`). |
+| `board` | `"As7h2d"`, `"As 7h 2d"` or `"As,7h,2d"`. It must hold exactly the cards for the street the actions reach: 0, 3, 4 or 5. |
+| `include` | Optional. Leaving it out means all three sections. When present, only the sections set to `true` are returned. |
 
-#### `include`
+An unknown field or section is a 400 that names it.
 
-`node`, `transition` and `keyComponents` are booleans. `combos` takes a boolean —
-`true` turns on every sub-field — or an object naming `weights`, `frequencies`,
-`visits`, `key`, `handMeta`, `counts`. An unknown key is a 400 naming it.
-
-Anything off is **not computed**, not merely not serialised. Measured on one flop
-node:
-
-| `include` | Payload | p50 |
-| --- | --- | --- |
-| `{}` | 2 B | 0.20 ms |
-| `{"transition": true}` | 235 B | 0.23 ms |
-| `{"combos": {"handMeta": true}}` | 36.8 KB | 0.50 ms |
-| `{"combos": {"frequencies": true}}` | 131 KB | 0.72 ms |
-| `{"combos": true}` | 334.8 KB | 2.28 ms |
-
-#### The sections
-
-**`node`** — the abstraction's simplified view: `spec`, `round`, `street`, `seat`,
-`heads`, `board`, `legal`, `options`, `invTemp`, `weightUnits`.
-
-**`transition`** — exact chips, for a UI applying one action and rendering the
-next decision. Only the two seats that changed; the rest of the table accumulates
-on the client.
+#### `game`
 
 ```json
-"transition": {
-  "pot": 10,
-  "lastAction": { "seat": 2, "option": 1, "chips": 395.5, "bet": 0, "inHand": true },
-  "actor": { "seat": 2, "chips": 395.5, "bet": 0, "toCall": 0,
-             "potAfterCall": 10, "spr": 39.55, "cpr": 0,
-             "legal": [false, true, true, true, false] }
-}
+{ "config": {"players": 3, "chips": 200, "metasBasic": true, "memoryBasic": true, "spec": "32011"},
+  "round": 1, "street": "flop", "board": "As7h2d", "pot": 13.5, "heads": 3,
+  "seats": [{"seat": 0, "name": "BTN", "stack": 195.5, "bet": 0, "inHand": true,
+             "allIn": false, "acting": false}, ...],
+  "actor": {"seat": 1, "name": "SB", "stack": 195.5, "bet": 0, "toCall": 0,
+            "potAfterCall": 13.5, "spr": 14.48, "cpr": 0},
+  "legal": [false, true, true, true, false],
+  "options": [{"option": 2, "name": "bet", "size": "0.5x pot", "legal": true,
+               "betTo": 6.75, "adds": 6.75, "reason": ""}, ...],
+  "history": [{"kind": "post", "seat": 1, "name": "small blind", "betTo": 1, ...},
+              {"kind": "action", "seat": 0, "name": "raise", "option": 2, "round": 0,
+               "betTo": 4.5, "adds": 4.5, "stack": 195.5},
+              {"kind": "street", "round": 1, "street": "flop", "board": "As7h2d"}] }
 ```
 
-`lastAction` is `null` when `actions` is empty. Note that its `bet` reads 0
-whenever that action closed the street — `newRound()` zeroes every live player's
-bet, so the chips are in `pot` and the stack is in `chips`.
+- `pot` counts every chip committed, including this street's bets.
+- `seats[].bet` is the amount in front on the current street.
+- Option `name` is what the table would say: check or call, and bet or raise.
+- `betTo` comes from `TableEngine::betTo`, which repeats `play()`'s float
+  operations; the test asserts every raise lands on it.
+- Illegal options carry the `reason` `getOptions()` turned them off for.
+- Seat names follow the player count: BTN, SB, BB, then the last `P − 3` of UTG, LJ,
+  HJ, CO.
 
-**`keyComponents`** — the part of the key all 1326 hands share, decomposed into
-named fields, with `raiseHistory` (four per-street counts) in place of
-`raiseHistoryCompressed`. Values are as the key encodes them: bucketed, clamped,
-and zeroed where `MEMORY_BASIC` drops a field. `boardField` and `boardClass` are
-`null` preflop, where the board field carries the hand-dependent 169-combo index
-instead.
+#### `key`
 
-**`combos`** — 1326 rows in hole-pair index order, `i * (101 - i) / 2 + j - 1` for
-cards `i < j`, carrying only the requested fields:
+The shared key is `actionState | boardField << 42`. It covers bits 0–57: every bit
+except the hand cluster (58–63), which differs per combo and is given in each `spot`
+row. For each field the section lists:
+
+- `shift` and `width`
+- `bits`, the field's binary, most significant bit first
+- `value`, the raw number those bits hold
+- `meaning`, in words
+- `zeroed`, set when `memoryBasic` forces the field to 0
+- `parts`, for packed fields:
+  - `raiseHistory` is ranked back to the four per-street raise counts
+  - `story` splits into its base-3 street digits plus the hero and villain
+    positions
+  - `actionPositions` splits into three buckets
+
+Preflop, bits 42–57 hold each combo's 169 class, so the board field is
+`"shared": false`.
+
+The section also carries `heroSeat`, `villanSeat` (needed to read the villain
+digits, but not stored in the key), and the exact `spr` and `cpr`.
+
+#### `spot`
 
 ```json
-[ { "combo": "AcAd", "handMeta": 5, "found": false },
-  null,
-  { "combo": "KcKd", "found": true,
-    "weights": [0.281, -5.841, -5.367, null],
-    "frequencies": [0, 1, 3.3e-30, 6.2e-28, 0],
-    "visits": 22.5, "nodeVisits": 630, "metaCombos": 28 } ]
+{ "legal": [...], "potAfterCall": 13.5,
+  "totalVisits": 2081228, "records": 27, "found": 1142, "missing": 34, "invalid": 150,
+  "rangeCombos": 1110, "rangeWeight": 95.69, "rangeMix": [0, 0.84, 0.078, 0.081, 0],
+  "rangeEv": 0.14, "emptySeats": [], "replayDrops": {"decisions": 0, "groups": 0, "combos": 0},
+  "combos": [null, {"combo": "KcQd", "reach": 0.3345, "cluster": 8, "key": "0x200af40018001521",
+                    "found": true, "clusterCombos": 41,
+                    "weights": [-0.627, -1.194, -1.736, null],
+                    "frequencies": [0, 0.957, 0.041, 0.002, 0],
+                    "evOptions": [null, -8.47, -16.12, -23.44, null], "ev": -8.81,
+                    "visits": 185510}, ...] }
 ```
 
-- A `null` row is a combination that clashes with the board.
-- `"found": false` means the state is absent from the table — see below. `found` is
-  emitted whenever a record-backed field was requested.
-- `weights` holds four numbers for options 1 to 4, stored as `float` and widened
-  to double here. There is no weight for folding
-  because its pot-normalised return is analytically exactly 0, and that zero is
-  the reference every other weight is measured against. Illegal options are
-  `null`.
-- `frequencies` holds five, fold first, and sums to 1 over the legal options.
-- `visits` is **per holding**: `nodeVisits / metaCombos`. The stored count belongs
-  to the key, which every combination in the same hand cluster shares, so the raw
-  number overstates one holding by the size of its cluster. Preflop `metaCombos`
-  is exactly 6 for a pair, 4 suited, 12 offsuit.
-- `counts` emits `{found, missing, invalid, metaMissing}` as a sibling of `combos`.
+- **Rows** are in hole-pair index order, `i * (101 - i) / 2 + j - 1` for cards
+  `i < j`. A row is `null` when the combo uses a board card. On a row with
+  `"found": false`, the node has no record, so only `reach`, `cluster`, `key` and
+  `clusterCombos` are present.
+- **`reach`** is the acting seat's: the product of its own policy along the line,
+  after `RANGE_FLOOR`. It is 0 for a combo the line has ruled out, which still
+  carries its strategy.
+- **`weights`** are the record's four values for options 1–4, pot-normalised and
+  relative to folding, which is exactly 0. An illegal option is `null`.
+- **`frequencies`** is the `INV_TEMP` softmax over the legal options, fold first.
+- **`evOptions`** gives each option's value in **chips relative to folding**:
+  `weight × potAfterCall`. `ev` is the policy-weighted mean.
+- **`visits`** is the record's count, from the cooldown block and reach-weighted.
+  It is shared by every combo in the cluster, and `clusterCombos` is how many valid
+  combos share it.
+- **`totalVisits`** sums the distinct records the acting range reaches (combos
+  with reach > 0).
+- **`rangeMix`** and **`rangeEv`** are reach-weighted over the combos that have a
+  record.
+- **`emptySeats`** lists seats whose range the line has emptied. Training drops
+  such a hand at the next street.
 
-Weights are in units of *(stack change) / (pot after calling)* at that node, so
-`transition.actor.potAfterCall` is what turns one back into chips.
+#### Errors
 
-Errors are 400 with `error`, a `reason` naming the restriction that blocked the
-action, the offending `actionIndex`, and the `legal` set at that point:
+Every error body has a machine-readable `code` and an `error` message:
 
-```json
-{ "error": "option 1 (call) is not legal here",
-  "reason": "no preflop limping: the pot is unraised, so every seat must fold or raise",
-  "actionIndex": 0,
-  "legal": [true, false, true, true, false], "options": [...] }
-```
+| Status | `code` | Extra fields | Cause |
+| --- | --- | --- | --- |
+| 400 | `illegal` | `reason`, `actionIndex`, `legal`, `options` | the tree forbids the action here |
+| 400 | `needsBoard` | `street`, `cards`, `actionIndex` | the action closed a street and the board is short |
+| 400 | `handEnded` | `endedBy` (`fold` / `showdown`), `actionIndex` | nothing is left to decide |
+| 400 | `boardMismatch` | | too many board cards for the street reached |
+| 400 | `badAction`, `badBoard`, `badConfig`, `badRequest` | | malformed input |
+| 404 | `strategyMissing` | `spec`, `path`, `config`, `available` | no `strategy_<spec>.bin` for that config |
+| 500 | `strategyUnreadable`, `internal` | | a corrupt file, or an unexpected throw |
 
-### `GET /health`, `GET /meta`
+### `GET /meta`, `GET /health`
 
-`/health` reports the loaded record count and mapped bytes. `/meta` reports the
-spec string, the config the strategy was trained under, the seat names, the card
-and combo encodings, and the default `invTemp`.
+`/meta` returns:
+- the default config
+- the limits
+- the `available` strategies, decoded from `solver/strategies/strategy_*.bin`
+- seat names per player count
+- `INV_TEMP`, `RANGE_FLOOR`, the blinds, the option names and the card encoding
+
+`/health` lists the specs opened so far and their record counts.
 
 ## What the tree will not accept
 
-`actions` are checked against `getOptions()` before each is played, so a sequence
-taken from a real hand history will often be rejected. The constraints, all from
-[engine.h](../solver/engine.h):
+`actions` are checked against `getOptions()` before each one is played:
 
-- **No preflop limping.** Unraised, every seat must fold or raise.
-- **Raise sizes are only** half pot, one and a half pot, and all in, and which are
+- **No preflop limping.** In an unraised pot, every seat must fold or raise.
+- **Raises are only** half pot, one and a half pot, or all in. Which of these are
   offered depends on the SPR at that node.
-- **At most six raises** in a hand, the sixth all-in only.
-- No flat call facing two or more raises; no third call on a street; no third
-  cold caller in a 3-bet-plus or postflop pot.
-- Seven seats, 400 starting chips, blinds 1 and 2 — all pinned by the spec string.
+- **At most six raises** per hand, and the sixth can only be all in.
+- No flat call when facing three or more raises since you last acted. No third call
+  on a street. No third cold caller in a 3-bet-plus or postflop pot.
 
-There is no projection of an off-tree action onto the nearest legal one. A snapped
-node answers a different question from the one asked, and doing it silently would
-hide that.
-
-## Missing states
-
-The table holds only the states self-play actually reached. A legitimate node can
-be absent, and `visits` on other rows says nothing about it, so a miss is reported
-as a miss: `"found": false` on the row, and a `missing` count on the response.
-
-Coverage tracks how plausible the line is. On a heads-up flop after a single raise
-and a call, 1173 of 1176 combos are present. On a seven-way river where every seat
-saw every street — a line the annealed policy essentially never takes — all 1081
-can be absent.
+An off-tree action is not projected onto the nearest legal one.
 
 ## Tests
 
 ```
-./build/keyEquivalence 200000 500
+./build/keyEquivalence 4000
 ```
 
-Self-plays 200k hands with a real `Engine`, weighted toward calls so the walk
-reaches the turn and river, and at every node rebuilds the key through
-`Replay` + `comboKey` from nothing but the action list and the board. The last run
-covered 3,317,259 nodes (2.19M preflop, 560k flop, 306k turn, 258k river) and
-6,634 full sweeps with zero key mismatches, zero legal-set mismatches and zero
-hand-meta misses. It also checks each sweep's combo accounting and that
-frequencies are a distribution over the legal options only.
+The test runs in two parts.
 
-`build/storeProbe <hex keys...>` prints what the mmap path returns for a key, for
-diffing against an independent reader of `strategy_<spec>.bin`.
+1. **Lockstep.** The trainer's `Engine` and `TableEngine<PLAYER_COUNT>` play the same
+   hands. At every decision, both acting ranges are narrowed by the same random
+   per-group policy: the trainer's through a copy of `chooseRangeOption`'s range
+   pass, the server's through `applyPolicy`. The two must agree on the action state,
+   the options, every seat's chips, bets and range, what `play()` and
+   `beginNewRound()` return, and every meta the trainer classifies.
+2. **Every table size from 3 to 7.** `TableEngine` self-plays under random
+   `metasBasic`, `memoryBasic` and stack sizes, with calls weighted up so the walk
+   reaches the turn and river. At every node the test asserts that:
+- `Replay`, given only the action list and the revealed board, reaches the same
+  action state, legal set and per-combo meta state;
+- every `key` field equals the engine quantity it encodes, and the fields repack
+  into the shared key;
+- every illegal option has a reason and no legal one does;
+- every raise lands on its `betTo`.
+
+At 4000 hands this covers 34k lockstep decisions and 218k nodes, with 0 failures.
+Doubling the range floor in `TableEngine` fails the lockstep part on the first
+narrowed street.
+
+`build/storeProbe [--spec 32011] <hex keys...>` prints what the mmap path returns for
+a key.
 
 ## On the VM
 
-**Step by step instructions are in [DEPLOY.md](DEPLOY.md).** In summary, copy
-from the repository root:
+**Step-by-step instructions are in [DEPLOY.md](DEPLOY.md).** Copy these from the
+repository root:
 
-- `solver/handAnalysis/boardClasses.bin`, `handMetas.bin`, `handMetasBasic.bin` (178 MB)
-- `solver/strategies/strategy_<spec>.bin` (8 + 28 bytes per record)
+- `solver/handAnalysis/boardClasses.bin`, `boardClassesBasic.bin`,
+  `handMetas.bin` and `handMetasBasic.bin`
+- every `solver/strategies/strategy_<spec>.bin` to serve (8 + 28 bytes per record)
 
-**Not** `handScores.bin` (535 MB): only `showdown()` reads it and the API never
-reaches showdown, which is why `server.cpp` calls `Engine::loadTables(false)`.
+**Not** `handScores.bin` (535 MB). Only `setRewards()` reads it, and the API never
+reaches a showdown, so `ServerTables::load()` skips it.
 
-Then run `indexBuilder`, install `deploy/firefly-api.service` and
-`deploy/nginx.conf`, and open 443 in the Oracle security list *and* in the VM's
-own firewall.
-
-Steady state is roughly 312 MB resident for the board-class table and the two hand
-meta maps — fixed, independent of strategy size — plus ~750 MB of file-backed
-mappings for the strategy and its index, which grow with the strategy and are
-reclaimable page cache rather than RSS.
-
-Measured on the development machine: p50 1.8 ms for a node where most combos are
-present, 0.5 ms where most miss (a miss resolves on the index tag without touching
-the record file). The response is ~267 KB of JSON, ~7.5 KB gzipped.
+Measured on the development machine against `strategy_32011.bin` (15.3M records):
+- p50 is about 1 ms for both the opening node and a flop node;
+- the full response is about 460 KB of JSON, which gzips to 15–27 KB;
+- RSS was 464 MB after a few requests.

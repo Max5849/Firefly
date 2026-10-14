@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, FULL_INCLUDE, getMeta, postStrategy } from '../api/client';
-import type { MetaResponse, StrategyResponse } from '../api/types';
-import { belowCut, reachProbabilities } from '../grid/range';
-import { LN65536, SEAT_NAMES } from './seats';
+import { ApiError, getMeta, postStrategy } from '../api/client';
+import type { ApiFailure } from '../api/client';
+import type { Config, MetaResponse, StrategyResponse } from '../api/types';
+import { metaStats } from '../grid/metas';
 import { cardCount, optionFromKey, rankFromKey, suitFromKey } from './keys';
 
 /** One settled node: the action list that reached it and the answer it gave. */
@@ -10,10 +10,6 @@ interface Frame {
   actions: number[];
   board: string;
   response: StrategyResponse;
-  /** Every seat's stack at this node, carried forward from lastAction.chips. */
-  stacks: number[];
-  /** Every seat's chips in front on the current street, zeroed when it rolls. */
-  bets: number[];
 }
 
 /** The action the player has committed to but cannot send until the board is in. */
@@ -30,84 +26,56 @@ export type Mode = 'acting' | 'boardEntry' | 'ended';
 export interface LedgerLine {
   kind: 'post' | 'action' | 'street' | 'terminal';
   seat?: number;
+  /** What the table would call it: small blind, check, call, bet, raise, all in. */
   name?: string;
   option?: number;
   stack?: number;
-  /** Total chips in front after the action - a raise "to" this figure. */
+  /** Total in front after the action - a raise "to" this figure. */
   size?: number;
   street?: string;
   board?: string;
+  /** terminal: "fold" when one seat is left, "showdown" when the board runs out. */
+  endedBy?: string;
   /** Frame this line belongs to, so clicking it can return to that state. */
   frame?: number;
 }
 
+export type MissingStrategy = Extract<ApiFailure, { kind: 'strategyMissing' }>;
+
 export interface HandState {
   meta: MetaResponse | null;
+  config: Config | null;
   mode: Mode;
   frame: Frame | null;
   pending: Pending | null;
   ledger: LedgerLine[];
-  invTemp: number;
   error: string | null;
+  /** Set when the chosen config has no strategy file. */
+  missing: MissingStrategy | null;
   loading: boolean;
+  /** Seat names at this table size. */
   seatNames: string[];
   /** Total bet each option would produce, indexed by option. */
   sizes: (number | null)[];
-  /**
-   * The acting player's own range: combinations whose probability of having
-   * reached this node, given their previous decisions, has fallen under 1%.
-   * Other seats' actions never narrow it.
-   */
+  /** Combinations whose cluster is too thin to read at this node. */
   black: Set<number>;
-  /** The acting seat's reach probabilities, or null before they have acted. */
-  reach: Float64Array | null;
-}
-
-function seedStacks(meta: MetaResponse): number[] {
-  const stacks = new Array<number>(meta.playerCount).fill(meta.startingChips);
-  stacks[1] -= meta.blinds[0];
-  stacks[2] -= meta.blinds[1];
-  return stacks;
-}
-
-function seedBets(meta: MetaResponse): number[] {
-  const bets = new Array<number>(meta.playerCount).fill(0);
-  bets[1] = meta.blinds[0];
-  bets[2] = meta.blinds[1];
-  return bets;
-}
-
-/**
- * What each option would make the actor's total bet. play() first matches the
- * outstanding bet, then adds k times the pot *after* that call - so a raise ends
- * at (table bet) + k * potAfterCall, and an all-in at their whole stack.
- */
-function raiseSizes(response: StrategyResponse | null): (number | null)[] {
-  const actor = response?.transition?.actor;
-  const legal = response?.node?.legal;
-  if (!actor || !legal) return [null, null, null, null, null];
-  const tableBet = actor.bet + actor.toCall;
-  return [
-    null,
-    legal[1] ? tableBet : null,
-    legal[2] ? tableBet + 0.5 * actor.potAfterCall : null,
-    legal[3] ? tableBet + 1.5 * actor.potAfterCall : null,
-    legal[4] ? actor.bet + actor.chips : null,
-  ];
+  /** Visits summed over the distinct records the acting range reaches. */
+  totalVisits: number | null;
 }
 
 export function useHand(): HandState & {
   handleKey: (key: string) => void;
-  setInvTemp: (value: number) => void;
   jumpTo: (frame: number) => void;
+  setConfig: (config: Config) => void;
 } {
   const [meta, setMeta] = useState<MetaResponse | null>(null);
+  const [config, setConfigState] = useState<Config | null>(null);
   const [frames, setFrames] = useState<Frame[]>([]);
   const [pending, setPending] = useState<Pending | null>(null);
   const [mode, setMode] = useState<Mode>('acting');
   const [terminal, setTerminal] = useState<LedgerLine | null>(null);
-  const [invTemp, setInvTempState] = useState<number>(LN65536);
   const [error, setError] = useState<string | null>(null);
+  const [missing, setMissing] = useState<MissingStrategy | null>(null);
   const [loading, setLoading] = useState(false);
 
   // A newer keystroke must win, so every request supersedes the one before it.
@@ -115,40 +83,17 @@ export function useHand(): HandState & {
 
   const send = useCallback(
     async (
+      setup: Config,
       actions: number[],
       board: string,
-      temp: number,
-      previous: Frame | null,
-      fallbackStacks?: number[],
-      fallbackBets?: number[],
-    ): Promise<{ ok: true; frame: Frame } | { ok: false; failure: ApiError['failure'] }> => {
+    ): Promise<{ ok: true; frame: Frame } | { ok: false; failure: ApiFailure }> => {
       inflight.current?.abort();
       const controller = new AbortController();
       inflight.current = controller;
       setLoading(true);
       try {
-        const response = await postStrategy(
-          { actions, board, invTemp: temp, include: { ...FULL_INCLUDE } },
-          controller.signal,
-        );
-
-        const beforeStacks = previous?.stacks ?? fallbackStacks ?? [];
-        const beforeBets = previous?.bets ?? fallbackBets ?? [];
-        const stacks = beforeStacks.slice();
-        let bets = beforeBets.slice();
-
-        const last = response.transition?.lastAction;
-        if (last) {
-          const spent = beforeStacks[last.seat] - last.chips;
-          stacks[last.seat] = last.chips;
-          const rolled = (response.node?.round ?? 0) > (previous?.response.node?.round ?? 0);
-          if (rolled) {
-            bets = new Array<number>(beforeBets.length).fill(0);
-          } else {
-            bets[last.seat] = (beforeBets[last.seat] ?? 0) + spent;
-          }
-        }
-        return { ok: true, frame: { actions, board, response, stacks, bets } };
+        const response = await postStrategy({ config: setup, actions, board }, controller.signal);
+        return { ok: true, frame: { actions, board, response } };
       } catch (caught) {
         if (caught instanceof ApiError) return { ok: false, failure: caught.failure };
         if (caught instanceof DOMException && caught.name === 'AbortError') {
@@ -168,21 +113,23 @@ export function useHand(): HandState & {
     [],
   );
 
-  /** Back to the opening preflop node. */
+  /** Back to the opening preflop node, at this config. */
   const reset = useCallback(
-    async (loaded: MetaResponse, temp: number) => {
+    async (setup: Config) => {
       // Cleared before the request, not after it: leaving the old frame in place
-      // would show the previous position until the new one arrives, which reads
-      // as the grid flashing the hand you just abandoned.
+      // would show the previous position until the new one arrives.
       inflight.current?.abort();
       setFrames([]);
       setPending(null);
       setTerminal(null);
       setError(null);
+      setMissing(null);
       setMode('acting');
-      const result = await send([], '', temp, null, seedStacks(loaded), seedBets(loaded));
+      const result = await send(setup, [], '');
       if (result.ok) {
         setFrames([result.frame]);
+      } else if (result.failure.kind === 'strategyMissing') {
+        setMissing(result.failure);
       } else if (result.failure.message !== 'superseded') {
         setError(result.failure.message);
       }
@@ -195,8 +142,18 @@ export function useHand(): HandState & {
     getMeta()
       .then((loaded) => {
         if (cancelled) return;
+        // A server from before the game / key / spot contract has no defaults, and
+        // every request this page sends would be rejected by it.
+        if (!loaded.defaults) {
+          setError(
+            'the API is an older server build than this page - rebuild and restart build/server from the current source',
+          );
+          return;
+        }
         setMeta(loaded);
-        void reset(loaded, LN65536);
+        const { spec: _spec, ...defaults } = loaded.defaults;
+        setConfigState(defaults);
+        void reset(defaults);
       })
       .catch((caught: unknown) => {
         if (!cancelled) {
@@ -208,6 +165,14 @@ export function useHand(): HandState & {
     };
   }, [reset]);
 
+  const setConfig = useCallback(
+    (next: Config) => {
+      setConfigState(next);
+      void reset(next);
+    },
+    [reset],
+  );
+
   const top = frames.length > 0 ? frames[frames.length - 1] : null;
 
   const settle = useCallback((frame: Frame) => {
@@ -217,9 +182,9 @@ export function useHand(): HandState & {
 
   const play = useCallback(
     async (option: number) => {
-      if (!top) return;
+      if (!top || !config) return;
       const actions = [...top.actions, option];
-      const result = await send(actions, top.board, invTemp, top);
+      const result = await send(config, actions, top.board);
       if (result.ok) {
         settle(result.frame);
         return;
@@ -240,8 +205,10 @@ export function useHand(): HandState & {
         case 'handEnded':
           setTerminal({
             kind: 'terminal',
-            seat: top.response.node?.seat,
+            seat: top.response.game?.actor.seat,
+            name: top.response.game?.options[option]?.name,
             option,
+            endedBy: failure.endedBy,
           });
           setMode('ended');
           setError(null);
@@ -249,38 +216,50 @@ export function useHand(): HandState & {
         case 'illegal':
           setError(failure.reason);
           break;
+        case 'strategyMissing':
+          setMissing(failure);
+          break;
         case 'other':
           if (failure.message !== 'superseded') setError(failure.message);
           break;
       }
     },
-    [top, invTemp, send, settle],
+    [top, config, send, settle],
   );
 
   const commitBoard = useCallback(
     async (held: Pending) => {
-      if (!top) return;
+      if (!top || !config) return;
       const actions = [...top.actions, held.action];
-      const result = await send(actions, held.board, invTemp, top);
+      const result = await send(config, actions, held.board);
       if (result.ok) {
         setPending(null);
         setMode('acting');
         settle(result.frame);
+      } else if (result.failure.kind === 'handEnded') {
+        setPending(null);
+        setTerminal({
+          kind: 'terminal',
+          seat: top.response.game?.actor.seat,
+          name: top.response.game?.options[held.action]?.name,
+          option: held.action,
+          endedBy: result.failure.endedBy,
+        });
+        setMode('ended');
       } else if (result.failure.message !== 'superseded') {
-        // A duplicate card or an impossible runout lands here. Drop the last card
-        // so the board can be retyped rather than stranding the hand.
+        // A duplicate card lands here. Drop the last card so the board can be
+        // retyped rather than stranding the hand.
         setPending({ ...held, board: held.board.slice(0, -2), rank: null });
         setError(result.failure.message);
       }
     },
-    [top, invTemp, send, settle],
+    [top, config, send, settle],
   );
 
   const undo = useCallback(() => {
     setError(null);
     if (mode === 'ended') {
-      // The hand only ends by folding out now, and that never pushed a frame, so
-      // there is nothing to pop.
+      // The ending action never pushed a frame, so there is nothing to pop.
       setTerminal(null);
       setMode('acting');
       return;
@@ -320,7 +299,7 @@ export function useHand(): HandState & {
         return;
       }
       if (key === 'n' && mode !== 'boardEntry') {
-        if (meta) void reset(meta, invTemp);
+        if (config) void reset(config);
         return;
       }
       if (mode === 'ended' || !top) return;
@@ -343,98 +322,68 @@ export function useHand(): HandState & {
       const option = optionFromKey(key);
       // Illegal options are inert - the keycap row already says which keys do
       // anything, so a rejection message would be noise.
-      if (option >= 0 && top.response.node?.legal[option]) void play(option);
+      if (option >= 0 && top.response.game?.legal[option]) void play(option);
     },
-    [mode, pending, top, meta, invTemp, reset, undo, play, commitBoard],
+    [mode, pending, top, config, reset, undo, play, commitBoard],
   );
 
-  const setInvTemp = useCallback(
-    (value: number) => {
-      setInvTempState(value);
-      if (!top) return;
-      const previous = frames.length > 1 ? frames[frames.length - 2] : null;
-      void send(top.actions, top.board, value, previous, top.stacks, top.bets).then((result) => {
-        if (result.ok) setFrames((current) => [...current.slice(0, -1), result.frame]);
-      });
-    },
-    [top, frames, send],
-  );
-
-  // Derived from the frame stack, so undo and jump-to shrink it automatically.
-  const reach = useMemo(() => reachProbabilities(frames), [frames]);
-  const actingSeat = top?.response.node?.seat;
-  const black = useMemo(
-    () => (actingSeat === undefined ? new Set<number>() : belowCut(reach.get(actingSeat))),
-    [reach, actingSeat],
-  );
-  const actingReach = useMemo(
-    () => (actingSeat === undefined ? null : (reach.get(actingSeat) ?? null)),
-    [reach, actingSeat],
-  );
+  const stats = useMemo(() => metaStats(top?.response.spot), [top]);
+  const players = top?.response.game?.config.players ?? config?.players ?? 0;
+  const seatNames = meta?.seats[String(players)] ?? [];
+  const live = mode !== 'ended' ? top : null;
 
   return {
     meta,
+    config,
     mode,
     frame: top,
     pending,
-    ledger: buildLedger(frames, meta, terminal),
-    invTemp,
+    ledger: buildLedger(frames, terminal),
     error,
+    missing,
     loading,
-    seatNames: SEAT_NAMES,
-    sizes: raiseSizes(mode === 'ended' ? null : (top?.response ?? null)),
-    black,
-    reach: actingReach,
+    seatNames,
+    sizes: live?.response.game?.options.map((option) => (option.legal ? option.betTo : null)) ?? [
+      null,
+      null,
+      null,
+      null,
+      null,
+    ],
+    black: stats?.black ?? new Set<number>(),
+    totalVisits: live?.response.spot?.totalVisits ?? null,
     handleKey,
-    setInvTemp,
     jumpTo,
+    setConfig,
   };
 }
 
 /**
- * Derived from the frame stack rather than accumulated, so undo and jump-to
- * cannot leave a stale line behind.
+ * Read from the server's history at the newest node, so undo and jump-to cannot
+ * leave a stale line behind. The k-th action produced frame k + 1.
  */
-function buildLedger(
-  frames: Frame[],
-  meta: MetaResponse | null,
-  terminal: LedgerLine | null,
-): LedgerLine[] {
-  if (frames.length === 0 || !meta) return [];
-  const lines: LedgerLine[] = [
-    { kind: 'post', seat: 1, name: 'small blind', size: meta.blinds[0], stack: frames[0].stacks[1], frame: 0 },
-    { kind: 'post', seat: 2, name: 'big blind', size: meta.blinds[1], stack: frames[0].stacks[2], frame: 0 },
-  ];
-
-  for (let i = 1; i < frames.length; i++) {
-    const previous = frames[i - 1];
-    const frame = frames[i];
-    const last = frame.response.transition?.lastAction;
-    if (!last) continue;
-
-    const spent = previous.stacks[last.seat] - last.chips;
-    lines.push({
-      kind: 'action',
-      seat: last.seat,
-      option: last.option,
-      stack: last.chips,
-      // The total in front after the action. Never lastAction.bet, which reads 0
-      // whenever the action closed the street.
-      size: (previous.bets[last.seat] ?? 0) + spent,
-      frame: i,
-    });
-
-    const before = previous.response.node?.round ?? 0;
-    const after = frame.response.node?.round ?? 0;
-    if (after > before) {
-      lines.push({
-        kind: 'street',
-        street: frame.response.node?.street,
-        board: frame.response.node?.board,
-      });
+function buildLedger(frames: Frame[], terminal: LedgerLine | null): LedgerLine[] {
+  const top = frames.length > 0 ? frames[frames.length - 1] : null;
+  const history = top?.response.game?.history;
+  if (!history) return [];
+  const lines: LedgerLine[] = [];
+  let actions = 0;
+  for (const entry of history) {
+    if (entry.kind === 'street') {
+      lines.push({ kind: 'street', street: entry.street, board: entry.board });
+      continue;
     }
+    if (entry.kind === 'action') actions++;
+    lines.push({
+      kind: entry.kind,
+      seat: entry.seat,
+      name: entry.name,
+      option: entry.option,
+      stack: entry.stack,
+      size: entry.betTo,
+      frame: entry.kind === 'post' ? 0 : actions,
+    });
   }
-
   if (terminal) lines.push(terminal);
   return lines;
 }

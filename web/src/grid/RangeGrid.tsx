@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { Combo, StrategyResponse } from '../api/types';
+import type { SpotCombo, StrategyResponse } from '../api/types';
 import { BLACK_HEX, OPTION_HEX, SLATE_HEX, VOID_HEX } from '../hand/seats';
 import { boardSuitCounts } from './comboIndex';
 import { CELLS } from './layout';
@@ -30,10 +30,10 @@ function useSquareSide(): [React.RefObject<HTMLDivElement | null>, number] {
 
 /**
  * Three ways a column carries nothing to read, all drawn black: the combination
- * uses a board card, the solver never built that node, or its meta fell under the
- * 5% cut here or on any earlier street.
+ * uses a board card, the solver has no record of its node, or its cluster fell
+ * under the 5% visits cut at this node.
  */
-function makeEliminated(combos: Combo[] | null, black: Set<number>) {
+function makeEliminated(combos: SpotCombo[] | null, black: Set<number>) {
   return (index: number): boolean => {
     if (!combos) return true;
     const row = combos[index];
@@ -57,7 +57,7 @@ export function RangeGrid({
   onHover,
 }: {
   response: StrategyResponse | null;
-  /** Combinations thin at this node or any earlier one in the hand. */
+  /** Combinations whose cluster is too thin to read at this node. */
   black: Set<number>;
   /** The combination under the cursor, or null when it leaves the grid. */
   onHover: (combo: number | null) => void;
@@ -72,7 +72,7 @@ export function RangeGrid({
   // drew, including after a move to a display with a different ratio.
   const [metrics, setMetrics] = useState({ pixels: 0, dpr: 1 });
 
-  const combos = response?.combos ?? null;
+  const combos = response?.spot?.combos ?? null;
 
   useEffect(() => {
     const element = canvas.current;
@@ -98,7 +98,7 @@ export function RangeGrid({
       current.pixels === pixels && current.dpr === dpr ? current : { pixels, dpr },
     );
 
-    const board = boardSuitCounts(response?.node?.board ?? '');
+    const board = boardSuitCounts(response?.game?.board ?? '');
     const eliminated = makeEliminated(combos, black);
 
     context.fillStyle = VOID_HEX;
@@ -134,15 +134,19 @@ export function RangeGrid({
             continue;
           }
 
-          // Bands stack from the bottom: fold, call, raise, raise, all in.
-          const frequencies = combos![combo]!.frequencies!;
+          // The column fills to its reach - how much of the hand is still in the
+          // acting range - and the bands stack inside that from the bottom: fold,
+          // call, raise, raise, all in. A hand the line has ruled out is empty.
+          const row = combos![combo]!;
+          const frequencies = row.frequencies!;
+          const reach = Math.min(1, Math.max(0, row.reach));
           let filled = 0;
           for (let option = 0; option < 5; option++) {
             const share = frequencies[option];
             if (!(share > 0)) continue;
-            const from = Math.round(filled * height);
+            const from = Math.round(filled * reach * height);
             filled = Math.min(1, filled + share);
-            const to = Math.round(filled * height);
+            const to = Math.round(filled * reach * height);
             if (to <= from) continue;
             context.fillStyle = OPTION_HEX[option];
             context.fillRect(x0, y + height - to, x1 - x0, to - from);
@@ -174,7 +178,9 @@ export function RangeGrid({
       label: cell.label,
       left: bound(index % 13),
       top: bound(Math.floor(index / 13)),
-      painted: combos !== null && cell.strips.some((combo) => !eliminated(combo)),
+      painted:
+        combos !== null &&
+        cell.strips.some((combo) => !eliminated(combo) && (combos[combo]?.reach ?? 0) > 0),
     }));
   }, [metrics, combos, black]);
 

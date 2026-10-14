@@ -1,6 +1,7 @@
 #pragma once
 
-#include "solver/engine.h"
+#include "server/engine/tableEngine.h"
+#include "server/strategyStore.h"
 
 // library.h leans on transitive includes that libc++ happens to provide and
 // libstdc++ does not, so the headers this file actually uses are named here.
@@ -18,6 +19,14 @@ inline constexpr char CARD_SUITS[5] = "cdhs";
 
 inline std::string cardToString(int card) {
     return std::string{CARD_RANKS[card / 4], CARD_SUITS[card % 4]};
+}
+
+inline std::string boardToString(const std::vector<int>& cards) {
+    std::string text;
+    for (int card : cards) {
+        text += cardToString(card);
+    }
+    return text;
 }
 
 // Returns -1 for anything that is not a two character rank/suit pair.
@@ -61,35 +70,83 @@ inline std::vector<int> parseBoard(const std::string& text) {
     return cards;
 }
 
-// How many board cards a street has. The replay reaches a round and the board
-// must match it exactly, so a flop query with four cards is an error rather than
-// a river query with the last card ignored.
+// How many board cards a street has.
 inline int roundBoardCards(int round) {
     return round == 0 ? 0 : round + 2;
 }
 
+inline const char* STREET_NAMES[4] = {"preflop", "flop", "turn", "river"};
+
 inline const char* OPTION_NAMES[5] = {
     "fold", "call", "raise 0.5x pot", "raise 1.5x pot", "all in"
 };
+
+// Seat 0 is the button and 1, 2 the blinds; the seats after them take the names of the
+// last positions before the button, so a 4 seat table has a CO and a 7 seat table
+// runs UTG, LJ, HJ, CO.
+inline std::vector<std::string> seatNames(int players) {
+    static const char* LATE[4] = {"UTG", "LJ", "HJ", "CO"};
+    std::vector<std::string> names = {"BTN", "SB", "BB"};
+    for (int i = 4 - (players - 3); i < 4; i++) {
+        names.push_back(LATE[i]);
+    }
+    return names;
+}
+
+// The name an option goes by at the table: check rather than call with nothing to
+// call, and bet rather than raise on an unopened postflop street. Preflop the big
+// blind is the bet, so every preflop raise is a raise.
+inline std::string actionName(int option, float toCall, int round, int streetRaises) {
+    if (option == 0) {
+        return "fold";
+    }
+    if (option == 1) {
+        return toCall > 0.0f ? "call" : "check";
+    }
+    if (option == 4) {
+        return "all in";
+    }
+    return (round > 0 && streetRaises == 0) ? "bet" : "raise";
+}
+
+// The INV_TEMP policy over the legal options, from a record's four weights. Fold's
+// weight is the exact 0, so it draws exp(0) = 1. The same softmax the trainer narrows
+// reach with.
+inline std::array<double, 5> policyFromWeights(const std::array<float, 4>& weights,
+        const std::array<bool, 5>& legal) {
+    std::array<double, 5> draws = {};
+    double sum = 0;
+    for (int j = 0; j < 5; j++) {
+        if (legal[j]) {
+            double w = j == 0 ? 0.0 : double(weights[j - 1]);
+            draws[j] = std::exp(std::clamp(INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
+        }
+        sum += draws[j];
+    }
+    for (int j = 0; j < 5; j++) {
+        draws[j] = sum > 0 ? draws[j] / sum : 0.0;
+    }
+    return draws;
+}
 
 // Why getOptions() turned one option off.
 //
 // It re-evaluates the same conditions rather than reading the returned mask,
 // because the mask says only that an option is off, never which clause did it.
 // That makes this a second copy of getOptions()'s logic, so keyEquivalence asserts
-// every illegal option gets a non-empty reason at every node it visits - an option
-// that falls through every clause here would otherwise be rejected with no
-// explanation at all.
+// every illegal option gets a non-empty reason at every node it visits.
 //
-// Returns "" for an option that is legal.
-inline std::string illegalReason(Engine& engine, int option) {
-    const Engine::Player& player = engine.players[engine.action];
+// Returns "" for an option that is legal. Reads spr and cpr, so setActionState()
+// must have run at this node.
+template <int P>
+std::string illegalReason(const TableEngine<P>& engine, int option) {
+    const auto& player = engine.players[engine.action];
     const int raises = engine.raiseHistory[0] + engine.raiseHistory[1]
         + engine.raiseHistory[2] + engine.raiseHistory[3];
     auto sprText = [&] { return std::to_string(player.spr); };
 
     if (option == 0) {
-        if (player.cpr < 0.01f) {
+        if (player.cpr < 0.0005f) {
             return "there is nothing to call, so folding is not an option here - "
                 "check or bet";
         }
@@ -99,7 +156,7 @@ inline std::string illegalReason(Engine& engine, int option) {
     if (option == 1) {
         // The call clauses only apply inside this guard; outside it, calling is
         // always legal.
-        if (!(player.spr >= 0.01f && raises < 6)) {
+        if (!(player.spr >= 0.0005f && raises < 6)) {
             return "";
         }
         // First in source order, matching how the || chain reads.
@@ -107,8 +164,8 @@ inline std::string illegalReason(Engine& engine, int option) {
             return "no preflop limping: the pot is unraised, so every seat must "
                 "fold or raise";
         }
-        if (player.raisesFaced > 1) {
-            return "you are facing a 3-bet or more since you last acted: fold or "
+        if (player.raisesFaced > 2) {
+            return "you are facing three or more raises since you last acted: fold or "
                 "re-raise, no flat call";
         }
         if (player.calls > 1) {
@@ -121,7 +178,7 @@ inline std::string illegalReason(Engine& engine, int option) {
         return "";
     }
 
-    if (player.spr < 0.01f) {
+    if (player.spr < 0.0005f) {
         return "calling is already all-in, so there are no chips behind to raise "
             "with";
     }
@@ -129,6 +186,9 @@ inline std::string illegalReason(Engine& engine, int option) {
         return "the hand has reached its six-raise cap";
     }
     if (raises > 4) {
+        if (option == 4) {
+            return "";
+        }
         return "the sixth raise can only be all-in";
     }
     if (option == 2 && player.spr < 0.866f) {
@@ -146,8 +206,27 @@ inline std::string illegalReason(Engine& engine, int option) {
     return "";
 }
 
+// One line of the hand as the table saw it.
+struct HistoryEntry {
+    enum Kind { Post, Action, Street };
+    Kind kind = Action;
+    int seat = -1;
+    int option = -1;
+    std::string name;
+    int round = 0;
+    // Post and Action: the seat's total in front on the street afterwards, the chips
+    // the action put in, and the stack left.
+    float betTo = 0;
+    float adds = 0;
+    float stack = 0;
+    // Street: the board once it is dealt.
+    std::string board;
+};
+
 struct ReplayResult {
     bool ok = false;
+    // Machine readable: badAction, illegal, handEnded, needsBoard, boardMismatch.
+    std::string code;
     std::string error;
     // Names the restriction that turned the option off, when the failure was an
     // illegal option. Empty otherwise.
@@ -157,31 +236,44 @@ struct ReplayResult {
     int actionIndex = -1;
     std::array<bool, 5> legal = {};
     bool hasLegal = false;
-    // The seat that played the last entry in the action list, and what it played.
-    // -1 when the list was empty, so there is no preceding action to describe.
-    int lastSeat = -1;
-    int lastOption = -1;
+    // needsBoard: the street the action list reached and the board cards it needs.
+    int needRound = 0;
+    // handEnded: "fold" when one seat is left, "showdown" when the board runs out.
+    std::string endedBy;
 };
 
-// Drives the real Engine to the node the action list describes.
-//
-// The 64 bit state key is the accumulated residue of Engine::play() - nine of its
-// fields exist nowhere else - so there is no way to construct a node from a
-// snapshot of stacks and pot. Replaying is not an implementation choice, it is
-// the only route.
-struct Replay {
-    Engine engine;
-    // The cards the caller actually supplied. Engine::boardCards also holds
-    // placeholders for streets the replay has not reached, so combo validity is
-    // tested against this rather than against the engine's board.
-    std::vector<int> board;
+// Groups and combos a range lost along the line because their node had no record.
+struct ReplayDrops {
+    int decisions = 0;
+    int groups = 0;
+    int combos = 0;
+};
 
-    // deck[0..4] are the board, deck[5..18] the seven pairs of hole cards.
-    // Streets not yet reached and every villain hand get placeholder cards drawn
-    // from the unused remainder: they are never read into the key, but they must
-    // be real, distinct, non clashing cards because newRound() classifies every
-    // live player's hand and looks the result up with at().
-    void setDeck(const std::vector<int>& boardCards) {
+// Drives a TableEngine to the node an action list describes, ranges included.
+//
+// The 64 bit state key is the accumulated residue of Engine::play(), so there is no way
+// to construct a node from a snapshot of stacks and pot: replaying is the only route.
+// And a range is the product of its seat's own policy along the line, so every past
+// decision is looked up in the strategy and narrowed exactly as the trainer narrows it
+// (TableEngine::applyPolicy), at INV_TEMP. A node the strategy has no record of drops the
+// combos that reach it.
+template <int P>
+struct Replay {
+    TableEngine<P> engine;
+    StrategyConfig config;
+    // The cards the caller actually supplied. Engine::boardCards also holds placeholders
+    // for streets the replay has not reached.
+    std::vector<int> board;
+    std::vector<HistoryEntry> history;
+    ReplayDrops drops;
+    // Scratch for narrowing.
+    std::array<uint8_t, COMBO_COUNT> groups;
+    std::array<std::array<double, 5>, GROUP_COUNT> policy;
+
+    // The five cards deal() takes. Streets not yet reached get placeholder cards drawn
+    // from the unused remainder: they are never read into the key, but deal() sorts
+    // the flop and they must be real, distinct cards.
+    std::array<int, 5> fullBoard(const std::vector<int>& boardCards) {
         board = boardCards;
         std::array<bool, 52> used = {};
         for (int card : boardCards) {
@@ -195,38 +287,87 @@ struct Replay {
             used[next] = true;
             return next;
         };
-        std::iota(engine.deck.begin(), engine.deck.end(), 0);
+        std::array<int, 5> cards;
         for (int i = 0; i < 5; i++) {
-            engine.deck[i] = i < int(boardCards.size()) ? boardCards[i] : takeUnused();
+            cards[i] = i < int(boardCards.size()) ? boardCards[i] : takeUnused();
         }
-        for (int i = 5; i < 2 * PLAYER_COUNT + 5; i++) {
-            engine.deck[i] = takeUnused();
-        }
+        return cards;
     }
 
-    // Replays the option indices in order. Each is checked against getOptions()
-    // before it is played: the tree forbids preflop limping, flat calling a
-    // 3-bet, a third call on a street, a third cold caller postflop, and any raise
-    // past the sixth, so an action list taken from a real hand will hit one of
-    // these and has to be told which.
-    ReplayResult run(const std::vector<int>& actions, const std::vector<int>& boardCards) {
+    // Narrows the acting seat's range by the option it played: each live combo takes
+    // its node's INV_TEMP probability for the option. Must follow setActionState().
+    void narrow(const StrategyStore& store, const std::array<bool, 5>& legal, int option) {
+        const int seat = engine.action;
+        const auto& range = engine.players[seat].range;
+        const uint64_t actionState = engine.getActionState(config.memoryBasic);
+        const auto& meta = engine.getMetaState(config.metasBasic);
+        std::array<int8_t, GROUP_COUNT> seen;
+        seen.fill(-1);
+        groups.fill(NO_GROUP);
+        bool dropped = false;
+        StrategyRecord record;
+        for (int combo = 0; combo < COMBO_COUNT; combo++) {
+            if (!engine.commonRange[combo] || !(range[combo] > 0.0f)) {
+                continue;
+            }
+            const uint8_t group = engine.getGroup(config.metasBasic, combo);
+            groups[combo] = group;
+            if (seen[group] < 0) {
+                const uint64_t key = actionState | meta[combo] << 42;
+                seen[group] = store.lookup(key, record) ? 1 : 0;
+                if (seen[group] == 1) {
+                    policy[group] = policyFromWeights(record.weights, legal);
+                } else {
+                    policy[group].fill(0.0);
+                    drops.groups++;
+                    dropped = true;
+                }
+            }
+            if (seen[group] == 0) {
+                drops.combos++;
+            }
+        }
+        drops.decisions += dropped;
+        engine.applyPolicy(seat, groups, policy, option);
+    }
+
+    // Replays the option indices in order. Each is checked against getOptions() before
+    // it is played. store == nullptr replays the action state alone and leaves every
+    // range at 1.
+    ReplayResult run(const StrategyConfig& setup, const std::vector<int>& actions,
+            const std::vector<int>& boardCards, const StrategyStore* store) {
         ReplayResult result;
-        setDeck(boardCards);
-        engine.deal();
+        config = setup;
+        history.clear();
+        drops = {};
+        engine.startingChips = float(config.chips);
+        engine.deal(fullBoard(boardCards));
+        for (int seat = 1; seat <= 2; seat++) {
+            HistoryEntry post;
+            post.kind = HistoryEntry::Post;
+            post.seat = seat;
+            post.name = seat == 1 ? "small blind" : "big blind";
+            post.betTo = engine.players[seat].bet;
+            post.adds = engine.players[seat].bet;
+            post.stack = engine.players[seat].chips;
+            history.push_back(post);
+        }
 
         for (size_t i = 0; i < actions.size(); i++) {
             int option = actions[i];
             if (option < 0 || option > 4) {
+                result.code = "badAction";
                 result.error = "action " + std::to_string(option)
                     + " is not an option index in 0..4";
                 result.actionIndex = int(i);
                 return result;
             }
-            // getState() writes player.spr and player.cpr as a side effect and
-            // getOptions() reads them, so this ordering is load bearing.
-            engine.getState(METAS_BASIC, MEMORY_BASIC);
+            // setActionState() writes player.spr and player.cpr and getOptions() reads
+            // them, so this ordering is load bearing.
+            engine.setActionState(config.memoryBasic);
             std::array<bool, 5> legal = engine.getOptions();
             if (!legal[option]) {
+                result.code = "illegal";
                 result.error = std::string("option ") + std::to_string(option) + " ("
                     + OPTION_NAMES[option] + ") is not legal here";
                 result.reason = illegalReason(engine, option);
@@ -235,32 +376,78 @@ struct Replay {
                 result.hasLegal = true;
                 return result;
             }
-            // Captured before play(), which advances the action pointer.
-            result.lastSeat = engine.getAction();
-            result.lastOption = option;
-            if (!engine.play(option)) {
-                result.error = "the hand ended at action " + std::to_string(i)
+            if (store != nullptr) {
+                narrow(*store, legal, option);
+            }
+
+            const int seat = engine.action;
+            auto& player = engine.players[seat];
+            HistoryEntry entry;
+            entry.seat = seat;
+            entry.option = option;
+            entry.round = engine.round;
+            entry.name = actionName(option, engine.bet - player.bet, engine.round,
+                engine.raiseHistory[engine.round]);
+            entry.betTo = engine.betTo(option);
+            const float stackBefore = player.chips;
+            const bool more = engine.play(option);
+            entry.adds = stackBefore - player.chips;
+            entry.stack = player.chips;
+            history.push_back(entry);
+            if (more) {
+                continue;
+            }
+
+            if (!engine.beginNewRound()) {
+                result.code = "handEnded";
+                result.endedBy = engine.heads == 1 ? "fold" : "showdown";
+                result.error = std::string("the hand ended at action ") + std::to_string(i)
+                    + (engine.heads == 1 ? ", when every other seat had folded"
+                        : ", when the betting finished and the board runs out to showdown")
                     + ", so there is no node to query";
                 result.actionIndex = int(i);
                 return result;
             }
+            const int needed = roundBoardCards(engine.round);
+            if (int(boardCards.size()) < needed) {
+                result.code = "needsBoard";
+                result.needRound = engine.round;
+                result.error = std::string("the action list reaches the ")
+                    + STREET_NAMES[engine.round] + ", which needs " + std::to_string(needed)
+                    + " board cards, but " + std::to_string(boardCards.size()) + " were given";
+                result.actionIndex = int(i);
+                return result;
+            }
+            engine.setCommonRange();
+            engine.setMetaState(!config.metasBasic, config.metasBasic);
+            HistoryEntry street;
+            street.kind = HistoryEntry::Street;
+            street.round = engine.round;
+            street.name = STREET_NAMES[engine.round];
+            street.board = boardToString(std::vector<int>(boardCards.begin(),
+                boardCards.begin() + needed));
+            history.push_back(street);
         }
 
-        int expected = roundBoardCards(engine.round);
+        const int expected = roundBoardCards(engine.round);
         if (int(boardCards.size()) != expected) {
-            result.error = "the action list reaches "
-                + std::string(engine.round == 0 ? "preflop"
-                    : engine.round == 1 ? "the flop"
-                    : engine.round == 2 ? "the turn" : "the river")
+            result.code = "boardMismatch";
+            result.error = std::string("the action list reaches ")
+                + (engine.round == 0 ? "preflop" : std::string("the ") + STREET_NAMES[engine.round])
                 + ", which needs " + std::to_string(expected) + " board cards, but "
                 + std::to_string(boardCards.size()) + " were given";
             return result;
         }
 
-        engine.getState(METAS_BASIC, MEMORY_BASIC);
+        engine.setActionState(config.memoryBasic);
         result.legal = engine.getOptions();
         result.hasLegal = true;
         result.ok = true;
         return result;
+    }
+
+    // The board cards revealed at the node.
+    std::vector<int> revealed() const {
+        return std::vector<int>(board.begin(), board.begin() + roundBoardCards(engine.round));
     }
 };

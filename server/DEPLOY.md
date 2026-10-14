@@ -166,14 +166,19 @@ cd ~/Poker/Firefly
 
 rsync -avP -e "ssh -i ~/.ssh/your-oracle-key" \
   solver/handAnalysis/boardClasses.bin \
+  solver/handAnalysis/boardClassesBasic.bin \
   solver/handAnalysis/handMetas.bin \
   solver/handAnalysis/handMetasBasic.bin \
   ubuntu@<VM_PUBLIC_IP>:/opt/firefly/solver/handAnalysis/
 
 rsync -avP -e "ssh -i ~/.ssh/your-oracle-key" \
-  solver/strategies/strategy_74011.bin \
+  solver/strategies/strategy_*.bin \
   ubuntu@<VM_PUBLIC_IP>:/opt/firefly/solver/strategies/
 ```
+
+Copy every `strategy_<spec>.bin` you want the front end to be able to pick: the
+UI chooses players, chips, metasBasic and memoryBasic, and the server answers with
+the matching file or a `strategyMissing` 404.
 
 `-P` shows progress and lets you resume: if the transfer drops, run the same
 command again and it picks up where it stopped.
@@ -182,7 +187,7 @@ command again and it picks up where it stopped.
 70 seconds at 50 Mbit/s.
 
 **Do not copy** `handScores.bin` (510 MB). The API never reaches showdown, so it is
-dead weight — that is exactly what the `Engine::loadTables(false)` change is for.
+dead weight, and `ServerTables::load()` never reads it.
 There is no `strategyBase_*.bin` any more: a run writes one file, and a run that uses
 a base reads a previous `strategy_<spec>.bin`.
 
@@ -196,9 +201,10 @@ stat -c "%s  %n" solver/handAnalysis/*.bin solver/strategies/*.bin
 | File | Bytes, exactly |
 | --- | --- |
 | `solver/handAnalysis/boardClasses.bin` | 121859400 |
+| `solver/handAnalysis/boardClassesBasic.bin` | 121859400 |
 | `solver/handAnalysis/handMetas.bin` | 27899243 |
 | `solver/handAnalysis/handMetasBasic.bin` | 27899243 |
-| `solver/strategies/strategy_74011.bin` | 8 + 28 × records (was 44 × records) |
+| `solver/strategies/strategy_<spec>.bin` | 8 + 28 × records |
 
 You do not have to be careful here: every one of these files has its exact
 expected size checked at startup, and a wrong size is a clear error on the spot
@@ -250,35 +256,35 @@ g++ -std=c++2b -O2 -I. -o build/keyEquivalence server/tests/keyEquivalence.cpp
 Two things about that command line, both load-bearing:
 
 - `-I.` plus running from `/opt/firefly` — every `#include` in this project is
-  written from the repository root, as `"solver/engine.h"`.
+  written from the repository root, as `"solver/multiHand/engine.h"`.
 - `-lz` on the server only — that is zlib, for gzipping responses.
 
 ---
 
-## 7. Build the index
+## 7. Build the indexes (optional)
+
+Each strategy file needs a sidecar `strategy_<spec>.idx`: a hash table that turns
+a state key into a record without scanning millions of them. **The server builds
+a missing or stale one itself** the first time that spec is requested, which takes
+about a second per 15 million records. To do it ahead of time instead:
 
 **[VM]**
 
 ```bash
 cd /opt/firefly
-./build/indexBuilder
+./build/indexBuilder --players 3 --chips 200 --metas 1 --memory 1
 ```
 
-This reads `strategy_74011.bin` and writes a 256 MB `strategy_74011.idx` beside
-it — a hash table that turns a state key into a record without scanning 10.8
-million of them. It verifies every key is reachable before it exits:
+It verifies every key is reachable before it exits:
 
 ```
-Records: 10843356
-Slots: 33554432 (256.000 MB, load 32.316%)
-Mean probes per insert: 1.239
-Wrote solver/strategies/strategy_74011.idx
-Verified 10843356 keys
+Records: 15255796
+Mean probes per insert: 1.417
+Wrote and verified solver/strategies/strategy_32011.idx (15255796 keys)
 ```
 
-**Run this again every time you copy over a new strategy file.** The server
-refuses to start if the index and the strategy disagree, so a stale index is an
-error rather than wrong answers.
+The service user needs write access to `solver/strategies/` for the server to
+build indexes itself.
 
 ---
 
@@ -292,22 +298,19 @@ cd /opt/firefly
 sleep 5
 
 curl -s localhost:8080/health
+curl -s localhost:8080/meta | head -c 600
 curl -s -X POST localhost:8080/strategy \
-  -d '{"actions":[],"include":{"combos":{"frequencies":true}}}' | head -c 400
+  -d '{"config":{"players":3,"chips":200},"actions":[]}' | head -c 400
 ```
 
-Expect `{"status":"ok", ...}` and then a wall of JSON whose first combo is `AcAd`
-raising about 94% of the time. If that works, the hard part is done — everything
-left is networking.
+Expect `{"status":"ok", ...}`, a `/meta` listing your strategies under
+`available`, and then a wall of JSON starting with the `game` section. If that
+works, the hard part is done — everything left is networking.
 
-Note the `include`: every response section is off unless asked for, so
-`{"actions":[]}` on its own returns `{}`. That is a successful reply — it means the
-action list replayed legally — but it is not much of a smoke test.
-
-Optionally prove the port is exactly right:
+Optionally prove the replay matches the engine exactly:
 
 ```bash
-./build/keyEquivalence 20000 2000 | tail -4     # expect PASSED, 0 mismatches
+./build/keyEquivalence 4000 | tail -4     # expect PASSED, 0 failures
 ```
 
 Stop it before moving on:
@@ -822,17 +825,17 @@ sudo systemctl restart firefly-api
 
 ```bash
 # [MAC]
-rsync -avP solver/strategies/strategy_74011.bin ubuntu@<IP>:/opt/firefly/solver/strategies/
+rsync -avP solver/strategies/strategy_<spec>.bin ubuntu@<IP>:/opt/firefly/solver/strategies/
 
 # [VM]
-cd /opt/firefly
-./build/indexBuilder                    # mandatory: the old index no longer matches
-sudo systemctl restart firefly-api
+sudo systemctl restart firefly-api      # an open file stays mapped until restart
 ```
 
-If the abstraction changes (`METAS_BASIC` / `MEMORY_BASIC` in `config.h`), the spec
-string changes with it — `74011` becomes something else — and you need the
-matching `strategy_<spec>.bin`, a rebuilt server, and a fresh index.
+The index is rebuilt on first use, because the old one no longer matches. A file for
+a new config (players, chips, `METAS_BASIC`, `MEMORY_BASIC`) has a new spec and
+needs no server rebuild: the UI can pick it as soon as it is in
+`solver/strategies/`. A change to `INV_TEMP` or `RANGE_FLOOR` does need a rebuild,
+because the server replays ranges with its compiled values.
 
 **The front end**, which needs nothing on the VM unless you are serving it there
 (§15d):
@@ -855,8 +858,8 @@ API serves.
 | --- | --- | --- |
 | `cannot find -lz` at link time | zlib headers missing | `sudo apt install zlib1g-dev` |
 | `solver/handAnalysis/boardClasses.bin has an unexpected size` | copy truncated or missing | re-run the rsync; compare against the byte table in §5 |
-| `... is not in the 28 byte record format` | strategy file in the old 44-byte double layout, or a partial copy | re-copy `strategy_74011.bin` from a run of the current solver |
-| `... Rebuild the index.` | index and strategy disagree | `./build/indexBuilder` |
+| `... is not in the 28 byte record format` | strategy file in an old layout, or a partial copy | re-copy `strategy_<spec>.bin` from a run of the current solver |
+| `strategyUnreadable` from the API | the index could not be rebuilt, or the file is corrupt | check write access to `solver/strategies/`; run `./build/indexBuilder <path>` to see the error |
 | `failed to open ... for reading` | wrong working directory | run from `/opt/firefly`; check `WorkingDirectory` in the unit |
 | Service dies instantly | see the real error | `journalctl -u firefly-api -n 50 --no-pager` |
 | `curl` from the Mac hangs, no error | host firewall still closed | §11b |

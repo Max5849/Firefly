@@ -1,4 +1,4 @@
-import type { MetaResponse, StrategyRequest, StrategyResponse } from './types';
+import type { ConfigWithSpec, MetaResponse, StrategyRequest, StrategyResponse } from './types';
 
 // Dev: same-origin /api, proxied to 127.0.0.1:8080 by Vite - no CORS, no token.
 // Deployed: VITE_API_URL points at nginx and VITE_API_TOKEN carries the bearer.
@@ -14,14 +14,21 @@ function headers(): HeadersInit {
 }
 
 /**
- * The server validates the board count *after* the replay, so a street rollover
- * is only ever announced as a rejection. These are the outcomes worth acting on
- * rather than merely reporting.
+ * The outcomes worth acting on rather than merely reporting, read from the error
+ * body's `code`. A street rollover is announced as needsBoard, since the server
+ * cannot go on without the cards.
  */
 export type ApiFailure =
   | { kind: 'needsBoard'; street: string; needed: number; message: string }
-  | { kind: 'handEnded'; actionIndex: number; message: string }
+  | { kind: 'handEnded'; actionIndex: number; endedBy: string; message: string }
   | { kind: 'illegal'; actionIndex: number; reason: string; message: string }
+  | {
+      kind: 'strategyMissing';
+      spec: string;
+      path: string;
+      available: ConfigWithSpec[];
+      message: string;
+    }
   | { kind: 'other'; message: string };
 
 export class ApiError extends Error {
@@ -33,40 +40,37 @@ export class ApiError extends Error {
   }
 }
 
-const STREET_CARDS: Record<string, number> = { flop: 3, turn: 4, river: 5 };
-
 function classify(body: Record<string, unknown>): ApiFailure {
   const message = typeof body.error === 'string' ? body.error : 'the request failed';
-
-  // "the action list reaches the flop, which needs 3 board cards, but 0 were given"
-  const needs = /needs (\d+) board cards/.exec(message);
-  const street = /reaches the (flop|turn|river)/.exec(message);
-  if (needs || (street && message.includes('board cards'))) {
-    const name = street ? street[1] : 'flop';
-    // Prefer the number the server stated; fall back to the street it named, so a
-    // reworded message still routes to board entry rather than to an error line.
-    const needed = needs ? Number(needs[1]) : STREET_CARDS[name];
-    return { kind: 'needsBoard', street: name, needed, message };
+  const actionIndex = typeof body.actionIndex === 'number' ? body.actionIndex : -1;
+  switch (body.code) {
+    case 'needsBoard':
+      return {
+        kind: 'needsBoard',
+        street: String(body.street ?? 'flop'),
+        needed: typeof body.cards === 'number' ? body.cards : 3,
+        message,
+      };
+    case 'handEnded':
+      return { kind: 'handEnded', actionIndex, endedBy: String(body.endedBy ?? ''), message };
+    case 'illegal':
+      return {
+        kind: 'illegal',
+        actionIndex,
+        reason: typeof body.reason === 'string' ? body.reason : message,
+        message,
+      };
+    case 'strategyMissing':
+      return {
+        kind: 'strategyMissing',
+        spec: String(body.spec ?? ''),
+        path: String(body.path ?? ''),
+        available: Array.isArray(body.available) ? (body.available as ConfigWithSpec[]) : [],
+        message,
+      };
+    default:
+      return { kind: 'other', message };
   }
-
-  if (message.includes('the hand ended at action')) {
-    return {
-      kind: 'handEnded',
-      actionIndex: typeof body.actionIndex === 'number' ? body.actionIndex : -1,
-      message,
-    };
-  }
-
-  if (Array.isArray(body.legal) && typeof body.actionIndex === 'number') {
-    return {
-      kind: 'illegal',
-      actionIndex: body.actionIndex,
-      reason: typeof body.reason === 'string' ? body.reason : message,
-      message,
-    };
-  }
-
-  return { kind: 'other', message };
 }
 
 export async function getMeta(signal?: AbortSignal): Promise<MetaResponse> {
@@ -104,11 +108,3 @@ export async function postStrategy(
   }
   return body as StrategyResponse;
 }
-
-/** Everything the server can return. Diagnostic sections are fetched but unrendered. */
-export const FULL_INCLUDE = {
-  node: true,
-  transition: true,
-  keyComponents: true,
-  combos: true,
-} as const;

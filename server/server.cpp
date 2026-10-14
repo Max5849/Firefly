@@ -1,22 +1,23 @@
 // Firefly strategy API.
 //
-//   build/server [--host H] [--port P] [--strategy PATH] [--index PATH]
-//                [--threads N] [--warm]
+//   build/server [--host H] [--port P] [--threads N] [--warm]
 //
-// Must be run from the repository root: engine.h resolves the handAnalysis tables
-// through relative paths.
+// Must be run from the repository root: the engine resolves the handAnalysis tables,
+// and the registry the strategy files, through relative paths.
 //
-// POST /strategy  {"actions": [0,0,3,1], "board": "As7h2d", "invTemp": 11.0904}
-//   -> the weights, frequencies and visits of all 1326 hole card combinations at
-//      the node that action list reaches, for the player to act.
+// POST /strategy  {"config": {"players": 3, "chips": 200, "metasBasic": true,
+//                             "memoryBasic": true},
+//                  "actions": [2, 1], "board": "As7h2d"}
+//   -> the table (game), the acting seat's key decoded (key), and the strategy, range,
+//      EV and visits of all 1326 hole card combinations at that node (spot).
 // GET  /health
 // GET  /meta
 
 #define CPPHTTPLIB_ZLIB_SUPPORT
 
-#include "solver/config.h"
 #include "server/replay.h"
-#include "server/sweep.h"
+#include "server/keyLayout.h"
+#include "server/spot.h"
 #include "server/strategyStore.h"
 #include "server/include/httplib.h"
 #include "server/include/json.hpp"
@@ -28,487 +29,542 @@
 
 using json = nlohmann::json;
 
-// The response is 1326 rows of ten numbers. A generic serialiser is the dominant
+// The response is 1326 rows of a dozen numbers. A generic serialiser is the dominant
 // cost of an otherwise few millisecond request, so it is written straight into one
 // preallocated buffer with to_chars.
 struct JsonWriter {
     std::string out;
+    // Whether the next value in the current object or array needs a comma first.
+    std::vector<bool> needComma;
 
-    JsonWriter() { out.reserve(1 << 19); }
+    JsonWriter() { out.reserve(1 << 20); }
 
-    void raw(const char* text) { out += text; }
-    void raw(const std::string& text) { out += text; }
-
-    void number(double value) {
-        if (!std::isfinite(value)) {
-            // Neither inf nor nan is valid JSON. A finite file never produces
-            // them, but a corrupt one should not produce an unparseable body.
-            out += "null";
-            return;
+    void separate() {
+        if (!needComma.empty()) {
+            if (needComma.back()) {
+                out += ',';
+            }
+            needComma.back() = true;
         }
-        char buffer[40];
-        auto [end, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value);
-        out.append(buffer, end);
     }
 
-    void number(uint64_t value) {
+    void open(char bracket) {
+        out += bracket;
+        needComma.push_back(false);
+    }
+
+    void close(char bracket) {
+        out += bracket;
+        needComma.pop_back();
+    }
+
+    void beginObject() { separate(); open('{'); }
+    void endObject() { close('}'); }
+    void beginArray() { separate(); open('['); }
+    void endArray() { close(']'); }
+
+    // A key inside an object; the value that follows must not separate again.
+    void key(const char* name) {
+        separate();
+        out += '"';
+        out += name;
+        out += "\":";
+        needComma.back() = false;
+    }
+
+    void finishValue() {
+        if (!needComma.empty()) {
+            needComma.back() = true;
+        }
+    }
+
+    void null() { separate(); out += "null"; finishValue(); }
+    void boolean(bool value) { separate(); out += value ? "true" : "false"; finishValue(); }
+
+    void number(double value) {
+        separate();
+        if (!std::isfinite(value)) {
+            // Neither inf nor nan is valid JSON.
+            out += "null";
+        } else {
+            char buffer[40];
+            auto [end, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value);
+            out.append(buffer, end);
+        }
+        finishValue();
+    }
+
+    void integer(int64_t value) {
+        separate();
         char buffer[24];
         auto [end, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value);
         out.append(buffer, end);
+        finishValue();
     }
-
-    void number(int value) { number(uint64_t(value < 0 ? 0 : value)); }
 
     // Keys are hex strings: a uint64 exceeds JSON's safe integer range and a
     // JavaScript client would silently round it.
-    void hexKey(uint64_t value) {
+    void hex(uint64_t value) {
+        separate();
         char buffer[20] = "\"0x";
         auto [end, ec] = std::to_chars(buffer + 3, buffer + 19, value, 16);
         *end = '"';
         out.append(buffer, end + 1);
+        finishValue();
     }
 
     void string(const std::string& text) {
+        separate();
         out += '"';
-        out += text;
+        for (char c : text) {
+            if (c == '"' || c == '\\') {
+                out += '\\';
+            }
+            out += c;
+        }
         out += '"';
+        finishValue();
     }
 
-    void key(const char* name) {
-        out += '"';
-        out += name;
-        out += "\":";
+    template <typename T>
+    void field(const char* name, const T& value) {
+        key(name);
+        if constexpr (std::is_same_v<T, bool>) {
+            boolean(value);
+        } else if constexpr (std::is_integral_v<T>) {
+            integer(int64_t(value));
+        } else if constexpr (std::is_floating_point_v<T>) {
+            number(double(value));
+        } else {
+            string(value);
+        }
     }
 };
 
 struct ServerOptions {
     std::string host = "127.0.0.1";
     int port = 8080;
-    std::string strategyPath;
-    std::string indexPath;
     int threads = 0;
     bool warm = false;
 };
 
-static void writeBoolArray(JsonWriter& writer, const std::array<bool, 5>& values) {
-    writer.raw("[");
-    for (int j = 0; j < 5; j++) {
-        writer.raw(values[j] ? "true" : "false");
-        if (j < 4) {
-            writer.raw(",");
-        }
-    }
-    writer.raw("]");
-}
-
-// Which sections the caller asked for. Everything is off unless named, so a
-// request that turns nothing on returns {} - which still means the action list
-// replayed legally, making it a cheap validity check.
+// Which sections the caller asked for. With no "include", everything.
 struct IncludeMask {
-    bool node = false;
-    bool transition = false;
-    bool keyComponents = false;
-    SweepFields combos;
-
-    bool anything() const {
-        return node || transition || keyComponents || combos.any();
-    }
+    bool game = true;
+    bool key = true;
+    bool spot = true;
 };
 
-// Writes a section separator only from the second section onward, so the caller
-// need not know which sections precede it.
-struct SectionWriter {
-    JsonWriter& writer;
-    bool written = false;
-
-    void begin(const char* name) {
-        if (written) {
-            writer.raw(",");
-        }
-        written = true;
-        writer.key(name);
-    }
+struct Request {
+    StrategyConfig config;
+    std::vector<int> actions;
+    std::vector<int> board;
+    IncludeMask include;
 };
 
-static void writeIntArray(JsonWriter& writer, const std::array<int, 4>& values) {
-    writer.raw("[");
-    for (int i = 0; i < 4; i++) {
-        writer.number(uint64_t(values[i]));
-        if (i < 3) {
-            writer.raw(",");
-        }
-    }
-    writer.raw("]");
+inline constexpr int MAX_CHIPS = 100000;
+
+static json configJson(const StrategyConfig& config) {
+    return {{"players", config.players}, {"chips", config.chips},
+        {"metasBasic", config.metasBasic}, {"memoryBasic", config.memoryBasic},
+        {"spec", config.spec()}};
 }
 
-// The abstraction's view of the node: what the key identifies, simplified.
-static void writeNode(JsonWriter& writer, const Engine& engine,
-        const std::vector<int>& board, const std::array<bool, 5>& legal,
-        double invTemp) {
-    writer.raw("{");
-    writer.key("spec");    writer.string(fireflySpec());
-    writer.raw(",");
-    writer.key("round");   writer.number(uint64_t(engine.round));
-    writer.raw(",");
-    writer.key("street");  writer.string(engine.round == 0 ? "preflop"
-        : engine.round == 1 ? "flop" : engine.round == 2 ? "turn" : "river");
-    writer.raw(",");
-    writer.key("seat");    writer.number(uint64_t(engine.action));
-    writer.raw(",");
-    writer.key("heads");   writer.number(uint64_t(engine.heads));
-    writer.raw(",");
-    writer.key("board");
-    {
-        std::string text;
-        for (int card : board) {
-            text += cardToString(card);
-        }
-        writer.string(text);
+static json availableJson() {
+    json list = json::array();
+    for (const StrategyConfig& config : availableStrategies()) {
+        list.push_back(configJson(config));
     }
-    writer.raw(",");
-    // legal lives here because it is what the rows' nulls and zeros are keyed to.
-    writer.key("legal");   writeBoolArray(writer, legal);
-    writer.raw(",");
-    writer.key("options");
-    writer.raw("[\"fold\",\"call\",\"raise 0.5x pot\",\"raise 1.5x pot\",\"all in\"]");
-    writer.raw(",");
-    writer.key("invTemp"); writer.number(invTemp);
-    writer.raw(",");
-    writer.key("weightUnits");
-    writer.string("stack change divided by the pot after calling, measured against "
-        "folding, whose value is exactly 0");
-    writer.raw("}");
+    return list;
 }
 
-// Exact chips, for a UI applying one action and rendering the next decision. Only
-// the two seats that changed; the rest of the table accumulates on the client.
-static void writeTransition(JsonWriter& writer, const Engine& engine,
-        const ReplayResult& replayed, const std::array<bool, 5>& legal) {
-    const Engine::Player& actor = engine.players[engine.action];
-    float toCall = engine.bet - actor.bet;
-
-    writer.raw("{");
-    writer.key("pot"); writer.number(double(engine.pot));
-    writer.raw(",");
-    writer.key("lastAction");
-    if (replayed.lastSeat < 0) {
-        // No action was submitted, so nothing preceded this node.
-        writer.raw("null");
-    } else {
-        const Engine::Player& last = engine.players[replayed.lastSeat];
-        writer.raw("{");
-        writer.key("seat");   writer.number(uint64_t(replayed.lastSeat));
-        writer.raw(",");
-        writer.key("option"); writer.number(uint64_t(replayed.lastOption));
-        writer.raw(",");
-        writer.key("chips");  writer.number(double(last.chips));
-        writer.raw(",");
-        // If the action closed the street, newRound() has already zeroed every
-        // live player's bet. The chips are in the pot and the stack is in chips,
-        // so this reading 0 is correct - but a UI rendering bet as "chips in
-        // front" needs to notice the street rolled over.
-        writer.key("bet");    writer.number(double(last.bet));
-        writer.raw(",");
-        writer.key("inHand"); writer.raw(last.inHand ? "true" : "false");
-        writer.raw("}");
-    }
-    writer.raw(",");
-    writer.key("actor");
-    writer.raw("{");
-    writer.key("seat");         writer.number(uint64_t(engine.action));
-    writer.raw(",");
-    writer.key("chips");        writer.number(double(actor.chips));
-    writer.raw(",");
-    writer.key("bet");          writer.number(double(actor.bet));
-    writer.raw(",");
-    writer.key("toCall");       writer.number(double(toCall));
-    writer.raw(",");
-    // The weight denominator, repeated here because it is exact.
-    writer.key("potAfterCall"); writer.number(double(engine.pot + toCall));
-    writer.raw(",");
-    writer.key("spr");          writer.number(double(actor.spr));
-    writer.raw(",");
-    writer.key("cpr");          writer.number(double(actor.cpr));
-    writer.raw(",");
-    writer.key("legal");        writeBoolArray(writer, legal);
-    writer.raw("}}");
+static void fail(httplib::Response& response, int status, const std::string& code,
+        const std::string& message, json extra = json::object()) {
+    json body = std::move(extra);
+    body["code"] = code;
+    body["error"] = message;
+    response.status = status;
+    response.set_content(body.dump(), "application/json");
 }
 
-static void writeKeyComponents(JsonWriter& writer, const KeyComponents& parts) {
-    writer.raw("{");
-    writer.key("roundHeadsBasic");      writer.number(uint64_t(parts.roundHeadsBasic));
-    writer.raw(",");
-    writer.key("headsBasic");           writer.number(uint64_t(parts.headsBasic));
-    writer.raw(",");
-    writer.key("actionPositionBucket"); writer.number(uint64_t(parts.actionPositionBucket));
-    writer.raw(",");
-    writer.key("sprCprBucket");         writer.number(uint64_t(parts.sprCprBucket));
-    writer.raw(",");
-    writer.key("sprCprKind");           writer.string(parts.sprCprKind);
-    writer.raw(",");
-    // Preflop the board field carries the 169 combo index, which is hand
-    // dependent, so there is no shared value to report.
-    writer.key("boardField");
-    if (parts.hasBoardField) {
-        writer.number(uint64_t(parts.boardField));
-    } else {
-        writer.raw("null");
-    }
-    writer.raw(",");
-    writer.key("boardClass");
-    if (parts.hasBoardField) {
-        writer.number(uint64_t(parts.boardClass));
-    } else {
-        writer.raw("null");
-    }
-    writer.raw(",");
-    // The four per street counts, in place of the colex rank the key packs.
-    writer.key("raiseHistory");       writeIntArray(writer, parts.raiseHistory);
-    writer.raw(",");
-    writer.key("playerLastActions");  writeIntArray(writer, parts.playerLastActions);
-    writer.raw(",");
-    writer.key("villanLastActions");  writeIntArray(writer, parts.villanLastActions);
-    writer.raw(",");
-    writer.key("playerPositionBasic"); writer.number(uint64_t(parts.playerPositionBasic));
-    writer.raw(",");
-    writer.key("villanPositionBasic"); writer.number(uint64_t(parts.villanPositionBasic));
-    writer.raw(",");
-    writer.key("villanPosition");      writer.number(uint64_t(parts.villanPosition));
-    writer.raw(",");
-    writer.key("raiseSizeOverZero");   writer.number(uint64_t(parts.raiseSizeOverZero));
-    writer.raw(",");
-    writer.key("raiseStrength");       writer.number(uint64_t(parts.raiseStrength));
-    writer.raw(",");
-    writer.key("hiddenRaiseSizeOverZero");
-    writer.number(uint64_t(parts.hiddenRaiseSizeOverZero));
-    writer.raw(",");
-    writer.key("hiddenRaiseStrength"); writer.number(uint64_t(parts.hiddenRaiseStrength));
-    writer.raw(",");
-    writer.key("raisesFaced");         writer.number(uint64_t(parts.raisesFaced));
-    writer.raw(",");
-    writer.key("relativePosition");    writer.number(uint64_t(parts.relativePosition));
-    writer.raw(",");
-    writer.key("playerCallsOverOne");  writer.raw(parts.playerCallsOverOne ? "true" : "false");
-    writer.raw(",");
-    writer.key("calls");               writer.number(uint64_t(parts.calls));
-    writer.raw("}");
-}
-
-static void writeCombos(JsonWriter& writer, const SweepResult& swept,
-        const SweepFields& fields) {
-    // found is emitted whenever a record backed field is present, because those
-    // fields are meaningless without it. It is not separately toggleable.
-    const bool emitFound = fields.needsStore();
-    writer.raw("[");
-    for (int i = 0; i < COMBO_COUNT; i++) {
-        const ComboRow& row = swept.rows[i];
-        if (i > 0) {
-            writer.raw(",");
-        }
-        if (!row.valid) {
-            // The combination clashes with a board card, so it cannot be held.
-            writer.raw("null");
-            continue;
-        }
-        writer.raw("{");
-        writer.key("combo");
-        writer.string(cardToString(row.cards[0]) + cardToString(row.cards[1]));
-        if (!row.metaFound) {
-            writer.raw(",");
-            writer.key("found");     writer.raw("false");
-            writer.raw(",");
-            writer.key("metaFound"); writer.raw("false");
-            writer.raw("}");
-            continue;
-        }
-        if (fields.handMeta) {
-            writer.raw(",");
-            writer.key("handMeta"); writer.number(uint64_t(row.handMeta));
-        }
-        if (fields.key) {
-            writer.raw(",");
-            writer.key("key"); writer.hexKey(row.key);
-        }
-        if (emitFound) {
-            writer.raw(",");
-            writer.key("found"); writer.raw(row.found ? "true" : "false");
-        }
-        if (row.found && fields.weights) {
-            writer.raw(",");
-            writer.key("weights");
-            writer.raw("[");
-            for (int j = 1; j < 5; j++) {
-                // An illegal option's stored slot holds whatever was in memory,
-                // so it is reported as absent rather than as a number.
-                if (swept.legal[j]) {
-                    writer.number(row.weights[j - 1]);
-                } else {
-                    writer.raw("null");
-                }
-                if (j < 4) {
-                    writer.raw(",");
-                }
-            }
-            writer.raw("]");
-        }
-        if (row.found && fields.frequencies) {
-            writer.raw(",");
-            writer.key("frequencies");
-            writer.raw("[");
-            for (int j = 0; j < 5; j++) {
-                writer.number(row.frequencies[j]);
-                if (j < 4) {
-                    writer.raw(",");
-                }
-            }
-            writer.raw("]");
-        }
-        if (row.found && fields.visits) {
-            writer.raw(",");
-            // The per holding estimate, plus the two numbers it is built from so
-            // it can be checked and re-aggregated.
-            writer.key("visits");     writer.number(row.visits);
-            writer.raw(",");
-            writer.key("nodeVisits"); writer.number(uint64_t(row.nodeVisits));
-            writer.raw(",");
-            writer.key("metaCombos"); writer.number(uint64_t(row.metaCombos));
-        }
-        writer.raw("}");
-    }
-    writer.raw("]");
-}
-
-static std::string buildResponse(const Engine& engine, const std::vector<int>& board,
-        const ReplayResult& replayed, const SweepResult& swept,
-        const std::array<bool, 5>& legal, double invTemp, const IncludeMask& include) {
-    JsonWriter writer;
-    SectionWriter sections{writer};
-    writer.raw("{");
-
-    if (include.node) {
-        sections.begin("node");
-        writeNode(writer, engine, board, legal, invTemp);
-    }
-    if (include.transition) {
-        sections.begin("transition");
-        writeTransition(writer, engine, replayed, legal);
-    }
-    if (include.keyComponents) {
-        sections.begin("keyComponents");
-        writeKeyComponents(writer, keyComponents(engine));
-    }
-    if (include.combos.counts) {
-        sections.begin("counts");
-        writer.raw("{");
-        writer.key("found");       writer.number(uint64_t(swept.found));
-        writer.raw(",");
-        writer.key("missing");     writer.number(uint64_t(swept.missing));
-        writer.raw(",");
-        writer.key("invalid");     writer.number(uint64_t(swept.invalid));
-        writer.raw(",");
-        writer.key("metaMissing"); writer.number(uint64_t(swept.metaMissing));
-        writer.raw("}");
-    }
-    if (include.combos.weights || include.combos.frequencies || include.combos.visits
-            || include.combos.key || include.combos.handMeta) {
-        sections.begin("combos");
-        writeCombos(writer, swept, include.combos);
-    }
-
-    writer.raw("}");
-    return std::move(writer.out);
-}
-
-// Parses the include block. Each section accepts true, false, or - for combos - an
-// object naming individual fields. An unknown key is a 400 rather than a silent
-// omission: a typo would otherwise return {} and read as a working request that
-// found nothing.
-static bool parseInclude(const json& body, IncludeMask& include, std::string& error) {
-    if (!body.contains("include") || body["include"].is_null()) {
+// Every field optional; a missing one takes the value config.h was compiled with.
+static bool parseConfig(const json& body, StrategyConfig& config, std::string& error) {
+    if (!body.contains("config") || body["config"].is_null()) {
         return true;
     }
-    const json& node = body["include"];
+    const json& node = body["config"];
     if (!node.is_object()) {
-        error = "\"include\" must be an object, for example "
-            "{\"node\": true, \"combos\": {\"weights\": true}}";
+        error = "\"config\" must be an object like {\"players\": 3, \"chips\": 200, "
+            "\"metasBasic\": true, \"memoryBasic\": true}";
         return false;
     }
-
-    auto readFlag = [&](const json& value, const char* name, bool& out) {
-        if (!value.is_boolean()) {
-            error = std::string("\"include.") + name + "\" must be true or false";
-            return false;
-        }
-        out = value.get<bool>();
-        return true;
-    };
-
     for (auto entry = node.begin(); entry != node.end(); ++entry) {
         const std::string& name = entry.key();
-        if (name == "node") {
-            if (!readFlag(entry.value(), "node", include.node)) { return false; }
-        } else if (name == "transition") {
-            if (!readFlag(entry.value(), "transition", include.transition)) { return false; }
-        } else if (name == "keyComponents") {
-            if (!readFlag(entry.value(), "keyComponents", include.keyComponents)) { return false; }
-        } else if (name == "combos") {
-            const json& combos = entry.value();
-            if (combos.is_boolean()) {
-                // Shorthand: true turns on every combo field.
-                const bool all = combos.get<bool>();
-                include.combos = SweepFields{all, all, all, all, all, all};
-            } else if (combos.is_object()) {
-                for (auto field = combos.begin(); field != combos.end(); ++field) {
-                    const std::string& key = field.key();
-                    bool* target = key == "weights"     ? &include.combos.weights
-                                 : key == "frequencies" ? &include.combos.frequencies
-                                 : key == "visits"      ? &include.combos.visits
-                                 : key == "key"         ? &include.combos.key
-                                 : key == "handMeta"    ? &include.combos.handMeta
-                                 : key == "counts"      ? &include.combos.counts
-                                 : nullptr;
-                    if (target == nullptr) {
-                        error = "unknown field \"" + key + "\" in \"include.combos\" "
-                            "(valid: weights, frequencies, visits, key, handMeta, counts)";
-                        return false;
-                    }
-                    if (!readFlag(field.value(), ("combos." + key).c_str(), *target)) {
-                        return false;
-                    }
-                }
-            } else {
-                error = "\"include.combos\" must be a boolean or an object";
+        const json& value = entry.value();
+        if (name == "players") {
+            if (!value.is_number_integer() || value.get<int>() < 3 || value.get<int>() > 7) {
+                error = "\"config.players\" must be an integer from 3 to 7";
                 return false;
             }
+            config.players = value.get<int>();
+        } else if (name == "chips") {
+            if (!value.is_number() || value.get<double>() != std::floor(value.get<double>())
+                    || value.get<double>() <= 0 || value.get<double>() > MAX_CHIPS) {
+                error = "\"config.chips\" must be a positive whole number of chips up to "
+                    + std::to_string(MAX_CHIPS);
+                return false;
+            }
+            const int chips = int(value.get<double>());
+            if (chips % 2 != 0) {
+                error = "\"config.chips\" must be even: strategy files are named by "
+                    "10 * chips + 10 * metasBasic, so an odd stack shares its name with "
+                    "the next stack up";
+                return false;
+            }
+            config.chips = chips;
+        } else if (name == "metasBasic" || name == "memoryBasic") {
+            if (!value.is_boolean()) {
+                error = "\"config." + name + "\" must be true or false";
+                return false;
+            }
+            (name == "metasBasic" ? config.metasBasic : config.memoryBasic) = value.get<bool>();
         } else {
-            error = "unknown section \"" + name + "\" in \"include\" "
-                "(valid: node, transition, keyComponents, combos)";
+            error = "unknown field \"" + name + "\" in \"config\" "
+                "(valid: players, chips, metasBasic, memoryBasic)";
             return false;
         }
     }
     return true;
 }
 
-static void fail(httplib::Response& response, int status, const std::string& message,
-        int actionIndex = -1, const std::array<bool, 5>* legal = nullptr,
-        const std::string& reason = "") {
-    json body;
-    body["error"] = message;
-    // Names the restriction that turned the option off. The message says only that
-    // an option is illegal; without this a caller cannot tell whether it hit the
-    // limping rule, a call cap, or an SPR threshold.
-    if (!reason.empty()) {
-        body["reason"] = reason;
+// An unknown section is a 400 rather than a silent omission: a typo would otherwise
+// return a response missing a section and read as a working request.
+static bool parseInclude(const json& body, IncludeMask& include, std::string& error) {
+    if (!body.contains("include") || body["include"].is_null()) {
+        return true;
     }
-    if (actionIndex >= 0) {
-        body["actionIndex"] = actionIndex;
+    const json& node = body["include"];
+    if (!node.is_object()) {
+        error = "\"include\" must be an object, for example {\"game\": true, \"spot\": false}";
+        return false;
     }
-    if (legal != nullptr) {
-        body["legal"] = std::vector<bool>(legal->begin(), legal->end());
-        body["options"] = std::vector<std::string>(OPTION_NAMES, OPTION_NAMES + 5);
+    include = {false, false, false};
+    for (auto entry = node.begin(); entry != node.end(); ++entry) {
+        const std::string& name = entry.key();
+        bool* target = name == "game" ? &include.game
+                     : name == "key"  ? &include.key
+                     : name == "spot" ? &include.spot
+                     : nullptr;
+        if (target == nullptr) {
+            error = "unknown section \"" + name + "\" in \"include\" (valid: game, key, spot)";
+            return false;
+        }
+        if (!entry.value().is_boolean()) {
+            error = "\"include." + name + "\" must be true or false";
+            return false;
+        }
+        *target = entry.value().get<bool>();
     }
-    response.status = status;
-    response.set_content(body.dump(), "application/json");
+    return true;
+}
+
+static void writeConfig(JsonWriter& w, const StrategyConfig& config) {
+    w.beginObject();
+    w.field("players", config.players);
+    w.field("chips", config.chips);
+    w.field("metasBasic", config.metasBasic);
+    w.field("memoryBasic", config.memoryBasic);
+    w.field("spec", config.spec());
+    w.endObject();
+}
+
+static void writeLegal(JsonWriter& w, const std::array<bool, 5>& legal) {
+    w.beginArray();
+    for (bool value : legal) {
+        w.boolean(value);
+    }
+    w.endArray();
+}
+
+// What a player sitting at the table sees: the seats, their stacks and bets, the pot,
+// the board, whose turn it is and what they may do, and the hand so far.
+template <int P>
+void writeGame(JsonWriter& w, Replay<P>& replay, const std::array<bool, 5>& legal) {
+    TableEngine<P>& engine = replay.engine;
+    const auto& actor = engine.players[engine.action];
+    const std::vector<std::string> names = seatNames(P);
+    const float toCall = engine.bet - actor.bet;
+
+    w.beginObject();
+    w.key("config");
+    writeConfig(w, replay.config);
+    w.field("round", int(engine.round));
+    w.field("street", std::string(STREET_NAMES[engine.round]));
+    w.field("board", boardToString(replay.revealed()));
+    w.field("pot", engine.pot);
+    w.field("heads", engine.heads);
+    w.field("blinds", std::string("1/2"));
+
+    w.key("seats");
+    w.beginArray();
+    for (int seat = 0; seat < P; seat++) {
+        const auto& player = engine.players[seat];
+        w.beginObject();
+        w.field("seat", seat);
+        w.field("name", names[seat]);
+        w.field("stack", player.chips);
+        w.field("bet", player.bet);
+        w.field("inHand", player.inHand);
+        w.field("allIn", player.inHand && player.chips < 0.0005f);
+        w.field("acting", seat == int(engine.action));
+        w.endObject();
+    }
+    w.endArray();
+
+    w.key("actor");
+    w.beginObject();
+    w.field("seat", int(engine.action));
+    w.field("name", names[engine.action]);
+    w.field("stack", actor.chips);
+    w.field("bet", actor.bet);
+    w.field("toCall", toCall);
+    w.field("potAfterCall", engine.pot + toCall);
+    w.field("spr", actor.spr);
+    w.field("cpr", actor.cpr);
+    w.endObject();
+
+    w.key("legal");
+    writeLegal(w, legal);
+    w.key("options");
+    w.beginArray();
+    for (int option = 0; option < 5; option++) {
+        w.beginObject();
+        w.field("option", option);
+        w.field("name", actionName(option, toCall, engine.round, engine.raiseHistory[engine.round]));
+        w.field("size", std::string(option == 2 ? "0.5x pot" : option == 3 ? "1.5x pot" : ""));
+        w.field("legal", legal[option]);
+        if (legal[option] && option > 0) {
+            const float to = engine.betTo(option);
+            w.field("betTo", to);
+            w.field("adds", to - actor.bet);
+        } else {
+            w.key("betTo");
+            w.null();
+            w.key("adds");
+            w.null();
+        }
+        w.field("reason", legal[option] ? std::string() : illegalReason(engine, option));
+        w.endObject();
+    }
+    w.endArray();
+
+    w.key("history");
+    w.beginArray();
+    for (const HistoryEntry& entry : replay.history) {
+        w.beginObject();
+        if (entry.kind == HistoryEntry::Street) {
+            w.field("kind", std::string("street"));
+            w.field("round", entry.round);
+            w.field("street", entry.name);
+            w.field("board", entry.board);
+        } else {
+            w.field("kind", std::string(entry.kind == HistoryEntry::Post ? "post" : "action"));
+            w.field("seat", entry.seat);
+            w.field("name", entry.name);
+            w.field("option", entry.option);
+            w.field("round", entry.round);
+            w.field("betTo", entry.betTo);
+            w.field("adds", entry.adds);
+            w.field("stack", entry.stack);
+        }
+        w.endObject();
+    }
+    w.endArray();
+    w.endObject();
+}
+
+static std::string bitString(uint64_t value, int width) {
+    std::string bits(width, '0');
+    for (int i = 0; i < width; i++) {
+        if (value >> (width - 1 - i) & 1) {
+            bits[i] = '1';
+        }
+    }
+    return bits;
+}
+
+static void writeKey(JsonWriter& w, const KeyLayout& layout) {
+    w.beginObject();
+    w.key("sharedKey");
+    w.hex(layout.sharedKey);
+    w.key("actionState");
+    w.hex(layout.actionState);
+    w.field("heroSeat", layout.heroSeat);
+    w.field("villanSeat", layout.villanSeat);
+    w.field("spr", layout.spr);
+    w.field("cpr", layout.cpr);
+    w.field("sharedBits", 58);
+    w.key("fields");
+    w.beginArray();
+    for (const KeyField& field : layout.fields) {
+        w.beginObject();
+        w.field("name", field.name);
+        w.field("label", field.label);
+        w.field("shift", field.shift);
+        w.field("width", field.width);
+        w.field("value", int64_t(field.value));
+        w.field("bits", bitString(field.value, field.width));
+        w.field("meaning", field.meaning);
+        w.field("zeroed", field.zeroed);
+        w.field("shared", field.shared);
+        w.key("parts");
+        w.beginArray();
+        for (const KeyPart& part : field.parts) {
+            w.beginObject();
+            w.field("name", part.name);
+            w.field("value", part.value);
+            w.field("meaning", part.meaning);
+            w.field("zeroed", part.zeroed);
+            w.endObject();
+        }
+        w.endArray();
+        w.endObject();
+    }
+    w.endArray();
+    w.endObject();
+}
+
+template <int P>
+void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops) {
+    w.beginObject();
+    w.key("legal");
+    writeLegal(w, spot.legal);
+    w.field("potAfterCall", spot.potAfterCall);
+    w.field("totalVisits", int64_t(spot.totalVisits));
+    w.field("records", spot.records);
+    w.field("found", spot.found);
+    w.field("missing", spot.missing);
+    w.field("invalid", spot.invalid);
+    w.field("rangeCombos", spot.rangeCombos);
+    w.field("rangeWeight", spot.rangeWeight);
+    w.field("rangeFoundWeight", spot.rangeFoundWeight);
+    w.key("rangeMix");
+    w.beginArray();
+    for (double share : spot.rangeMix) {
+        w.number(share);
+    }
+    w.endArray();
+    w.field("rangeEv", spot.rangeEv);
+    w.key("emptySeats");
+    w.beginArray();
+    for (int seat : spot.emptySeats) {
+        w.integer(seat);
+    }
+    w.endArray();
+    w.key("replayDrops");
+    w.beginObject();
+    w.field("decisions", drops.decisions);
+    w.field("groups", drops.groups);
+    w.field("combos", drops.combos);
+    w.endObject();
+
+    w.key("combos");
+    w.beginArray();
+    for (const SpotRow& row : spot.rows) {
+        if (!row.valid) {
+            w.null();
+            continue;
+        }
+        w.beginObject();
+        w.field("combo", cardToString(row.cards[0]) + cardToString(row.cards[1]));
+        w.field("reach", row.reach);
+        w.field("cluster", row.cluster);
+        w.key("key");
+        w.hex(row.key);
+        w.field("found", row.found);
+        w.field("clusterCombos", row.clusterCombos);
+        if (row.found) {
+            w.key("weights");
+            w.beginArray();
+            for (int j = 1; j < 5; j++) {
+                // An illegal option's stored slot is meaningless, so it is absent.
+                if (spot.legal[j]) {
+                    w.number(row.weights[j - 1]);
+                } else {
+                    w.null();
+                }
+            }
+            w.endArray();
+            w.key("frequencies");
+            w.beginArray();
+            for (double share : row.frequencies) {
+                w.number(share);
+            }
+            w.endArray();
+            w.key("evOptions");
+            w.beginArray();
+            for (int j = 0; j < 5; j++) {
+                if (spot.legal[j]) {
+                    w.number(row.evOptions[j]);
+                } else {
+                    w.null();
+                }
+            }
+            w.endArray();
+            w.field("ev", row.ev);
+            w.field("visits", int64_t(row.visits));
+        }
+        w.endObject();
+    }
+    w.endArray();
+    w.endObject();
+}
+
+// One request at one player count. The replay is per thread: HandClusterer writes to
+// its own scratch, and an engine is too large to build per request.
+template <int P>
+void answer(const Request& request, const StrategyStore& store, httplib::Response& response) {
+    thread_local std::unique_ptr<Replay<P>> replay = std::make_unique<Replay<P>>();
+    ReplayResult result = replay->run(request.config, request.actions, request.board, &store);
+    if (!result.ok) {
+        json extra = json::object();
+        if (result.actionIndex >= 0) {
+            extra["actionIndex"] = result.actionIndex;
+        }
+        if (!result.reason.empty()) {
+            extra["reason"] = result.reason;
+        }
+        if (result.hasLegal) {
+            extra["legal"] = std::vector<bool>(result.legal.begin(), result.legal.end());
+            extra["options"] = std::vector<std::string>(OPTION_NAMES, OPTION_NAMES + 5);
+        }
+        if (result.code == "needsBoard") {
+            extra["street"] = STREET_NAMES[result.needRound];
+            extra["cards"] = roundBoardCards(result.needRound);
+        }
+        if (result.code == "handEnded") {
+            extra["endedBy"] = result.endedBy;
+        }
+        fail(response, 400, result.code, result.error, std::move(extra));
+        return;
+    }
+
+    JsonWriter w;
+    w.beginObject();
+    if (request.include.game) {
+        w.key("game");
+        writeGame(w, *replay, result.legal);
+    }
+    if (request.include.key) {
+        w.key("key");
+        writeKey(w, decodeKey(*replay));
+    }
+    if (request.include.spot) {
+        w.key("spot");
+        writeSpot<P>(w, computeSpot(*replay, store, result.legal), replay->drops);
+    }
+    w.endObject();
+    response.set_content(std::move(w.out), "application/json");
 }
 
 int main(int argc, char** argv) {
@@ -526,10 +582,6 @@ int main(int argc, char** argv) {
                 options.host = next();
             } else if (flag == "--port") {
                 options.port = std::stoi(next());
-            } else if (flag == "--strategy") {
-                options.strategyPath = next();
-            } else if (flag == "--index") {
-                options.indexPath = next();
             } else if (flag == "--threads") {
                 options.threads = std::stoi(next());
             } else if (flag == "--warm") {
@@ -538,29 +590,20 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("unrecognised flag " + flag);
             }
         }
-        if (options.strategyPath.empty()) {
-            options.strategyPath = defaultStrategyPath();
-        }
-        if (options.indexPath.empty()) {
-            options.indexPath = defaultIndexPath();
-        }
 
-        // Before any Engine exists: the constructor also calls loadTables, and the
-        // once_flag means the first caller decides whether the 535 MB showdown
-        // table is read. Nothing here ever reaches showdown.
-        Engine::loadTables(false);
+        // Every table but handScores.bin, which only a showdown reads.
+        ServerTables::load();
 
-        StrategyStore store;
-        store.open(options.strategyPath, options.indexPath);
-        std::cout << "Spec: " << fireflySpec() << "\n"
-                  << "Strategy: " << options.strategyPath << " (" << store.records
-                  << " records)\n"
-                  << "Mapped: " << (store.mappedBytes() / (1024.0 * 1024.0)) << " MB"
-                  << std::endl;
-        if (options.warm) {
-            uint64_t sink = store.warm();
-            std::cout << "Warmed the mappings (" << (sink & 1) << ")" << std::endl;
+        StrategyRegistry registry;
+        registry.warm = options.warm;
+        registry.log = &std::cout;
+        const StrategyConfig defaults;
+        std::cout << "Default spec: " << defaults.spec() << "\n"
+                  << "Available:";
+        for (const StrategyConfig& config : availableStrategies()) {
+            std::cout << " " << config.spec();
         }
+        std::cout << std::endl;
 
         httplib::Server server;
         if (options.threads > 0) {
@@ -575,144 +618,134 @@ int main(int argc, char** argv) {
         server.Get("/health", [&](const httplib::Request&, httplib::Response& response) {
             json body;
             body["status"] = "ok";
-            body["spec"] = fireflySpec();
-            body["records"] = store.records;
-            body["mappedBytes"] = store.mappedBytes();
+            json loaded = json::array();
+            for (const auto& [spec, records] : registry.loaded()) {
+                loaded.push_back({{"spec", spec}, {"records", records}});
+            }
+            body["loaded"] = loaded;
             response.set_content(body.dump(), "application/json");
         });
 
         server.Get("/meta", [&](const httplib::Request&, httplib::Response& response) {
             json body;
-            body["spec"] = fireflySpec();
-            body["playerCount"] = PLAYER_COUNT;
-            body["startingChips"] = CHIP_COUNT;
+            body["defaults"] = configJson(defaults);
+            body["limits"] = {{"players", {3, 7}}, {"chipsMax", MAX_CHIPS}, {"chipsEven", true}};
+            body["available"] = availableJson();
             body["blinds"] = {1, 2};
-            body["metasBasic"] = METAS_BASIC;
-            body["memoryBasic"] = MEMORY_BASIC;
-            body["records"] = store.records;
-            body["defaultInvTemp"] = TERMINAL_INV_TEMP;
+            body["invTemp"] = INV_TEMP;
+            body["rangeFloor"] = RANGE_FLOOR;
             body["comboCount"] = COMBO_COUNT;
             body["options"] = std::vector<std::string>(OPTION_NAMES, OPTION_NAMES + 5);
-            body["seats"] = {"BTN", "SB", "BB", "UTG", "UTG+1", "MP", "CO"};
+            json seats = json::object();
+            for (int players = 3; players <= 7; players++) {
+                seats[std::to_string(players)] = seatNames(players);
+            }
+            body["seats"] = seats;
             body["cardEncoding"] = "rank * 4 + suit, rank 0 = ace descending to 12 = "
                 "deuce, suits cdhs; combos are indexed i * (101 - i) / 2 + j - 1 for "
                 "cards i < j";
-            body["weightUnits"] = "stack change divided by the pot after calling, "
-                "measured against folding, whose value is exactly 0";
+            body["evUnits"] = "chips, relative to folding: a record's weight times the pot "
+                "after calling";
+            body["replay"] = "ranges are replayed at this server's INV_TEMP and RANGE_FLOOR; "
+                "a strategy trained with other values replays differently";
             response.set_content(body.dump(2), "application/json");
         });
 
-        server.Post("/strategy", [&](const httplib::Request& request,
+        server.Post("/strategy", [&](const httplib::Request& httpRequest,
                 httplib::Response& response) {
             json body;
             try {
-                body = json::parse(request.body);
+                body = json::parse(httpRequest.body);
             } catch (const std::exception& e) {
-                fail(response, 400, std::string("malformed JSON body: ") + e.what());
+                fail(response, 400, "badRequest", std::string("malformed JSON body: ") + e.what());
                 return;
             }
             if (!body.is_object()) {
-                fail(response, 400, "the body must be a JSON object");
+                fail(response, 400, "badRequest", "the body must be a JSON object");
                 return;
             }
 
-            std::vector<int> actions;
+            Request request;
             if (body.contains("actions") && !body["actions"].is_null()) {
                 if (!body["actions"].is_array()) {
-                    fail(response, 400, "\"actions\" must be an array of option indices 0..4");
+                    fail(response, 400, "badRequest",
+                        "\"actions\" must be an array of option indices 0..4");
                     return;
                 }
                 if (body["actions"].size() > 256) {
-                    fail(response, 400, "\"actions\" is longer than any hand can be");
+                    fail(response, 400, "badRequest", "\"actions\" is longer than any hand can be");
                     return;
                 }
                 for (const auto& entry : body["actions"]) {
                     if (!entry.is_number_integer()) {
-                        fail(response, 400, "\"actions\" must hold integers 0..4");
+                        fail(response, 400, "badRequest", "\"actions\" must hold integers 0..4");
                         return;
                     }
-                    actions.push_back(entry.get<int>());
+                    request.actions.push_back(entry.get<int>());
                 }
             }
-
-            std::vector<int> board;
             if (body.contains("board") && !body["board"].is_null()) {
                 if (!body["board"].is_string()) {
-                    fail(response, 400, "\"board\" must be a string like \"As7h2d\"");
+                    fail(response, 400, "badRequest", "\"board\" must be a string like \"As7h2d\"");
                     return;
                 }
                 try {
-                    board = parseBoard(body["board"].get<std::string>());
+                    request.board = parseBoard(body["board"].get<std::string>());
                 } catch (const std::exception& e) {
-                    fail(response, 400, e.what());
+                    fail(response, 400, "badBoard", e.what());
+                    return;
+                }
+            }
+            std::string error;
+            if (!parseConfig(body, request.config, error)) {
+                fail(response, 400, "badConfig", error);
+                return;
+            }
+            if (!parseInclude(body, request.include, error)) {
+                fail(response, 400, "badRequest", error);
+                return;
+            }
+            for (auto entry = body.begin(); entry != body.end(); ++entry) {
+                const std::string& name = entry.key();
+                if (name != "actions" && name != "board" && name != "config" && name != "include") {
+                    fail(response, 400, "badRequest", "unknown field \"" + name
+                        + "\" (valid: config, actions, board, include)");
                     return;
                 }
             }
 
-            double invTemp = TERMINAL_INV_TEMP;
-            if (body.contains("invTemp") && !body["invTemp"].is_null()) {
-                if (!body["invTemp"].is_number()) {
-                    fail(response, 400, "\"invTemp\" must be a number");
-                    return;
-                }
-                invTemp = body["invTemp"].get<double>();
-                if (!std::isfinite(invTemp) || invTemp < 0.0 || invTemp > 1e6) {
-                    fail(response, 400, "\"invTemp\" must be finite and in [0, 1e6]");
-                    return;
-                }
-            }
-
-            IncludeMask include;
-            {
-                std::string error;
-                if (!parseInclude(body, include, error)) {
-                    fail(response, 400, error);
-                    return;
-                }
-            }
-
-            // One Engine per worker thread: HandClusterer::classifyHand writes to
-            // its own scratch arrays, so it cannot be shared.
-            thread_local Replay replay;
-            ReplayResult result;
+            const std::string spec = request.config.spec();
+            std::shared_ptr<const StrategyStore> store;
             try {
-                result = replay.run(actions, board);
+                store = registry.get(spec);
             } catch (const std::exception& e) {
-                fail(response, 500, std::string("replay failed: ") + e.what());
+                fail(response, 500, "strategyUnreadable",
+                    "strategy_" + spec + ".bin exists but cannot be read: " + e.what());
                 return;
             }
-            if (!result.ok) {
-                fail(response, 400, result.error, result.actionIndex,
-                    result.hasLegal ? &result.legal : nullptr, result.reason);
+            if (store == nullptr) {
+                fail(response, 404, "strategyMissing",
+                    "no strategy has been trained for " + std::to_string(request.config.players)
+                        + " players, " + std::to_string(request.config.chips) + " chips, metasBasic "
+                        + (request.config.metasBasic ? "on" : "off") + ", memoryBasic "
+                        + (request.config.memoryBasic ? "on" : "off")
+                        + ": " + strategyPath(spec) + " does not exist",
+                    {{"spec", spec}, {"path", strategyPath(spec)},
+                        {"config", configJson(request.config)}, {"available", availableJson()}});
                 return;
             }
 
-            // Nothing was asked for. The replay still validated the action list, so
-            // a 200 with an empty body means the line is legal.
-            if (!include.anything()) {
-                response.set_content("{}", "application/json");
-                return;
+            try {
+                switch (request.config.players) {
+                    case 3: answer<3>(request, *store, response); break;
+                    case 4: answer<4>(request, *store, response); break;
+                    case 5: answer<5>(request, *store, response); break;
+                    case 6: answer<6>(request, *store, response); break;
+                    case 7: answer<7>(request, *store, response); break;
+                }
+            } catch (const std::exception& e) {
+                fail(response, 500, "internal", std::string("replay failed: ") + e.what());
             }
-
-            // The sweep is 1326 classifications; skip it entirely unless a combo
-            // field needs it. A transition-only request is then just a replay.
-            SweepResult swept;
-            if (include.combos.any()) {
-                // sweep() calls getState() then getOptions() itself and stores
-                // the result in swept.legal.
-                swept = sweep(replay.engine, replay.board, store, invTemp,
-                    include.combos);
-            } else {
-                // getState() assigns spr, cpr and actionPosition, which both
-                // getOptions() and keyComponents() read. sweep() does this itself.
-                replay.engine.getState(METAS_BASIC, MEMORY_BASIC);
-                swept.legal = replay.engine.getOptions();
-            }
-
-            response.set_content(
-                buildResponse(replay.engine, replay.board, result, swept,
-                    swept.legal, invTemp, include),
-                "application/json");
         });
 
         server.set_exception_handler([](const httplib::Request&, httplib::Response& response,
@@ -724,10 +757,7 @@ int main(int argc, char** argv) {
                 message = e.what();
             } catch (...) {
             }
-            json body;
-            body["error"] = message;
-            response.status = 500;
-            response.set_content(body.dump(), "application/json");
+            fail(response, 500, "internal", message);
         });
 
         std::cout << "Listening on " << options.host << ":" << options.port << std::endl;

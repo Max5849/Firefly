@@ -1,6 +1,5 @@
-// Mirrors the POST /strategy contract. Every section is optional because the
-// server computes nothing it was not asked for - an absent section is "not
-// requested", never "empty".
+// Mirrors the POST /strategy contract. Sections are optional only because "include"
+// can turn them off; the client always asks for all three.
 
 export const OPTION_COUNT = 5;
 export const COMBO_COUNT = 1326;
@@ -14,132 +13,192 @@ export const SHOVE = 4;
 
 export type OptionIndex = 0 | 1 | 2 | 3 | 4;
 
-export interface MetaResponse {
+/** The four settings a strategy file was trained at; the spec names the file. */
+export interface Config {
+  players: number;
+  chips: number;
+  metasBasic: boolean;
+  memoryBasic: boolean;
+}
+
+export interface ConfigWithSpec extends Config {
   spec: string;
-  playerCount: number;
-  startingChips: number;
+}
+
+export interface MetaResponse {
+  defaults: ConfigWithSpec;
+  limits: { players: [number, number]; chipsMax: number; chipsEven: boolean };
+  available: ConfigWithSpec[];
   blinds: [number, number];
-  defaultInvTemp: number;
+  invTemp: number;
+  rangeFloor: number;
   comboCount: number;
   options: string[];
-  seats: string[];
-  records: number;
+  /** Seat names by player count, keyed "3".."7". */
+  seats: Record<string, string[]>;
+  evUnits: string;
+  replay: string;
 }
 
-export interface NodeSection {
-  spec: string;
-  round: 0 | 1 | 2 | 3;
-  street: 'preflop' | 'flop' | 'turn' | 'river';
+export interface Seat {
   seat: number;
-  heads: number;
-  board: string;
-  /** Recomputed by getOptions(), never read from the strategy file. */
-  legal: boolean[];
-  options: string[];
-  invTemp: number;
-  weightUnits: string;
-}
-
-export interface LastAction {
-  seat: number;
-  option: number;
-  /** Stack after the action. Authoritative - derive bet sizes from this. */
-  chips: number;
-  /** 0 whenever the action closed the street, because newRound() zeroes bets. */
+  name: string;
+  stack: number;
+  /** Chips in front on this street. */
   bet: number;
   inHand: boolean;
+  allIn: boolean;
+  acting: boolean;
 }
 
 export interface Actor {
   seat: number;
-  chips: number;
+  name: string;
+  stack: number;
   bet: number;
   toCall: number;
   potAfterCall: number;
   spr: number;
   cpr: number;
-  legal: boolean[];
 }
 
-export interface TransitionSection {
+export interface OptionView {
+  option: number;
+  /** fold, check, call, bet, raise or all in - as the table would say it. */
+  name: string;
+  /** "0.5x pot" or "1.5x pot" for the two sized raises, else "". */
+  size: string;
+  legal: boolean;
+  /** Total in front after the option; null for fold and illegal options. */
+  betTo: number | null;
+  adds: number | null;
+  /** Why getOptions() turned it off; "" when legal. */
+  reason: string;
+}
+
+export type HistoryEntry =
+  | {
+      kind: 'post' | 'action';
+      seat: number;
+      name: string;
+      option: number;
+      round: number;
+      betTo: number;
+      adds: number;
+      stack: number;
+    }
+  | { kind: 'street'; round: number; street: string; board: string };
+
+export interface GameSection {
+  config: ConfigWithSpec;
+  round: 0 | 1 | 2 | 3;
+  street: 'preflop' | 'flop' | 'turn' | 'river';
+  board: string;
+  /** Every chip committed, this street's bets included. */
   pot: number;
-  lastAction: LastAction | null;
+  heads: number;
+  blinds: string;
+  seats: Seat[];
   actor: Actor;
+  legal: boolean[];
+  options: OptionView[];
+  history: HistoryEntry[];
 }
 
-export interface KeyComponents {
-  roundHeadsBasic: number;
-  headsBasic: number;
-  actionPositionBucket: number;
-  sprCprBucket: number;
-  sprCprKind: 'spr' | 'cpr';
-  boardField: number | null;
-  boardClass: number | null;
-  raiseHistory: number[];
-  playerLastActions: number[];
-  villanLastActions: number[];
-  playerPositionBasic: number;
-  villanPositionBasic: number;
-  villanPosition: number;
-  raiseSizeOverZero: number;
-  raiseStrength: number;
-  hiddenRaiseSizeOverZero: number;
-  hiddenRaiseStrength: number;
-  raisesFaced: number;
-  relativePosition: number;
-  playerCallsOverOne: boolean;
-  calls: number;
+export interface KeyPart {
+  name: string;
+  value: number;
+  meaning: string;
+  zeroed: boolean;
+}
+
+export interface KeyField {
+  name: string;
+  label: string;
+  shift: number;
+  width: number;
+  value: number;
+  /** The field's bits, most significant first. */
+  bits: string;
+  meaning: string;
+  /** memoryBasic forces this field to 0. */
+  zeroed: boolean;
+  /** False for the preflop board field, which holds each combo's own 169 class. */
+  shared: boolean;
+  parts: KeyPart[];
+}
+
+export interface KeySection {
+  /** actionState | boardField << 42 - every bit but the hand cluster. Hex. */
+  sharedKey: string;
+  actionState: string;
+  heroSeat: number;
+  villanSeat: number;
+  spr: number;
+  cpr: number;
+  sharedBits: number;
+  fields: KeyField[];
 }
 
 /**
- * A combo row has four shapes and they are not interchangeable:
- *   null                            the combination uses a board card
- *   { found: false, metaFound: false }  meta miss - no (boardClass, handClass) entry
- *   { found: false }                table miss - key absent from the strategy table
- *   { found: true, ... }            hit
- * `frequencies` and `visits` are only meaningful on the last of those.
+ * null when the combination uses a board card. found: false when its node has no
+ * record, in which case only reach, cluster, key and clusterCombos are present.
  */
-export interface ComboRow {
+export interface SpotRow {
   combo: string;
-  found?: boolean;
-  metaFound?: boolean;
+  /** The acting seat's reach: its own INV_TEMP policy multiplied along the line. */
+  reach: number;
+  /** The 169 class preflop, the hand cluster postflop. */
+  cluster: number;
+  key: string;
+  found: boolean;
+  clusterCombos: number;
+  /** Options 1..4, pot normalised against folding. null where illegal. */
+  weights?: (number | null)[];
   /** Five entries, fold first, summing to 1 over the legal options. */
   frequencies?: number[];
-  /** Four entries for options 1..4. null where illegal - never treat as 0. */
-  weights?: (number | null)[];
-  /** Per-holding estimate: nodeVisits / metaCombos. */
+  /** Each option's value in chips relative to folding. null where illegal. */
+  evOptions?: (number | null)[];
+  /** The policy-weighted EV in chips relative to folding. */
+  ev?: number;
+  /** The record's visits, shared by every combo in its cluster. */
   visits?: number;
-  nodeVisits?: number;
-  metaCombos?: number;
-  key?: string;
-  handMeta?: number;
 }
 
-export type Combo = ComboRow | null;
+export type SpotCombo = SpotRow | null;
 
-export interface Counts {
+export interface SpotSection {
+  legal: boolean[];
+  potAfterCall: number;
+  /** Visits summed over the distinct records the acting range reaches. */
+  totalVisits: number;
+  records: number;
   found: number;
   missing: number;
   invalid: number;
-  metaMissing: number;
+  rangeCombos: number;
+  rangeWeight: number;
+  rangeFoundWeight: number;
+  rangeMix: number[];
+  rangeEv: number;
+  emptySeats: number[];
+  replayDrops: { decisions: number; groups: number; combos: number };
+  combos: SpotCombo[];
 }
 
 export interface StrategyResponse {
-  node?: NodeSection;
-  transition?: TransitionSection;
-  keyComponents?: KeyComponents;
-  combos?: Combo[];
-  counts?: Counts;
+  game?: GameSection;
+  key?: KeySection;
+  spot?: SpotSection;
 }
 
 export interface StrategyRequest {
+  config: Config;
   actions: number[];
   board: string;
-  invTemp?: number;
-  include: Record<string, unknown>;
 }
 
-/** True when the row carries a usable strategy, i.e. it is a hit. */
-export function isHit(row: Combo): row is ComboRow {
-  return row !== null && row.found === true;
+/** True when the row carries a usable strategy. */
+export function isHit(row: SpotCombo): row is SpotRow & Required<Pick<SpotRow, 'frequencies'>> {
+  return row !== null && row.found && row.frequencies !== undefined;
 }

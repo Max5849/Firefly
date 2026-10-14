@@ -1,8 +1,18 @@
 # TashtegoGTO — the strategy browser
 
 A keyboard-driven front end for `POST /strategy`. Type a line, watch all 1326
-combinations respond. There are no buttons: every action, board card and reset is a
-keystroke.
+combinations respond. Every action, board card and reset is a keystroke; the only
+controls are the config bar in the header, which picks the strategy file.
+
+The page has three columns:
+
+- **left — the table.** Street, pot, board, every seat's stack and bet and whether
+  it has folded or is all in, the hand so far, and the acting seat's options with
+  their sizes. All of it comes from the server's `game` section.
+- **centre — the grid.** Every combination's action mix, filled to its reach.
+- **right — the spot and the key.** The range's visits, size, action mix and EV;
+  the hovered combination's reach, frequency and EV per option, visits and key;
+  and the acting seat's state key, bit by bit, with each field decoded.
 
 ```
 npm install
@@ -37,10 +47,22 @@ Only legal options are offered; the keycaps at the foot of the left column are t
 legality display, so a key that is not shown does nothing. `a` and `c` mean
 different things in the two modes, which never overlap.
 
+## Choosing a strategy
+
+The header picks players (3–7), starting chips (even, blinds 1/2), and basic or
+full metas and memory. Those four name the strategy file, `strategy_<spec>.bin`;
+the spec beside them turns red when nothing has been trained for it, and a banner
+lists what has. The `trained` menu jumps straight to any file the server has.
+Changing the config starts a new hand.
+
 ## Reading the grid
 
 Each of the 169 cells is one row of columns, one per combination — 6 for a pair, 4
-suited, 12 offsuit. Every column fills from the bottom in action order:
+suited, 12 offsuit. **A column's height is the combination's reach**: how much of
+it is still in the acting seat's range, the product of that seat's own policy along
+the line. A full column is a hand that always plays this way to here; an empty one
+is a hand the line has ruled out. Inside that height the column fills from the
+bottom in action order:
 
 | | fold | call | raise | raise | all in |
 | --- | --- | --- | --- | --- | --- |
@@ -58,43 +80,41 @@ together on the left. Three separate things eliminate a column, and the grid doe
 not distinguish them:
 
 - the combination uses a board card;
-- the solver never built that node;
-- the hand class is too thin to read — its visit count, divided by the number of
-  combinations in the class, is under 5% of the largest such figure at this node.
+- the strategy has no record of that node;
+- the hand cluster is too thin to read — its visit count, divided by the number of
+  combinations in the cluster, is under 5% of the largest such figure at this node.
 
-That last one is normalised deliberately. A class covering 255 holdings would
-otherwise always outrank one covering 12 on raw counts alone. On a `Ks9s2dAh` turn
-it blacks out the ace-queen class at 28,030 visits over 99 combinations — 283 each,
-against a 367 cut — while a class with 26,914 raw visits over 36 combinations
-survives at 748.
+That last one is normalised deliberately. A cluster covering 255 holdings would
+otherwise always outrank one covering 12 on raw counts alone.
 
-`VISITS` in the header is the node total: the sum over *distinct* hand classes, not
-the sum of the per-combination figures, which would multiply each class by its size.
+`VISITS` is the node total: the sum over the *distinct* records the acting range
+reaches, not the sum of per-combination figures, which would multiply each cluster
+by its size. EVs are in chips relative to folding.
 
 ## Street changes
 
-The server validates the board count after replaying the actions, so a street
-rollover is only ever announced as a rejected request. Sending an action that closes
-a street returns
+The server cannot replay past a street without its cards, so a street rollover is
+announced as a rejected request. Sending an action that closes a street returns
 
 ```
-400 the action list reaches the flop, which needs 3 board cards, but 0 were given
+400 {"code": "needsBoard", "street": "flop", "cards": 3, ...}
 ```
 
-and the client reads that as "hold the action, ask for three cards". Two 400s per
-hand in the network log are normal.
+and the client reads that as "hold the action, ask for three cards". A 400 per
+street in the network log is normal.
 
 ## Layout
 
 ```
 src/
-  api/     client.ts   the fetch layer and its error classifier
-           types.ts    the response contract, including all four combo shapes
-  hand/    useHand.ts  the state machine: frames, board entry, undo
+  api/     client.ts   the fetch layer; errors classified by their code
+           types.ts    the response contract: game, key, spot
+  hand/    useHand.ts  the state machine: config, frames, board entry, undo
            keys.ts     the keymap
   grid/    layout.ts   169 cells -> 1326 strips, asserted complete at load
+           metas.ts    the thin-cluster cut
            RangeGrid.tsx
-  ui/      ActionColumn.tsx  specs, ledger, keycaps
+  ui/      ConfigBar.tsx    players, chips, metas, memory
+           ActionColumn.tsx table, seats, ledger, keycaps
+           SpotColumn.tsx   spot summary, hover readout, key panel
 ```
-
-`keyComponents`, `weights` and the state keys are fetched but not yet rendered.
