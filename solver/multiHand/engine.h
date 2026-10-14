@@ -574,6 +574,23 @@ struct Engine {
         setBlocks(round + 2);
     }
 
+    // False when the board has taken every combo some seat had left: RANGE_FLOOR can leave
+    // a range whose combos all share a card, and the line is then impossible for every
+    // seat, since lineReach counts each other seat folded or not.
+    bool rangesLive() const {
+        for (int seat = 0; seat < PLAYER_COUNT; seat++) {
+            const std::array<float, COMBO_COUNT>& range = players[seat].range;
+            bool live = false;
+            for (int combo = 0; combo < COMBO_COUNT && !live; combo++) {
+                live = commonRange[combo] && range[combo] > 0.0f;
+            }
+            if (!live) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Extends the card removal sums from the first blockCount board cards to the first
     // boardCount: each new card takes the combos holding it, and no earlier board card,
     // out of every seat's sums. The sums must be current for the seats' ranges, which

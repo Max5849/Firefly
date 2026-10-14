@@ -520,6 +520,12 @@ struct Explorer {
                 break;
             }
             engine.setCommonRange();
+            if (!engine.rangesLive()) {
+                // Every weight from here on is 0, so the hand is dropped. The decisions
+                // already taken keep their visits, which are expectations at the decision.
+                updateRangeWeights(worker, 0.0);
+                return;
+            }
             engine.setMetaState(!METAS_BASIC || (USE_BASE && !BASE_METAS_BASIC),
                 METAS_BASIC || (USE_BASE && BASE_METAS_BASIC));
         }
