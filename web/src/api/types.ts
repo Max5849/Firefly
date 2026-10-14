@@ -30,7 +30,10 @@ export interface MetaResponse {
   limits: { players: [number, number]; chipsMax: number; chipsEven: boolean };
   available: ConfigWithSpec[];
   blinds: [number, number];
+  /** The inverse temperature training ran at, ln(2^8). */
   invTemp: number;
+  /** What a request may ask for: [ln(2^4), ln(2^64)]. */
+  invTempRange: [number, number];
   rangeFloor: number;
   comboCount: number;
   options: string[];
@@ -146,7 +149,7 @@ export interface KeySection {
  */
 export interface SpotRow {
   combo: string;
-  /** The acting seat's reach: its own INV_TEMP policy multiplied along the line. */
+  /** The acting seat's reach: its own policy multiplied along the line. */
   reach: number;
   /** The 169 class preflop, the hand cluster postflop. */
   cluster: number;
@@ -169,6 +172,8 @@ export type SpotCombo = SpotRow | null;
 
 export interface SpotSection {
   legal: boolean[];
+  /** The inverse temperature the ranges were replayed and the policy taken at. */
+  invTemp: number;
   potAfterCall: number;
   /** Visits summed over the distinct records the acting range reaches. */
   totalVisits: number;
@@ -194,6 +199,7 @@ export interface StrategyResponse {
 
 export interface StrategyRequest {
   config: Config;
+  invTemp: number;
   actions: number[];
   board: string;
 }

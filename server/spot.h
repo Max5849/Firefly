@@ -13,7 +13,7 @@ struct SpotRow {
     // False when the combo uses a revealed board card.
     bool valid = false;
     std::array<int, 2> cards = {0, 0};
-    // The acting seat's reach: the product of its own INV_TEMP policy along the line,
+    // The acting seat's reach: the product of its own policy along the line,
     // after RANGE_FLOOR. 0 for a combo the line has ruled out.
     float reach = 0;
     // The hand part of the key: the 169 class preflop, the hand cluster postflop.
@@ -22,7 +22,7 @@ struct SpotRow {
     bool found = false;
     // Option 1..4 values from the record, pot normalised, relative to folding.
     std::array<double, 4> weights = {};
-    // The INV_TEMP policy over the legal options.
+    // The policy over the legal options, at the replay's inverse temperature.
     std::array<double, 5> frequencies = {};
     // Each option's value in chips relative to folding (weight * pot after calling),
     // and their mean under the policy.
@@ -37,6 +37,8 @@ struct SpotRow {
 struct SpotResult {
     std::array<SpotRow, COMBO_COUNT> rows;
     std::array<bool, 5> legal = {};
+    // The inverse temperature the range was replayed and the policy taken at.
+    double invTemp = INV_TEMP;
     // The weight denominator: the pot once the actor has called.
     double potAfterCall = 0;
     // The sum of visits over the distinct records the acting range reaches.
@@ -68,6 +70,7 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
     const auto& actor = engine.players[engine.action];
     // getOptions() at this node, from the replay. Not stored in the strategy file.
     out.legal = legal;
+    out.invTemp = replay.invTemp;
     out.potAfterCall = double(engine.pot + (engine.bet - actor.bet));
 
     const uint64_t actionState = config.memoryBasic ? engine.actionStateBasic : engine.actionState;
@@ -117,7 +120,7 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
                 row.weights[j - 1] = double(group.record.weights[j - 1]);
                 values[j] = row.weights[j - 1];
             }
-            row.frequencies = policyFromWeights(group.record.weights, out.legal);
+            row.frequencies = policyFromWeights(group.record.weights, out.legal, replay.invTemp);
             row.visits = group.record.visits;
             row.ev = 0;
             for (int j = 0; j < 5; j++) {

@@ -36,7 +36,17 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
-      <Header meta={hand.meta} config={hand.config} onConfig={hand.setConfig} />
+      <Header
+        meta={hand.meta}
+        config={hand.config}
+        onConfig={hand.setConfig}
+        temp={{
+          exponent: hand.tempExponent,
+          training: hand.trainingExponent,
+          limits: hand.tempLimits,
+          onChange: hand.setTempExponent,
+        }}
+      />
       {missing ? (
         <div
           className="shrink-0 border-b px-5 py-2 text-[12px]"

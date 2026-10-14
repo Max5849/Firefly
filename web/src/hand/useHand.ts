@@ -61,12 +61,23 @@ export interface HandState {
   black: Set<number>;
   /** Visits summed over the distinct records the acting range reaches. */
   totalVisits: number | null;
+  /** The inverse temperature is ln(2^tempExponent); the page asks for every node at it. */
+  tempExponent: number;
+  /** The exponent training ran at, ln(2^8). */
+  trainingExponent: number;
+  /** The exponents a request may use, inclusive. */
+  tempLimits: [number, number];
 }
+
+/** ln(2^4) .. ln(2^64), the range the server accepts. */
+const TEMP_LIMITS: [number, number] = [4, 64];
+const DEFAULT_EXPONENT = 8;
 
 export function useHand(): HandState & {
   handleKey: (key: string) => void;
   jumpTo: (frame: number) => void;
   setConfig: (config: Config) => void;
+  setTempExponent: (exponent: number) => void;
 } {
   const [meta, setMeta] = useState<MetaResponse | null>(null);
   const [config, setConfigState] = useState<Config | null>(null);
@@ -77,6 +88,11 @@ export function useHand(): HandState & {
   const [error, setError] = useState<string | null>(null);
   const [missing, setMissing] = useState<MissingStrategy | null>(null);
   const [loading, setLoading] = useState(false);
+  const [tempExponent, setTempExponentState] = useState(DEFAULT_EXPONENT);
+  const [trainingExponent, setTrainingExponent] = useState(DEFAULT_EXPONENT);
+  // Read by send(), so every request goes out at the temperature current when it is
+  // sent without each caller having to carry it.
+  const invTemp = useRef(DEFAULT_EXPONENT * Math.LN2);
 
   // A newer keystroke must win, so every request supersedes the one before it.
   const inflight = useRef<AbortController | null>(null);
@@ -92,7 +108,10 @@ export function useHand(): HandState & {
       inflight.current = controller;
       setLoading(true);
       try {
-        const response = await postStrategy({ config: setup, actions, board }, controller.signal);
+        const response = await postStrategy(
+          { config: setup, invTemp: invTemp.current, actions, board },
+          controller.signal,
+        );
         return { ok: true, frame: { actions, board, response } };
       } catch (caught) {
         if (caught instanceof ApiError) return { ok: false, failure: caught.failure };
@@ -151,6 +170,10 @@ export function useHand(): HandState & {
           return;
         }
         setMeta(loaded);
+        const training = Math.round(loaded.invTemp / Math.LN2);
+        setTrainingExponent(training);
+        setTempExponentState(training);
+        invTemp.current = training * Math.LN2;
         const { spec: _spec, ...defaults } = loaded.defaults;
         setConfigState(defaults);
         void reset(defaults);
@@ -173,7 +196,32 @@ export function useHand(): HandState & {
     [reset],
   );
 
+  const setTempExponent = useCallback((exponent: number) => {
+    const clamped = Math.min(TEMP_LIMITS[1], Math.max(TEMP_LIMITS[0], Math.round(exponent)));
+    invTemp.current = clamped * Math.LN2;
+    setTempExponentState(clamped);
+  }, []);
+
   const top = frames.length > 0 ? frames[frames.length - 1] : null;
+
+  // A frame answered at another temperature - the temperature just changed, or undo
+  // or a ledger jump uncovered an older frame - is asked for again, so ranges, mixes
+  // and EVs on screen always belong to the temperature shown.
+  useEffect(() => {
+    const served = top?.response.spot?.invTemp;
+    if (!top || !config || served === undefined) return;
+    if (Math.abs(served - tempExponent * Math.LN2) < 1e-9) return;
+    void send(config, top.actions, top.board).then((result) => {
+      if (!result.ok) {
+        if (result.failure.message !== 'superseded') setError(result.failure.message);
+        return;
+      }
+      setFrames((current) => {
+        const last = current[current.length - 1];
+        return last === top ? [...current.slice(0, -1), result.frame] : current;
+      });
+    });
+  }, [top, config, tempExponent, send]);
 
   const settle = useCallback((frame: Frame) => {
     setFrames((current) => [...current, frame]);
@@ -298,6 +346,10 @@ export function useHand(): HandState & {
         undo();
         return;
       }
+      if (key === '[' || key === ']') {
+        setTempExponent(tempExponent + (key === ']' ? 1 : -1));
+        return;
+      }
       if (key === 'n' && mode !== 'boardEntry') {
         if (config) void reset(config);
         return;
@@ -324,7 +376,7 @@ export function useHand(): HandState & {
       // anything, so a rejection message would be noise.
       if (option >= 0 && top.response.game?.legal[option]) void play(option);
     },
-    [mode, pending, top, config, reset, undo, play, commitBoard],
+    [mode, pending, top, config, reset, undo, play, commitBoard, tempExponent, setTempExponent],
   );
 
   const stats = useMemo(() => metaStats(top?.response.spot), [top]);
@@ -352,6 +404,10 @@ export function useHand(): HandState & {
     ],
     black: stats?.black ?? new Set<number>(),
     totalVisits: live?.response.spot?.totalVisits ?? null,
+    tempExponent,
+    trainingExponent,
+    tempLimits: TEMP_LIMITS,
+    setTempExponent,
     handleKey,
     jumpTo,
     setConfig,

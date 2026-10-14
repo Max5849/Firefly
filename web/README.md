@@ -26,7 +26,8 @@ cd .. && ./build/server --port 8080          # local, with the tables on this ma
 ssh -N -i ~/.ssh/key -L 8080:127.0.0.1:8080 ubuntu@<VM_IP>   # or the VM, DEPLOY.md section 9
 ```
 
-Vite proxies `/api` to that port, so the page is same-origin and needs neither CORS
+`API_PORT=8081 npm run dev` points the proxy at another port, so a local server can
+run beside a tunnel that holds 8080. Vite proxies `/api` to that port, so the page is same-origin and needs neither CORS
 nor a token. To point at a deployed server instead, copy `.env.example` to `.env`
 and set `VITE_API_URL` and `VITE_API_TOKEN` — and note that a token in the bundle is
 readable by anyone who can open the page. The matching `Access-Control-Allow-Origin`
@@ -41,6 +42,7 @@ lives in `../server/deploy/nginx.conf`, off until you name an origin in the
 | `2`–`9` `t` `j` `q` `k` `a` | — | rank |
 | `s` `h` `d` `c` | — | suit, completing the card |
 | `Backspace` | undo the last action | undo a card, then the held action |
+| `[` `]` | lower / raise the inverse temperature | same |
 | `n` | new hand | — |
 
 Only legal options are offered; the keycaps at the foot of the left column are the
@@ -54,6 +56,15 @@ full metas and memory. Those four name the strategy file, `strategy_<spec>.bin`;
 the spec beside them turns red when nothing has been trained for it, and a banner
 lists what has. The `trained` menu jumps straight to any file the server has.
 Changing the config starts a new hand.
+
+## Temperature
+
+`temp` in the header sets the inverse temperature, ln(2^k) for k from 4 to 64; `[` and
+`]` step it. It changes the whole page at once: the policy each earlier decision
+narrowed its range with, and the policy shown now. k = 8 is what training ran at,
+marked `trained`, and the only setting that reproduces training's ranges. Changing it
+re-asks for the current node, and undo or a ledger jump re-asks for any node fetched at
+another temperature.
 
 ## Reading the grid
 

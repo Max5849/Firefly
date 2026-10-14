@@ -1,15 +1,18 @@
 import type { Config, MetaResponse } from '../api/types';
 import { ConfigBar } from './ConfigBar';
+import { TempControl } from './TempControl';
 
 /** The wordmark is the one non-data element on the page, and the one non-mono type. */
 export function Header({
   meta,
   config,
   onConfig,
+  temp,
 }: {
   meta: MetaResponse | null;
   config: Config | null;
   onConfig: (config: Config) => void;
+  temp: React.ComponentProps<typeof TempControl>;
 }) {
   return (
     <header
@@ -22,7 +25,10 @@ export function Header({
       >
         Tashtego<span style={{ color: 'var(--color-ash)' }}>GTO</span>
       </h1>
-      <ConfigBar meta={meta} config={config} onChange={onConfig} />
+      <div className="flex items-center gap-6">
+        <ConfigBar meta={meta} config={config} onChange={onConfig} />
+        {meta ? <TempControl {...temp} /> : null}
+      </div>
     </header>
   );
 }

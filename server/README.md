@@ -38,8 +38,9 @@ looks up the acting seat's nodes in the strategy and narrows the range with
 node with **no record drops the combos that reach it**, and the response counts
 those drops (`spot.replayDrops`).
 
-The replay uses the server's compiled `INV_TEMP` and `RANGE_FLOOR`. A strategy
-trained with other values replays differently.
+The replay narrows at the request's `invTemp`, which defaults to the compiled
+`INV_TEMP`, and with the compiled `RANGE_FLOOR`. Only those defaults reproduce the
+ranges training saw.
 
 ## Building
 
@@ -83,6 +84,7 @@ records. `build/indexBuilder` does the same ahead of time:
   "config": { "players": 3, "chips": 200, "metasBasic": true, "memoryBasic": true },
   "actions": [2, 1, 1],
   "board": "As7h2d",
+  "invTemp": 5.545177444479562,
   "include": { "game": true, "key": true, "spot": true }
 }
 ```
@@ -92,6 +94,7 @@ records. `build/indexBuilder` does the same ahead of time:
 | `config` | Which strategy to read. Each field is optional and defaults to `config.h`. `players` is 3–7. `chips` must be a positive even integer, because the spec `10000·players + 10·chips + 10·metasBasic + memoryBasic` is ambiguous for odd stacks. |
 | `actions` | Option indices in order: 0 fold, 1 call/check, 2 raise to half pot, 3 raise to one and a half pot, 4 all in. Empty means the first preflop decision (seat `3 % players`). |
 | `board` | `"As7h2d"`, `"As 7h 2d"` or `"As,7h,2d"`. It must hold exactly the cards for the street the actions reach: 0, 3, 4 or 5. |
+| `invTemp` | Optional, from ln(2^4) to ln(2^64). Defaults to `INV_TEMP`, ln(2^8), the temperature training ran at. It sets **both** the policy each past decision narrows its range with and the policy shown at the spot, so ranges, frequencies, EV and the range mix all belong to one temperature. Only the default reproduces training's ranges. |
 | `include` | Optional. Leaving it out means all three sections. When present, only the sections set to `true` are returned. |
 
 An unknown field or section is a 400 that names it.

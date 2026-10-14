@@ -109,17 +109,17 @@ inline std::string actionName(int option, float toCall, int round, int streetRai
     return (round > 0 && streetRaises == 0) ? "bet" : "raise";
 }
 
-// The INV_TEMP policy over the legal options, from a record's four weights. Fold's
-// weight is the exact 0, so it draws exp(0) = 1. The same softmax the trainer narrows
-// reach with.
+// The policy at inverse temperature invTemp over the legal options, from a record's
+// four weights. Fold's weight is the exact 0, so it draws exp(0) = 1. At INV_TEMP this
+// is the softmax the trainer narrows reach with.
 inline std::array<double, 5> policyFromWeights(const std::array<float, 4>& weights,
-        const std::array<bool, 5>& legal) {
+        const std::array<bool, 5>& legal, double invTemp) {
     std::array<double, 5> draws = {};
     double sum = 0;
     for (int j = 0; j < 5; j++) {
         if (legal[j]) {
             double w = j == 0 ? 0.0 : double(weights[j - 1]);
-            draws[j] = std::exp(std::clamp(INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
+            draws[j] = std::exp(std::clamp(invTemp * w, -MAX_EXP_ARG, MAX_EXP_ARG));
         }
         sum += draws[j];
     }
@@ -255,12 +255,14 @@ struct ReplayDrops {
 // to construct a node from a snapshot of stacks and pot: replaying is the only route.
 // And a range is the product of its seat's own policy along the line, so every past
 // decision is looked up in the strategy and narrowed exactly as the trainer narrows it
-// (TableEngine::applyPolicy), at INV_TEMP. A node the strategy has no record of drops the
-// combos that reach it.
+// (TableEngine::applyPolicy), at the request's inverse temperature - INV_TEMP reproduces
+// training's ranges. A node the strategy has no record of drops the combos that reach it.
 template <int P>
 struct Replay {
     TableEngine<P> engine;
     StrategyConfig config;
+    // The inverse temperature every past decision's policy is taken at.
+    double invTemp = INV_TEMP;
     // The cards the caller actually supplied. Engine::boardCards also holds placeholders
     // for streets the replay has not reached.
     std::vector<int> board;
@@ -295,7 +297,7 @@ struct Replay {
     }
 
     // Narrows the acting seat's range by the option it played: each live combo takes
-    // its node's INV_TEMP probability for the option. Must follow setActionState().
+    // its node's probability for the option at invTemp. Must follow setActionState().
     void narrow(const StrategyStore& store, const std::array<bool, 5>& legal, int option) {
         const int seat = engine.action;
         const auto& range = engine.players[seat].range;
@@ -316,7 +318,7 @@ struct Replay {
                 const uint64_t key = actionState | meta[combo] << 42;
                 seen[group] = store.lookup(key, record) ? 1 : 0;
                 if (seen[group] == 1) {
-                    policy[group] = policyFromWeights(record.weights, legal);
+                    policy[group] = policyFromWeights(record.weights, legal, invTemp);
                 } else {
                     policy[group].fill(0.0);
                     drops.groups++;
@@ -335,9 +337,11 @@ struct Replay {
     // it is played. store == nullptr replays the action state alone and leaves every
     // range at 1.
     ReplayResult run(const StrategyConfig& setup, const std::vector<int>& actions,
-            const std::vector<int>& boardCards, const StrategyStore* store) {
+            const std::vector<int>& boardCards, const StrategyStore* store,
+            double temperature = INV_TEMP) {
         ReplayResult result;
         config = setup;
+        invTemp = temperature;
         history.clear();
         drops = {};
         engine.startingChips = float(config.chips);

@@ -155,8 +155,14 @@ struct IncludeMask {
     bool spot = true;
 };
 
+// The inverse temperatures a request may ask for: ln(2^4) to ln(2^64). Training runs
+// at INV_TEMP = ln(2^8).
+inline const double MIN_INV_TEMP = 4 * std::log(2.0);
+inline const double MAX_INV_TEMP = 64 * std::log(2.0);
+
 struct Request {
     StrategyConfig config;
+    double invTemp = INV_TEMP;
     std::vector<int> actions;
     std::vector<int> board;
     IncludeMask include;
@@ -439,6 +445,7 @@ void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops) 
     w.beginObject();
     w.key("legal");
     writeLegal(w, spot.legal);
+    w.field("invTemp", spot.invTemp);
     w.field("potAfterCall", spot.potAfterCall);
     w.field("totalVisits", int64_t(spot.totalVisits));
     w.field("records", spot.records);
@@ -525,7 +532,8 @@ void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops) 
 template <int P>
 void answer(const Request& request, const StrategyStore& store, httplib::Response& response) {
     thread_local std::unique_ptr<Replay<P>> replay = std::make_unique<Replay<P>>();
-    ReplayResult result = replay->run(request.config, request.actions, request.board, &store);
+    ReplayResult result = replay->run(request.config, request.actions, request.board, &store,
+        request.invTemp);
     if (!result.ok) {
         json extra = json::object();
         if (result.actionIndex >= 0) {
@@ -633,6 +641,7 @@ int main(int argc, char** argv) {
             body["available"] = availableJson();
             body["blinds"] = {1, 2};
             body["invTemp"] = INV_TEMP;
+            body["invTempRange"] = {MIN_INV_TEMP, MAX_INV_TEMP};
             body["rangeFloor"] = RANGE_FLOOR;
             body["comboCount"] = COMBO_COUNT;
             body["options"] = std::vector<std::string>(OPTION_NAMES, OPTION_NAMES + 5);
@@ -646,8 +655,8 @@ int main(int argc, char** argv) {
                 "cards i < j";
             body["evUnits"] = "chips, relative to folding: a record's weight times the pot "
                 "after calling";
-            body["replay"] = "ranges are replayed at this server's INV_TEMP and RANGE_FLOOR; "
-                "a strategy trained with other values replays differently";
+            body["replay"] = "ranges are replayed at the request's invTemp (default INV_TEMP, "
+                "which reproduces training) and this server's RANGE_FLOOR";
             response.set_content(body.dump(2), "application/json");
         });
 
@@ -705,11 +714,25 @@ int main(int argc, char** argv) {
                 fail(response, 400, "badRequest", error);
                 return;
             }
+            if (body.contains("invTemp") && !body["invTemp"].is_null()) {
+                const json& value = body["invTemp"];
+                // A hair of slack, so a client's ln(2^k) need not match bit for bit.
+                if (!value.is_number() || !std::isfinite(value.get<double>())
+                        || value.get<double>() < MIN_INV_TEMP * (1 - 1e-9)
+                        || value.get<double>() > MAX_INV_TEMP * (1 + 1e-9)) {
+                    fail(response, 400, "badRequest", "\"invTemp\" must be a number from "
+                        "ln(2^4) = " + std::to_string(MIN_INV_TEMP) + " to ln(2^64) = "
+                        + std::to_string(MAX_INV_TEMP));
+                    return;
+                }
+                request.invTemp = value.get<double>();
+            }
             for (auto entry = body.begin(); entry != body.end(); ++entry) {
                 const std::string& name = entry.key();
-                if (name != "actions" && name != "board" && name != "config" && name != "include") {
+                if (name != "actions" && name != "board" && name != "config" && name != "include"
+                        && name != "invTemp") {
                     fail(response, 400, "badRequest", "unknown field \"" + name
-                        + "\" (valid: config, actions, board, include)");
+                        + "\" (valid: config, actions, board, invTemp, include)");
                     return;
                 }
             }
