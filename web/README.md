@@ -60,7 +60,7 @@ Changing the config starts a new hand.
 ## Temperature
 
 `temp` in the header sets the inverse temperature **per chip of EV**, ln(2^k) for k
-from 1/8 to 8. Each step multiplies k by 2^(1/8), and `[` and `]` step it. Every policy
+from 1/64 to 4. Each step multiplies k by 2^(1/8), and `[` and `]` step it. Every policy
 is a softmax over each option's EV in chips, so at ln(2^k) an option one chip better is
 played 2^k times as often, whatever the pot. The default is k = 1.
 

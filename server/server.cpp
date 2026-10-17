@@ -155,9 +155,9 @@ struct IncludeMask {
     bool spot = true;
 };
 
-// The inverse temperatures per chip of EV a request may ask for: ln(2^(1/8)) to ln(2^8).
-inline const double MIN_INV_TEMP = std::log(2.0) / 8;
-inline const double MAX_INV_TEMP = 8 * std::log(2.0);
+// The inverse temperatures per chip of EV a request may ask for: ln(2^(1/64)) to ln(2^4).
+inline const double MIN_INV_TEMP = std::log(2.0) / 64;
+inline const double MAX_INV_TEMP = 4 * std::log(2.0);
 
 struct Request {
     StrategyConfig config;
@@ -723,7 +723,7 @@ int main(int argc, char** argv) {
                         || value.get<double>() < MIN_INV_TEMP * (1 - 1e-9)
                         || value.get<double>() > MAX_INV_TEMP * (1 + 1e-9)) {
                     fail(response, 400, "badRequest", "\"invTemp\" must be a number from "
-                        "ln(2^(1/8)) = " + std::to_string(MIN_INV_TEMP) + " to ln(2^8) = "
+                        "ln(2^(1/64)) = " + std::to_string(MIN_INV_TEMP) + " to ln(2^4) = "
                         + std::to_string(MAX_INV_TEMP));
                     return;
                 }

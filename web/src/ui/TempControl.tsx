@@ -8,7 +8,7 @@ function formatExponent(step: number): string {
 
 /**
  * The inverse temperature every node is asked for at, per chip of EV: ln(2^k), with k
- * from 1/8 to 8 in steps of 2^(1/8). At ln(2^k) an option one chip better is played
+ * from 1/64 to 4 in steps of 2^(1/8). At ln(2^k) an option one chip better is played
  * 2^k times as often. It sets both the policy shown at the spot and the one the ranges
  * are replayed through. [ and ] step it from the keyboard.
  */

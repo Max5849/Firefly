@@ -101,7 +101,7 @@ records. `build/indexBuilder` does the same ahead of time:
 | `config` | Which strategy to read. Each field is optional and defaults to `config.h`. `players` is 3–7. `chips` must be a positive even integer, because the spec `10000·players + 10·chips + 10·metasBasic + memoryBasic` is ambiguous for odd stacks. |
 | `actions` | Option indices in order: 0 fold, 1 call/check, 2 raise to half pot, 3 raise to one and a half pot, 4 all in. Empty means the first preflop decision (seat `3 % players`). |
 | `board` | `"As7h2d"`, `"As 7h 2d"` or `"As,7h,2d"`. It must hold exactly the cards for the street the actions reach: 0, 3, 4 or 5. |
-| `invTemp` | Optional inverse temperature **per chip of EV**, from ln(2^(1/8)) ≈ 0.0866 to ln(2^8) ≈ 5.545. Defaults to ln 2. It sets **both** the policy each past decision narrows its range with and the policy shown at the spot, so ranges, frequencies, EV and the range mix all belong to one temperature. Echoed as `spot.invTemp`. |
+| `invTemp` | Optional inverse temperature **per chip of EV**, from ln(2^(1/64)) ≈ 0.0108 to ln(2^4) ≈ 2.773. Defaults to ln 2. It sets **both** the policy each past decision narrows its range with and the policy shown at the spot, so ranges, frequencies, EV and the range mix all belong to one temperature. Echoed as `spot.invTemp`. |
 | `include` | Optional. Leaving it out means all three sections. When present, only the sections set to `true` are returned. |
 
 An unknown field or section is a 400 that names it.

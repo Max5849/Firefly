@@ -66,12 +66,12 @@ export interface HandState {
    * multiplies it by 2^(1/8). The page asks for every node at it.
    */
   tempStep: number;
-  /** The steps a request may use, inclusive: ln(2^(1/8)) .. ln(2^8). */
+  /** The steps a request may use, inclusive: ln(2^(1/64)) .. ln(2^4). */
   tempLimits: [number, number];
 }
 
-/** In eighths of a power of two: 2^(1/8) = 2^(2^-3) .. 2^8 = 2^(2^3). */
-const TEMP_LIMITS: [number, number] = [-24, 24];
+/** In eighths of a power of two: 2^(1/64) = 2^(2^-6) .. 2^4 = 2^(2^2). */
+const TEMP_LIMITS: [number, number] = [-48, 16];
 
 /** ln(2^(2^(step / 8))), the inverse temperature a step stands for. */
 export function invTempOf(step: number): number {
