@@ -41,10 +41,9 @@ export default function App() {
         config={hand.config}
         onConfig={hand.setConfig}
         temp={{
-          exponent: hand.tempExponent,
-          training: hand.trainingExponent,
+          step: hand.tempStep,
           limits: hand.tempLimits,
-          onChange: hand.setTempExponent,
+          onChange: hand.setTempStep,
         }}
       />
       {missing ? (

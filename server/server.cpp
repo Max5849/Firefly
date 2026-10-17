@@ -155,14 +155,13 @@ struct IncludeMask {
     bool spot = true;
 };
 
-// The inverse temperatures a request may ask for: ln(2^4) to ln(2^64). Training runs
-// at INV_TEMP = ln(2^8).
-inline const double MIN_INV_TEMP = 4 * std::log(2.0);
-inline const double MAX_INV_TEMP = 64 * std::log(2.0);
+// The inverse temperatures per chip of EV a request may ask for: ln(2^(1/8)) to ln(2^8).
+inline const double MIN_INV_TEMP = std::log(2.0) / 8;
+inline const double MAX_INV_TEMP = 8 * std::log(2.0);
 
 struct Request {
     StrategyConfig config;
-    double invTemp = INV_TEMP;
+    double invTemp = DEFAULT_INV_TEMP;
     std::vector<int> actions;
     std::vector<int> board;
     IncludeMask include;
@@ -640,7 +639,7 @@ int main(int argc, char** argv) {
             body["limits"] = {{"players", {3, 7}}, {"chipsMax", MAX_CHIPS}, {"chipsEven", true}};
             body["available"] = availableJson();
             body["blinds"] = {1, 2};
-            body["invTemp"] = INV_TEMP;
+            body["invTemp"] = DEFAULT_INV_TEMP;
             body["invTempRange"] = {MIN_INV_TEMP, MAX_INV_TEMP};
             body["rangeFloor"] = RANGE_FLOOR;
             body["comboCount"] = COMBO_COUNT;
@@ -655,8 +654,11 @@ int main(int argc, char** argv) {
                 "cards i < j";
             body["evUnits"] = "chips, relative to folding: a record's weight times the pot "
                 "after calling";
-            body["replay"] = "ranges are replayed at the request's invTemp (default INV_TEMP, "
-                "which reproduces training) and this server's RANGE_FLOOR";
+            body["invTempUnits"] = "per chip of EV: every policy is a softmax over each "
+                "option's EV in chips, so ln 2 plays an option one chip better twice as often";
+            body["replay"] = "ranges are replayed through that same EV softmax at the "
+                "request's invTemp and this server's RANGE_FLOOR; training narrowed with a "
+                "softmax over pot shares at INV_TEMP, so no invTemp reproduces it exactly";
             response.set_content(body.dump(2), "application/json");
         });
 
@@ -721,7 +723,7 @@ int main(int argc, char** argv) {
                         || value.get<double>() < MIN_INV_TEMP * (1 - 1e-9)
                         || value.get<double>() > MAX_INV_TEMP * (1 + 1e-9)) {
                     fail(response, 400, "badRequest", "\"invTemp\" must be a number from "
-                        "ln(2^4) = " + std::to_string(MIN_INV_TEMP) + " to ln(2^64) = "
+                        "ln(2^(1/8)) = " + std::to_string(MIN_INV_TEMP) + " to ln(2^8) = "
                         + std::to_string(MAX_INV_TEMP));
                     return;
                 }

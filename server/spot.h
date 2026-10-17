@@ -38,7 +38,7 @@ struct SpotResult {
     std::array<SpotRow, COMBO_COUNT> rows;
     std::array<bool, 5> legal = {};
     // The inverse temperature the range was replayed and the policy taken at.
-    double invTemp = INV_TEMP;
+    double invTemp = DEFAULT_INV_TEMP;
     // The weight denominator: the pot once the actor has called.
     double potAfterCall = 0;
     // The sum of visits over the distinct records the acting range reaches.
@@ -120,7 +120,8 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
                 row.weights[j - 1] = double(group.record.weights[j - 1]);
                 values[j] = row.weights[j - 1];
             }
-            row.frequencies = policyFromWeights(group.record.weights, out.legal, replay.invTemp);
+            row.frequencies = policyFromWeights(group.record.weights, out.legal, replay.invTemp,
+                out.potAfterCall);
             row.visits = group.record.visits;
             row.ev = 0;
             for (int j = 0; j < 5; j++) {

@@ -59,12 +59,14 @@ Changing the config starts a new hand.
 
 ## Temperature
 
-`temp` in the header sets the inverse temperature, ln(2^k) for k from 4 to 64; `[` and
-`]` step it. It changes the whole page at once: the policy each earlier decision
-narrowed its range with, and the policy shown now. k = 8 is what training ran at,
-marked `trained`, and the only setting that reproduces training's ranges. Changing it
-re-asks for the current node, and undo or a ledger jump re-asks for any node fetched at
-another temperature.
+`temp` in the header sets the inverse temperature **per chip of EV**, ln(2^k) for k
+from 1/8 to 8. Each step multiplies k by 2^(1/8), and `[` and `]` step it. Every policy
+is a softmax over each option's EV in chips, so at ln(2^k) an option one chip better is
+played 2^k times as often, whatever the pot. The default is k = 1.
+
+It changes the whole page at once: the policy each earlier decision narrowed its range
+with, and the policy shown now. Changing it re-asks for the current node, and undo or
+a ledger jump re-asks for any node fetched at another temperature.
 
 ## Reading the grid
 

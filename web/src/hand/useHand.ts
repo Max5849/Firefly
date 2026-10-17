@@ -61,23 +61,28 @@ export interface HandState {
   black: Set<number>;
   /** Visits summed over the distinct records the acting range reaches. */
   totalVisits: number | null;
-  /** The inverse temperature is ln(2^tempExponent); the page asks for every node at it. */
-  tempExponent: number;
-  /** The exponent training ran at, ln(2^8). */
-  trainingExponent: number;
-  /** The exponents a request may use, inclusive. */
+  /**
+   * The inverse temperature, per chip of EV, is ln(2^(2^(tempStep / 8))): each step
+   * multiplies it by 2^(1/8). The page asks for every node at it.
+   */
+  tempStep: number;
+  /** The steps a request may use, inclusive: ln(2^(1/8)) .. ln(2^8). */
   tempLimits: [number, number];
 }
 
-/** ln(2^4) .. ln(2^64), the range the server accepts. */
-const TEMP_LIMITS: [number, number] = [4, 64];
-const DEFAULT_EXPONENT = 8;
+/** In eighths of a power of two: 2^(1/8) = 2^(2^-3) .. 2^8 = 2^(2^3). */
+const TEMP_LIMITS: [number, number] = [-24, 24];
+
+/** ln(2^(2^(step / 8))), the inverse temperature a step stands for. */
+export function invTempOf(step: number): number {
+  return Math.pow(2, step / 8) * Math.LN2;
+}
 
 export function useHand(): HandState & {
   handleKey: (key: string) => void;
   jumpTo: (frame: number) => void;
   setConfig: (config: Config) => void;
-  setTempExponent: (exponent: number) => void;
+  setTempStep: (step: number) => void;
 } {
   const [meta, setMeta] = useState<MetaResponse | null>(null);
   const [config, setConfigState] = useState<Config | null>(null);
@@ -88,11 +93,10 @@ export function useHand(): HandState & {
   const [error, setError] = useState<string | null>(null);
   const [missing, setMissing] = useState<MissingStrategy | null>(null);
   const [loading, setLoading] = useState(false);
-  const [tempExponent, setTempExponentState] = useState(DEFAULT_EXPONENT);
-  const [trainingExponent, setTrainingExponent] = useState(DEFAULT_EXPONENT);
+  const [tempStep, setTempStepState] = useState(0);
   // Read by send(), so every request goes out at the temperature current when it is
   // sent without each caller having to carry it.
-  const invTemp = useRef(DEFAULT_EXPONENT * Math.LN2);
+  const invTemp = useRef(invTempOf(0));
 
   // A newer keystroke must win, so every request supersedes the one before it.
   const inflight = useRef<AbortController | null>(null);
@@ -170,10 +174,13 @@ export function useHand(): HandState & {
           return;
         }
         setMeta(loaded);
-        const training = Math.round(loaded.invTemp / Math.LN2);
-        setTrainingExponent(training);
-        setTempExponentState(training);
-        invTemp.current = training * Math.LN2;
+        // Start at the server's default, on the nearest step.
+        const step = Math.min(
+          TEMP_LIMITS[1],
+          Math.max(TEMP_LIMITS[0], Math.round(8 * Math.log2(loaded.invTemp / Math.LN2))),
+        );
+        setTempStepState(step);
+        invTemp.current = invTempOf(step);
         const { spec: _spec, ...defaults } = loaded.defaults;
         setConfigState(defaults);
         void reset(defaults);
@@ -196,10 +203,10 @@ export function useHand(): HandState & {
     [reset],
   );
 
-  const setTempExponent = useCallback((exponent: number) => {
-    const clamped = Math.min(TEMP_LIMITS[1], Math.max(TEMP_LIMITS[0], Math.round(exponent)));
-    invTemp.current = clamped * Math.LN2;
-    setTempExponentState(clamped);
+  const setTempStep = useCallback((step: number) => {
+    const clamped = Math.min(TEMP_LIMITS[1], Math.max(TEMP_LIMITS[0], Math.round(step)));
+    invTemp.current = invTempOf(clamped);
+    setTempStepState(clamped);
   }, []);
 
   const top = frames.length > 0 ? frames[frames.length - 1] : null;
@@ -210,7 +217,7 @@ export function useHand(): HandState & {
   useEffect(() => {
     const served = top?.response.spot?.invTemp;
     if (!top || !config || served === undefined) return;
-    if (Math.abs(served - tempExponent * Math.LN2) < 1e-9) return;
+    if (Math.abs(served - invTempOf(tempStep)) < 1e-9) return;
     void send(config, top.actions, top.board).then((result) => {
       if (!result.ok) {
         if (result.failure.message !== 'superseded') setError(result.failure.message);
@@ -221,7 +228,7 @@ export function useHand(): HandState & {
         return last === top ? [...current.slice(0, -1), result.frame] : current;
       });
     });
-  }, [top, config, tempExponent, send]);
+  }, [top, config, tempStep, send]);
 
   const settle = useCallback((frame: Frame) => {
     setFrames((current) => [...current, frame]);
@@ -347,7 +354,7 @@ export function useHand(): HandState & {
         return;
       }
       if (key === '[' || key === ']') {
-        setTempExponent(tempExponent + (key === ']' ? 1 : -1));
+        setTempStep(tempStep + (key === ']' ? 1 : -1));
         return;
       }
       if (key === 'n' && mode !== 'boardEntry') {
@@ -376,7 +383,7 @@ export function useHand(): HandState & {
       // anything, so a rejection message would be noise.
       if (option >= 0 && top.response.game?.legal[option]) void play(option);
     },
-    [mode, pending, top, config, reset, undo, play, commitBoard, tempExponent, setTempExponent],
+    [mode, pending, top, config, reset, undo, play, commitBoard, tempStep, setTempStep],
   );
 
   const stats = useMemo(() => metaStats(top?.response.spot), [top]);
@@ -404,10 +411,9 @@ export function useHand(): HandState & {
     ],
     black: stats?.black ?? new Set<number>(),
     totalVisits: live?.response.spot?.totalVisits ?? null,
-    tempExponent,
-    trainingExponent,
+    tempStep,
     tempLimits: TEMP_LIMITS,
-    setTempExponent,
+    setTempStep,
     handleKey,
     jumpTo,
     setConfig,
