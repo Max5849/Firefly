@@ -38,16 +38,15 @@ looks up the acting seat's nodes in the strategy and narrows the range with
 node with **no record drops the combos that reach it**, and the response counts
 those drops (`spot.replayDrops`).
 
-**Every policy here is a softmax over true EV.** A record stores each option's return
-as a share of the pot after calling. The server multiplies it by that pot to get chips
-relative to folding, and takes `P(j) ∝ exp(invTemp × EV_j)`. This applies both to each
-past decision (at that decision's pot) and to the spot. One temperature therefore means
-the same thing in a 3-chip pot and a 300-chip one: at ln 2, an option one chip better is
-played twice as often.
+**Every policy here is a softmax over true EV.** A record's weights are each option's
+EV in chips, relative to folding, as the singleHand trainer stores them. The server
+uses them as stored and takes `P(j) ∝ exp(invTemp × w_j)`, both at each past decision
+and at the spot. At ln 2, an option one chip better is played twice as often.
+`RANGE_FLOOR` is the compiled one.
 
-Training narrowed its ranges with a softmax over the pot shares at `INV_TEMP`. No chip
-temperature reproduces those ranges exactly. These are the strategy's ranges at the
-temperature you choose. `RANGE_FLOOR` is the compiled one.
+**Every file is read as chips.** The multiHand trainer stores shares of the pot after
+calling instead, under the same `strategy_<spec>.bin` names, so its files are served
+with wrong EVs, frequencies and ranges.
 
 ## Building
 
@@ -178,12 +177,12 @@ digits, but not stored in the key), and the exact `spr` and `cpr`.
 - **`reach`** is the acting seat's: the product of its own policy along the line,
   after `RANGE_FLOOR`. It is 0 for a combo the line has ruled out, which still
   carries its strategy.
-- **`weights`** are the record's four values for options 1–4, pot-normalised and
-  relative to folding, which is exactly 0. An illegal option is `null`.
+- **`weights`** are the record's four values for options 1–4: chip EV relative to
+  folding, which is exactly 0. An illegal option is `null`.
 - **`frequencies`** is the softmax of `invTemp × evOptions` over the legal options,
   fold first.
-- **`evOptions`** gives each option's value in **chips relative to folding**:
-  `weight × potAfterCall`. `ev` is the policy-weighted mean.
+- **`evOptions`** gives each option's value in **chips relative to folding**, which
+  is the weight itself (fold is 0). `ev` is the policy-weighted mean.
 - **`visits`** is the record's count, from the cooldown block and reach-weighted.
   It is shared by every combo in the cluster, and `clusterCombos` is how many valid
   combos share it.

@@ -110,24 +110,24 @@ inline std::string actionName(int option, float toCall, int round, int streetRai
 }
 
 // The inverse temperature a request gets when it names none: ln 2, so an option worth
-// one chip more is played twice as often. Per chip of EV, unlike the trainer's
-// INV_TEMP, which is per pot.
+// one chip more is played twice as often.
 inline const double DEFAULT_INV_TEMP = std::log(2.0);
 
 // The policy over the legal options, from a record's four weights, at inverse
 // temperature invTemp per chip.
 //
-// A record stores each option's return as a share of the pot after calling. The
-// softmax here runs on the true EV instead - the weight times potAfterCall, in chips
-// relative to folding - so one temperature means the same thing in a 3 chip pot and a
-// 300 chip one. Fold's EV is the exact 0, so it draws exp(0) = 1.
+// A record's weights are each option's true EV: its return in chips from the decision
+// on, relative to folding, as solver/singleHand stores them. They are used as they
+// are, with no pot scaling. Fold's EV is the exact 0, so it draws exp(0) = 1.
+// (solver/multiHand stores shares of the pot after calling instead; its files read as
+// chips here and come out wrong.)
 inline std::array<double, 5> policyFromWeights(const std::array<float, 4>& weights,
-        const std::array<bool, 5>& legal, double invTemp, double potAfterCall) {
+        const std::array<bool, 5>& legal, double invTemp) {
     std::array<double, 5> draws = {};
     double sum = 0;
     for (int j = 0; j < 5; j++) {
         if (legal[j]) {
-            double ev = j == 0 ? 0.0 : double(weights[j - 1]) * potAfterCall;
+            double ev = j == 0 ? 0.0 : double(weights[j - 1]);
             draws[j] = std::exp(std::clamp(invTemp * ev, -MAX_EXP_ARG, MAX_EXP_ARG));
         }
         sum += draws[j];
@@ -264,11 +264,9 @@ struct ReplayDrops {
 // to construct a node from a snapshot of stacks and pot: replaying is the only route.
 // And a range is the product of its seat's own policy along the line, so every past
 // decision is looked up in the strategy and narrowed exactly as the trainer narrows it
-// (TableEngine::applyPolicy), with each decision's policy taken over true EV at the
-// request's inverse temperature (policyFromWeights). Training narrowed with a softmax
-// over pot shares instead, so these ranges are the strategy's at that temperature, not
-// a reproduction of training's. A node the strategy has no record of drops the combos
-// that reach it.
+// (TableEngine::applyPolicy), with each decision's policy a softmax over the stored
+// chip EVs at the request's inverse temperature (policyFromWeights). A node the
+// strategy has no record of drops the combos that reach it.
 template <int P>
 struct Replay {
     TableEngine<P> engine;
@@ -314,8 +312,6 @@ struct Replay {
     void narrow(const StrategyStore& store, const std::array<bool, 5>& legal, int option) {
         const int seat = engine.action;
         const auto& range = engine.players[seat].range;
-        // The weights' denominator at this decision.
-        const double potAfterCall = double(engine.pot + (engine.bet - engine.players[seat].bet));
         const uint64_t actionState = engine.getActionState(config.memoryBasic);
         const auto& meta = engine.getMetaState(config.metasBasic);
         std::array<int8_t, GROUP_COUNT> seen;
@@ -333,7 +329,7 @@ struct Replay {
                 const uint64_t key = actionState | meta[combo] << 42;
                 seen[group] = store.lookup(key, record) ? 1 : 0;
                 if (seen[group] == 1) {
-                    policy[group] = policyFromWeights(record.weights, legal, invTemp, potAfterCall);
+                    policy[group] = policyFromWeights(record.weights, legal, invTemp);
                 } else {
                     policy[group].fill(0.0);
                     drops.groups++;

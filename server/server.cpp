@@ -652,13 +652,12 @@ int main(int argc, char** argv) {
             body["cardEncoding"] = "rank * 4 + suit, rank 0 = ace descending to 12 = "
                 "deuce, suits cdhs; combos are indexed i * (101 - i) / 2 + j - 1 for "
                 "cards i < j";
-            body["evUnits"] = "chips, relative to folding: a record's weight times the pot "
-                "after calling";
+            body["evUnits"] = "chips, relative to folding: a record's weights are true EV, "
+                "used as stored";
             body["invTempUnits"] = "per chip of EV: every policy is a softmax over each "
                 "option's EV in chips, so ln 2 plays an option one chip better twice as often";
             body["replay"] = "ranges are replayed through that same EV softmax at the "
-                "request's invTemp and this server's RANGE_FLOOR; training narrowed with a "
-                "softmax over pot shares at INV_TEMP, so no invTemp reproduces it exactly";
+                "request's invTemp and this server's RANGE_FLOOR";
             response.set_content(body.dump(2), "application/json");
         });
 
