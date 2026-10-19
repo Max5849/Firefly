@@ -9,9 +9,6 @@ struct Engine {
         uint64_t metaState;
         uint64_t metaStateBasic;
         uint32_t handScore;
-        // The importance ratio of the line: the product, over every decision made while
-        // this seat was in the hand, of the chosen option's INV_TEMP probability over its
-        // sampled probability.
         double ratio;
         float chips;
         bool inHand;
@@ -540,7 +537,7 @@ struct Engine {
             return false;
         }
         round++;
-        if (round == 4) {
+        if (round == 1) {
             return false;
         } 
         firstAction = 1;

@@ -4,10 +4,10 @@
 #include "solver/singleHand/baseTable.h"
 #include "solver/singleHand/trace.h"
 
-double MIN_DELTA_INC;
-double DELTA_SCALAR;
-double INV_MIN_DELTA_INC;
-double INV_DELTA_SCALAR;
+// The step's 1 / variance for an option: its Welford variance, no lower than VARIANCE_MIN.
+static inline double inverseVariance(const OptionStats& option) {
+    return 1.0 / std::max(loadDouble(option.variance), VARIANCE_MIN);
+}
 
 // Applies w <- scale * w + shift atomically. An EMA step w <- w + s (t - w) is the map
 // with scale 1 - s and shift s * t.
@@ -34,6 +34,11 @@ struct Decision {
     // The seat's ratio just before the decision: the expected weight of the touch given
     // the hand reached it.
     double ratio;
+    // The chosen option's INV_TEMP probability over its sampled probability.
+    double own;
+    // exp(-H) of the node's INV_TEMP policy: 1 when one option is certain, 1 / n when n
+    // are equally likely.
+    double certainty;
 };
 
 struct Worker {
@@ -48,34 +53,26 @@ struct Worker {
     }
 };
 
-enum class Phase { Warmup, Training, Cooldown };
-
 struct Explorer {
-    static constexpr uint64_t BLOCK = EPOCHS / 20;
-    static constexpr uint64_t BLOCKS = EPOCHS / BLOCK;
-    static constexpr uint64_t WARMUP_HANDS = EPOCHS / 20;
-    static constexpr uint64_t COOLDOWN_HANDS = EPOCHS / 20;
-    static_assert(BLOCK > 0 && EPOCHS % BLOCK == 0,
-        "BLOCK must divide EPOCHS exactly");
-    static_assert(BLOCKS >= 1, "the run needs at least one training block");
-
     StrategyTable strategy;
     BaseTable strategyBase;
     unsigned threads;
-    std::barrier<> bar;
     std::atomic<uint64_t> nextChunk;
-    // Chunks of the current phase block that have finished, as opposed to been claimed.
+    // Chunks that have finished, as opposed to been claimed.
     std::atomic<uint64_t> doneChunks;
-    // Hands finished over the whole run, across every phase. On its own cache line, since
+    // Hands finished over the whole run. On its own cache line, since
     // every thread bumps it once a hand (128 bytes covers Apple silicon's line size).
     alignas(128) std::atomic<uint64_t> totalHands;
+    // Hands that reached TRACE_KEY, so printTrace can keep one in TRACE_EVERY.
+    alignas(128) std::atomic<uint64_t> traceCount;
     alignas(128) std::mutex printMutex;
     // The hand count and time at the last report, guarded by printMutex.
     uint64_t lastReportHands;
     std::chrono::steady_clock::time_point lastReportTime;
 
-    explicit Explorer(unsigned threads) : threads(threads), bar(threads), nextChunk(0), doneChunks(0),
-        totalHands(0), lastReportHands(0), lastReportTime(std::chrono::steady_clock::now()) {}
+    explicit Explorer(unsigned threads) : threads(threads), nextChunk(0), doneChunks(0),
+        totalHands(0), traceCount(0), lastReportHands(0),
+        lastReportTime(std::chrono::steady_clock::now()) {}
 
     // Finds the node for one key, inserting it if new. Visits are not counted here: they
     // are counted at the end of the hand, weighted by the ratio.
@@ -120,11 +117,13 @@ struct Explorer {
                 }
             }
             for (int j = 0; j < 4; j++) {
-                double seed = base != nullptr ? double(base->weights[j]) : 0.0;
-                weights.weights[j].store(std::bit_cast<uint64_t>(seed),
-                    std::memory_order_relaxed);
+                OptionStats& option = weights.options[j];
+                storeDouble(option.weight, base != nullptr ? double(base->weights[j]) : 0.0);
+                storeDouble(option.mean, 0.0);
+                storeDouble(option.variance, 0.0);
+                option.visits.store(0, std::memory_order_relaxed);
             }
-            weights.stats.store(makeStats(legal, 65535), std::memory_order_relaxed);
+            weights.legal.store(legal, std::memory_order_relaxed);
             strategy.publish(slotIndex, word);
         }
         return weights;
@@ -134,15 +133,14 @@ struct Explorer {
     // legal options. Fold's weight is the exact 0, so it draws exp(0) = 1 in both.
     static void nodePolicy(const Entry& weights, std::array<double, 5>& probabilities,
             std::array<double, 5>& sampling) {
-        const uint8_t legal = entryOptions(weights.stats.load(std::memory_order_relaxed));
+        const uint8_t legal = entryLegal(weights);
         double sum = 0;
         double sampleSum = 0;
         for (int j = 0; j < 5; j++) {
             double draw = 0;
             double sampleDraw = 0;
             if (legal & (1u << j)) {
-                double w = j == 0 ? 0.0 : std::bit_cast<double>(
-                    weights.weights[j - 1].load(std::memory_order_relaxed));
+                double w = j == 0 ? 0.0 : loadDouble(weights.options[j - 1].weight);
                 draw = std::exp(std::clamp(INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
                 sampleDraw = std::exp(std::clamp(SAMPLE_INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
             }
@@ -190,10 +188,17 @@ struct Explorer {
             }
         }
 
+        double negativeEntropy = 0;
+        for (int j = 0; j < 5; j++) {
+            if (policy[j] > 0) {
+                negativeEntropy += policy[j] * std::log(policy[j]);
+            }
+        }
+        const double ratio = policy[option] / sampling[option];
         const int decisionIndex = int(worker.decisions.size());
         worker.decisions.push_back({&weights, seat, option, engine.getChips(),
-            engine.getPot(), engine.getRatio(seat)});
-        const double ratio = policy[option] / sampling[option];
+            engine.getPot(), engine.getRatio(seat), ratio,
+            std::exp(negativeEntropy)});
         for (int other = 0; other < PLAYER_COUNT; other++) {
             if (engine.players[other].inHand) {
                 engine.getRatio(other) *= ratio;
@@ -202,20 +207,23 @@ struct Explorer {
 
         if constexpr (TRACE_KEY_ENABLED) {
             if (key == TRACE_KEY) {
-                const uint64_t stats = weights.stats.load(std::memory_order_relaxed);
                 TraceNode node{};
                 node.key = key;
                 node.decision = decisionIndex;
                 node.combo = engine.getHoleCombo(seat);
                 node.action = seat;
                 node.option = option;
-                node.legal = entryOptions(stats);
-                node.visits = entryVisits(stats);
-                node.delta = entryDelta(stats);
-                node.ratio = worker.decisions.back().ratio;
+                node.legal = entryLegal(weights);
                 for (int j = 0; j < 4; j++) {
-                    node.weights[j] = std::bit_cast<double>(
-                        weights.weights[j].load(std::memory_order_relaxed));
+                    const OptionStats& stats = weights.options[j];
+                    node.visits[j] = optionVisits(stats);
+                    node.means[j] = loadDouble(stats.mean);
+                    node.variances[j] = loadDouble(stats.variance);
+                }
+                node.ratio = worker.decisions.back().ratio;
+                node.certainty = worker.decisions.back().certainty;
+                for (int j = 0; j < 4; j++) {
+                    node.weights[j] = loadDouble(weights.options[j].weight);
                 }
                 node.probabilities = policy;
                 node.sampled = sampling;
@@ -232,6 +240,11 @@ struct Explorer {
         if (worker.tracePath.empty()) {
             return;
         }
+        // Skipped traces are dropped before they are formatted.
+        if (traceCount.fetch_add(1, std::memory_order_relaxed) % TRACE_EVERY != 0) {
+            worker.tracePath.clear();
+            return;
+        }
         std::ostringstream out;
         formatTrace(worker.tracePath, out);
         worker.tracePath.clear();
@@ -239,48 +252,80 @@ struct Explorer {
         std::cout << out.str() << std::flush;
     }
 
-    // At the end of the hand every decision takes one EMA step toward its seat's pot
-    // normalised return, scaled by the seat's final ratio: the line was drawn at the
-    // sampled frequencies of every seat, so the ratio weights the touch by how often it
-    // would really have happened.
+    // Walked backward, each seat keeps a running product of the later decisions' ratios,
+    // by any seat, up to and including its own fold: after the fold nothing changes its
+    // return.
     //
-    // Visits add each decision's expected weight given the hand reached it - the ratio
-    // just before it - rather than the weight itself: everything from the decision on
-    // averages to 1, so the expectation drops that noise. Folds count too. In 1/256
-    // units with stochastic rounding.
-    void updateWeights(Worker& worker, double multiplier) {
+    // The ratio of a decision is the one before it times the later decisions' own
+    // ratios, leaving out its own: the option's mean is its return given it was chosen.
+    // Every other decision reweights the line from SAMPLE_INV_TEMP to INV_TEMP.
+    //
+    // The chosen option takes one weighted Welford step of its pot-relative return, with the
+    // ratio as the weight, in 1/65536 visit units with stochastic rounding. If that
+    // rounds to nothing, nothing moves.
+    //
+    // Past warmup the weight then takes an EMA step toward the return times the hand's
+    // certainty, the product over every decision in it, so every node of the hand takes
+    // the same factor: a hand whose play stays undecided pulls its weights short of their
+    // returns, and only reaches them as that play firms up. The step is scaled by the
+    // same ratio, so neither its INV_TEMP nor its sampled probability shrinks or grows
+    // it, and by 1 / variance of the option's return, read before this sample. The Welford
+    // mean and variance take the raw return: they describe the return itself.
+    void updateWeights(Worker& worker, bool moveWeights) {
         Engine& engine = worker.engine;
         const std::array<float, PLAYER_COUNT> rewards = engine.getRewards();
-        for (size_t d = 0; d < worker.decisions.size(); d++) {
+        double certainty = 1.0;
+        for (const Decision& decision : worker.decisions) {
+            certainty *= decision.certainty;
+        }
+        std::array<double, PLAYER_COUNT> onwardRatio;
+        onwardRatio.fill(1.0);
+        for (size_t d = worker.decisions.size(); d-- > 0; ) {
             const Decision& decision = worker.decisions[d];
-            Entry& weights = *decision.entry;
-            const double mass = 256.0 * decision.ratio;
-            if (mass > 0.0) {
-                uint64_t add = uint64_t(mass);
-                add += worker.unit(worker.gen) < mass - double(add);
-                if (add > 0) {
-                    addVisits(weights, add);
-                }
+            if (decision.option == 0) {
+                onwardRatio[decision.seat] = 1.0;
             }
-            const double ratio = engine.getRatio(decision.seat);
-            if (decision.option == 0 || multiplier == 0.0 || !(ratio > 0.0)) {
+            const double ratio = decision.ratio * onwardRatio[decision.seat];
+            for (int seat = 0; seat < PLAYER_COUNT; seat++) {
+                onwardRatio[seat] *= decision.own;
+            }
+            if (decision.option == 0 || !(ratio > 0.0)) {
                 continue;
             }
-            const double step = LEARNING_RATE * multiplier * MIN_DELTA_INC
-                * std::exp(DELTA_SCALAR * entryDelta(weights.stats.load(std::memory_order_relaxed)));
-            // A touch of weight w is w unit steps: it keeps exp(-rate * w).
-            const double s = -std::expm1(-step * ratio);
+            OptionStats& option = decision.entry->options[decision.option - 1];
+            // The return from the decision on, as a share of the pot after calling.
             const double target = (rewards[decision.seat] - decision.chips) / decision.pot;
-            auto [before, after] = affineUpdate(weights.weights[decision.option - 1],
-                1.0 - s, s * target);
+            const double inverse = inverseVariance(option);
+            const double mass = VISITS_ONE * ratio;
+            uint64_t add = uint64_t(mass);
+            add += worker.unit(worker.gen) < mass - double(add);
+            if (add == 0) {
+                continue;
+            }
+            const uint64_t visits = option.visits.fetch_add(add, std::memory_order_relaxed) + add;
+            const double share = double(add) / double(visits);
+            auto [meanBefore, meanAfter] = affineUpdate(option.mean, 1.0 - share, share * target);
+            affineUpdate(option.variance, 1.0 - share,
+                share * (target - meanBefore) * (target - meanAfter));
+            if (!moveWeights) {
+                continue;
+            }
+            // A touch of weight w is w unit steps: it keeps exp(-rate * w).
+            const double s = -std::expm1(-LEARNING_RATE * inverse * ratio);
+            const double weightTarget = certainty * target;
+            auto [before, after] = affineUpdate(option.weight, 1.0 - s, s * weightTarget);
             if constexpr (TRACE_KEY_ENABLED) {
                 for (TraceNode& node : worker.tracePath) {
                     if (node.decision != int(d)) {
                         continue;
                     }
                     node.updated = true;
+                    node.stepRatio = ratio;
+                    node.onward = certainty;
+                    node.inverseVariance = inverse;
                     node.step = s;
                     node.target = target;
+                    node.weightTarget = weightTarget;
                     node.before = before;
                     node.after = after;
                 }
@@ -295,35 +340,7 @@ struct Explorer {
         worker.decisions.clear();
     }
 
-    void updateDeltasRange(uint64_t begin, uint64_t end) {
-        for (uint64_t i = begin; i < end; i++) {
-            Entry& weights = strategy.dense[i];
-            uint64_t stats = weights.stats.load(std::memory_order_relaxed);
-            double visits = std::clamp(double(entryVisits(stats)), VISITS_FLOOR, VISITS_CEIL);
-            double rate = 1.0 / std::pow(visits, FLEXIBILITY);
-            long encoded = std::lround(std::log(rate * INV_MIN_DELTA_INC) * INV_DELTA_SCALAR);
-            stats = (stats & ~DELTA_MASK) | uint64_t(std::clamp(encoded, 0L, 65535L)) << 40;
-            weights.stats.store(stats, std::memory_order_relaxed);
-        }
-    }
-
-    void deltaPass(unsigned t, bool keepVisits = false) {
-        bar.arrive_and_wait();
-        uint64_t live = strategy.count();
-        uint64_t span = live / threads;
-        uint64_t begin = span * t;
-        uint64_t end = (t + 1 == threads) ? live : span * (t + 1);
-        updateDeltasRange(begin, end);
-        bar.arrive_and_wait();
-        if (t == 0) {
-            strategy.compact(keepVisits);
-            nextChunk.store(0, std::memory_order_relaxed);
-            doneChunks.store(0, std::memory_order_relaxed);
-        }
-        bar.arrive_and_wait();
-    }
-
-    void playHand(Worker& worker, double multiplier) {
+    void playHand(Worker& worker, bool moveWeights) {
         Engine& engine = worker.engine;
         engine.shuffle(worker.gen);
         engine.deal();
@@ -344,50 +361,41 @@ struct Explorer {
             engine.setMetaState(!METAS_BASIC || (USE_BASE && !BASE_METAS_BASIC),
                 METAS_BASIC || (USE_BASE && BASE_METAS_BASIC));
         }
-        updateWeights(worker, multiplier);
+        updateWeights(worker, moveWeights);
     }
 
-    void runBlock(Worker& worker, Phase phase, uint64_t blockBase, uint64_t phaseHands) {
-        const uint64_t phaseChunks = (phaseHands + CHUNK_HANDS - 1) / CHUNK_HANDS;
+    void runTraining(Worker& worker) {
+        constexpr uint64_t chunks = (EPOCHS + CHUNK_HANDS - 1) / CHUNK_HANDS;
         for (;;) {
             uint64_t chunk = nextChunk.fetch_add(1, std::memory_order_relaxed);
-            if (chunk >= phaseChunks) {
+            if (chunk >= chunks) {
                 return;
             }
-            uint64_t base = chunk * CHUNK_HANDS;
-            uint64_t hands = std::min(CHUNK_HANDS, phaseHands - base);
-            double multiplier = (phase == Phase::Training) ? 1.0 : 0.0;
+            const uint64_t base = chunk * CHUNK_HANDS;
+            uint64_t hands = std::min(CHUNK_HANDS, EPOCHS - base);
             for (uint64_t j = 0; j < hands; j++) {
-                if (phase == Phase::Cooldown) {
-                    multiplier = 1.0 - double(base + j) / double(phaseHands);
-                }
-                playHand(worker, multiplier);
+                playHand(worker, base + j >= WARMUP_HANDS);
                 // Counted per hand, not per chunk, so a report's rate is not quantised to chunks.
                 totalHands.fetch_add(1, std::memory_order_relaxed);
             }
             // Chunks finish out of order across threads, so progress is the count of
             // finished chunks, not the offset of the one this thread just played.
             uint64_t done = doneChunks.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (done % PRINT_CHUNKS == 0 || done == phaseChunks) {
-                report(phase, blockBase, phaseHands);
+            if (done % PRINT_CHUNKS == 0 || done == chunks) {
+                report();
             }
         }
     }
 
-    void report(Phase phase, uint64_t blockBase, uint64_t phaseHands) {
+    void report() {
         // The count is read under the lock, so successive prints never go backwards.
         std::lock_guard<std::mutex> lock(printMutex);
-        const uint64_t globalHand = blockBase + std::min(
-            doneChunks.load(std::memory_order_relaxed) * CHUNK_HANDS, phaseHands);
+        const uint64_t played = std::min(
+            doneChunks.load(std::memory_order_relaxed) * CHUNK_HANDS, EPOCHS);
         std::ostringstream out;
         out << std::fixed << std::setprecision(3);
-        if (phase == Phase::Warmup) {
-            out << "Warm up: " << 100.0 * double(globalHand) / double(WARMUP_HANDS) << "% Complete\n";
-        } else if (phase == Phase::Training) {
-            out << "Training: " << 100.0 * double(globalHand) / double(EPOCHS) << "% Complete\n";
-        } else {
-            out << "Cooldown: " << 100.0 * double(globalHand) / double(COOLDOWN_HANDS) << "% Complete\n";
-        }
+        out << (played <= WARMUP_HANDS ? "Warm up: " : "Training: ")
+            << 100.0 * double(played) / double(EPOCHS) << "% Complete\n";
         out << "Strategy Size: " << strategy.count() << "\n";
         // The rate covers only the hands finished since the last report.
         const uint64_t hands = totalHands.load(std::memory_order_relaxed);
@@ -401,18 +409,6 @@ struct Explorer {
         std::cout << out.str() << std::flush;
     }
 
-    void workerMain(unsigned t) {
-        Worker worker(t);
-        runBlock(worker, Phase::Warmup, 0, WARMUP_HANDS);
-        for (uint64_t block = 0; block < BLOCKS; block++) {
-            deltaPass(t);
-            runBlock(worker, Phase::Training, block * BLOCK, BLOCK);
-        }
-        deltaPass(t);
-        runBlock(worker, Phase::Cooldown, 0, COOLDOWN_HANDS);
-        deltaPass(t, true);
-    }
-
     void run() {
         lastReportTime = std::chrono::steady_clock::now();
         std::vector<std::thread> pool;
@@ -420,7 +416,8 @@ struct Explorer {
         for (unsigned t = 0; t < threads; t++) {
             pool.emplace_back([this, t] {
                 try {
-                    workerMain(t);
+                    Worker worker(t);
+                    runTraining(worker);
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> lock(printMutex);
                     std::cerr << "worker " << t << " failed: " << e.what() << std::endl;
@@ -431,13 +428,15 @@ struct Explorer {
         for (auto& thread : pool) {
             thread.join();
         }
+        const uint64_t pruned = strategy.compact();
+        std::cout << "Pruned " << pruned << " nodes under " << VISITS_FLOOR << " visits" << std::endl;
     }
 
     // The trailing s marks a single hand strategy, keeping it apart from the range
     // trainer's file at the same spec.
     static std::string spec(bool metasBasic, bool memoryBasic) {
         return std::to_string((int)(10000 * PLAYER_COUNT + 10 * CHIP_COUNT
-            + 10 * metasBasic + 1 * memoryBasic)) + "s";
+            + 10 * metasBasic + 1 * memoryBasic));
     }
 
     void downloadStrategyBase() {
@@ -483,10 +482,9 @@ struct Explorer {
             Entry& weights = strategy.dense[i];
             std::array<float, 4> out;
             for (int j = 0; j < 4; j++) {
-                out[j] = float(std::bit_cast<double>(
-                    weights.weights[j].load(std::memory_order_relaxed)));
+                out[j] = float(loadDouble(weights.options[j].weight));
             }
-            uint32_t visits = entryVisits(weights.stats.load(std::memory_order_relaxed));
+            uint32_t visits = uint32_t(std::min<uint64_t>(entryVisits(weights), UINT32_MAX));
             uint64_t key = weights.key.load(std::memory_order_relaxed);
             writeFile.write(&key, sizeof(key));
             writeFile.write(&out, sizeof(out));
@@ -508,14 +506,6 @@ struct Explorer {
 
 int main () {
     try {
-        // delta encodes the node's rate per unit of visit weight, 1 / visits^FLEXIBILITY,
-        // logarithmically between the rates at VISITS_CEIL (delta 0) and VISITS_FLOOR.
-        MIN_DELTA_INC = 1.0 / std::pow(VISITS_CEIL, FLEXIBILITY);
-        INV_MIN_DELTA_INC = 1.0 / MIN_DELTA_INC;
-        DELTA_SCALAR = std::log(1.0 / std::pow(VISITS_FLOOR, FLEXIBILITY)
-            * INV_MIN_DELTA_INC) / 65535.0;
-        INV_DELTA_SCALAR = 1.0 / DELTA_SCALAR;
-
         unsigned threads = std::thread::hardware_concurrency();
         if (const char* override = std::getenv("FIREFLY_THREADS")) {
             threads = unsigned(std::strtoul(override, nullptr, 10));
@@ -536,10 +526,10 @@ int main () {
                   << "EPOCHS: " << EPOCHS << "\n"
                   << "INV_TEMP: " << INV_TEMP << "\n"
                   << "SAMPLE_INV_TEMP: " << SAMPLE_INV_TEMP << "\n"
-                  << "FLEXIBILITY: " << FLEXIBILITY << "\n"
                   << "LEARNING_RATE: " << LEARNING_RATE << "\n"
                   << "VISITS_FLOOR: " << VISITS_FLOOR << "\n"
-                  << "VISITS_CEIL: " << VISITS_CEIL << std::endl;
+                  << "WARMUP_HANDS: " << WARMUP_HANDS << "\n"
+                  << "VARIANCE_MIN: " << VARIANCE_MIN << std::endl;
 
         Engine::loadTables();
 
