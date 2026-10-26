@@ -44,6 +44,9 @@ struct RangeDecision {
     int groupCount;
     std::array<uint8_t, GROUP_COUNT> liveGroups;
     std::array<Entry*, GROUP_COUNT> entries;
+    // Each node's INV_TEMP probability for the option taken, divided back out of its
+    // combos' touches so the update is conditioned on taking the option.
+    std::array<double, GROUP_COUNT> share;
     std::array<uint8_t, COMBO_COUNT> groups;
 };
 
@@ -273,6 +276,10 @@ struct Explorer {
         }
         decision.option = option;
         engine.lineOdds *= sampled[option] / running;
+        for (int k = 0; k < decision.groupCount; k++) {
+            const uint8_t group = decision.liveGroups[k];
+            decision.share[group] = worker.policy[group][option];
+        }
 
         if constexpr (TRACE_KEY_ENABLED) {
             for (int k = 0; k < decision.groupCount; k++) {
@@ -367,6 +374,14 @@ struct Explorer {
     // often it would really have happened. A node's steps from one decision are composed
     // and applied in one CAS, which equals applying them one combo at a time.
     //
+    // The touch for a decision leaves out the node's own probability for the option: the
+    // weight estimates the return given the option is taken. Left in, an option's weight
+    // moved by about its probability's share of its gap per block, so an option the
+    // policy had all but dropped could never climb back. Without it every option closes
+    // about LEARNING_RATE of its gap per block, and a touch scales with 1 over the
+    // option's sampled share instead, so its noise is set by how often the range samples
+    // the option, not by how often the node plays it.
+    //
     // Visits add each combo's expected weight given the hand reached the decision -
     // its line reach / odds just before it - rather than the weight itself: everything
     // from the decision on averages to 1, so the expectation drops that noise. Every
@@ -409,7 +424,10 @@ struct Explorer {
                     continue;
                 }
                 worker.visitMass[group] += 256.0 * decision.reach[combo] / decision.odds;
-                const double reach = train ? lineWeight[combo] / engine.lineOdds : 0.0;
+                // A combo with reach left took the option with a share above 0: its float
+                // reach would have underflowed to 0 otherwise.
+                const double reach = train
+                    ? lineWeight[combo] / (engine.lineOdds * decision.share[group]) : 0.0;
                 if (reach > 0.0) {
                     // A touch of weight w is w unit steps: it keeps exp(-rate * w).
                     const double s = -std::expm1(-worker.step[group] * reach);

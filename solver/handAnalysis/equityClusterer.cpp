@@ -2,7 +2,7 @@
 #include "solver/handAnalysis/handClusterer.h"
 #include "solver/handAnalysis/dealer.h"
 
-bool BASIC = false;
+bool BASIC = true;
 
 // Showdown histograms keyed by boardClass | handClass << 16, where boardClass is the full
 // class, or the basic class when BASIC is set.
@@ -319,13 +319,13 @@ int main() {
     std::unordered_map<uint64_t, uint8_t> handMetas;
     uint64_t collisions = 0;
     std::cout << "clustering flop: ";
-    collisions += clusterDists(flopHandDists, handMetas, 32);
+    collisions += clusterDists(flopHandDists, handMetas, 24);
     flopHandDists = HandDists();
     std::cout << "clustering turn: ";
-    collisions += clusterDists(turnHandDists, handMetas, 24);
+    collisions += clusterDists(turnHandDists, handMetas, 18);
     turnHandDists = HandDists();
     std::cout << "clustering river: ";
-    collisions += clusterDists(riverHandDists, handMetas, 16);
+    collisions += clusterDists(riverHandDists, handMetas, 12);
     riverHandDists = HandDists();
     if (collisions > 0) {
         std::cout << "warning: " << collisions << " keys share a board class id across streets;"

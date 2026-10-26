@@ -19,7 +19,7 @@ struct HandClusterer {
 
     HandClusterer() {
         cardRankBuckets = {0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3};
-        holeCardRankBuckets = {0, 1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 4, 4};
+        holeCardRankBuckets = {0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 6, 6, 6};
     }  
 
     uint32_t classifyFlop(const std::array<int, 5>& boardCards) {
@@ -109,36 +109,20 @@ struct HandClusterer {
                 straightState = 1;
             }
         } else if (straightFillCount < 2) {
-            straightState = 2;
+            if (straightDrawCount < 2) {
+                straightState = 2;
+            } else {
+                straightState = 3;
+            }
         } else if (straightFillCount < 3) {
-            straightState = 3;
-        } else {
             straightState = 4;
+        } else {
+            straightState = 5;
         }
         flopClassification[classIndex++] = straightState;
-        highCardRank = 13;
-        int highCard = 0;
-        for (int i = 0; i < 13; i++) {
-            if (cardRanks[i] == 1) {
-                highCardRank = i;
-                highCard = i;
-                flopClassification[classIndex++] = cardRankBuckets[i];
-                break;
-            } else if (i == 12) {
-                flopClassification[classIndex++] = 4;
-            }
-        }
-        for (int i = 0; i < 13; i++) {
-            if (cardRanks[i] == 1 && i != highCard) {
-                flopClassification[classIndex++] = cardRankBuckets[i];
-                break;
-            } else if (i == 12) {
-                flopClassification[classIndex++] = 4;
-            }
-        }
 
         highPairRank = 13;
-        highCard = 0;
+        int highCard = 0;
         for (int i = 0; i < 13; i++) {
             if (cardRanks[i] > 1) {
                 highPairRank = i;
@@ -162,15 +146,41 @@ struct HandClusterer {
                 flopClassification[classIndex++] = 0;
             }
         }
+
+        highCardRank = 13;
+        highCard = 0;
+        for (int i = 0; i < 13; i++) {
+            if (cardRanks[i] == 1) {
+                highCardRank = i;
+                highCard = i;
+                flopClassification[classIndex++] = cardRankBuckets[i];
+                break;
+            } else if (i == 12) {
+                flopClassification[classIndex++] = 4;
+            }
+        }
+        if (flopClassification[3] == 0) {
+            for (int i = 0; i < 13; i++) {
+                if (cardRanks[i] == 1 && i != highCard) {
+                    flopClassification[classIndex++] = cardRankBuckets[i];
+                    break;
+                } else if (i == 12) {
+                    flopClassification[classIndex++] = 4;
+                }
+            }
+        } else {
+            flopClassification[classIndex++] = 4;
+        }
+
         uint32_t key = 0;
         key = 3 * key + flopClassification[0];
-        key = 5 * key + flopClassification[1];
-        key = 5 * key + flopClassification[2];
-        key = 5 * key + flopClassification[3];
+        key = 6 * key + flopClassification[1];
+        key = 4 * key + flopClassification[2];
+        key = 4 * key + flopClassification[3];
         key = 4 * key + flopClassification[4];
         key = 4 * key + flopClassification[5];
-        key = 4 * key + flopClassification[6];
-        key = 4 * key + flopClassification[7];
+        key = 5 * key + flopClassification[6];
+        key = 5 * key + flopClassification[7];
         return key + 1;
     }    
 
@@ -277,33 +287,6 @@ struct HandClusterer {
 
         int highCard = 0;
         for (int i = 0; i < 13; i++) {
-            if (cardRanks[i] == 1) {
-                highCard = i;
-                if (highCard < highCardRank) {
-                    turnClassification[classIndex++] = 1;
-                } else {
-                    turnClassification[classIndex++] = 0;
-                }
-                highCardRank = highCard;
-                turnClassification[classIndex++] = cardRankBuckets[i];
-                break;
-            } else if (i == 12) {
-                highCardRank = 13;
-                turnClassification[classIndex++] = 0;
-                turnClassification[classIndex++] = 4;
-            }
-        }
-        for (int i = 0; i < 13; i++) {
-            if (cardRanks[i] == 1 && i != highCard) {
-                turnClassification[classIndex++] = cardRankBuckets[i];
-                break;
-            } else if (i == 12) {
-                turnClassification[classIndex++] = 4;
-            }
-        }
-
-        highCard = 0;
-        for (int i = 0; i < 13; i++) {
             if (cardRanks[i] > 1) {
                 highCard = i;
                 if (highCard < highPairRank) {
@@ -333,17 +316,48 @@ struct HandClusterer {
             }
         }
 
+        highCard = 0;
+        for (int i = 0; i < 13; i++) {
+            if (cardRanks[i] == 1) {
+                highCard = i;
+                if (highCard < highCardRank) {
+                    turnClassification[classIndex++] = 1;
+                } else {
+                    turnClassification[classIndex++] = 0;
+                }
+                highCardRank = highCard;
+                turnClassification[classIndex++] = cardRankBuckets[i];
+                break;
+            } else if (i == 12) {
+                highCardRank = 13;
+                turnClassification[classIndex++] = 0;
+                turnClassification[classIndex++] = 4;
+            }
+        }
+        if (turnClassification[4] == 0) {
+            for (int i = 0; i < 13; i++) {
+                if (cardRanks[i] == 1 && i != highCard) {
+                    turnClassification[classIndex++] = cardRankBuckets[i];
+                    break;
+                } else if (i == 12) {
+                    turnClassification[classIndex++] = 4;
+                }
+            }
+        } else {
+            turnClassification[classIndex++] = 4;
+        }
+
         uint32_t key = 0;
         key = 4 * key + turnClassification[0];
         key = 10 * key + turnClassification[1];
         key = 2 * key + turnClassification[2];
-        key = 5 * key + turnClassification[3];
-        key = 5 * key + turnClassification[4];
-        key = 2 * key + turnClassification[5];
+        key = 4 * key + turnClassification[3];
+        key = 4 * key + turnClassification[4];
+        key = 4 * key + turnClassification[5];
         key = 4 * key + turnClassification[6];
-        key = 4 * key + turnClassification[7];
-        key = 4 * key + turnClassification[8];
-        key = 4 * key + turnClassification[9];
+        key = 2 * key + turnClassification[7];
+        key = 5 * key + turnClassification[8];
+        key = 5 * key + turnClassification[9];
         return key + 1;
     }     
 
@@ -516,33 +530,6 @@ struct HandClusterer {
         
         int highCard = 0;
         for (int i = 0; i < 13; i++) {
-            if (cardRanks[i] == 1) {
-                highCard = i;
-                if (highCard < highCardRank) {
-                    riverClassification[classIndex++] = 1;
-                } else {
-                    riverClassification[classIndex++] = 0;
-                }
-                highCardRank = highCard;
-                riverClassification[classIndex++] = cardRankBuckets[i];
-                break;
-            } else if (i == 12) {
-                highCardRank = 13;
-                riverClassification[classIndex++] = 0;
-                riverClassification[classIndex++] = 4;
-            }
-        }
-        for (int i = 0; i < 13; i++) {
-            if (cardRanks[i] == 1 && i != highCard) {
-                riverClassification[classIndex++] = cardRankBuckets[i];
-                break;
-            } else if (i == 12) {
-                riverClassification[classIndex++] = 4;
-            }
-        }
-
-        highCard = 0;
-        for (int i = 0; i < 13; i++) {
             if (cardRanks[i] > 1) {
                 highCard = i;
                 if (highCard < highPairRank) {
@@ -572,23 +559,54 @@ struct HandClusterer {
             }
         }
 
+        highCard = 0;
+        for (int i = 0; i < 13; i++) {
+            if (cardRanks[i] == 1) {
+                highCard = i;
+                if (highCard < highCardRank) {
+                    riverClassification[classIndex++] = 1;
+                } else {
+                    riverClassification[classIndex++] = 0;
+                }
+                highCardRank = highCard;
+                riverClassification[classIndex++] = cardRankBuckets[i];
+                break;
+            } else if (i == 12) {
+                highCardRank = 13;
+                riverClassification[classIndex++] = 0;
+                riverClassification[classIndex++] = 4;
+            }
+        }
+        if (riverClassification[5] == 0) {
+            for (int i = 0; i < 13; i++) {
+                if (cardRanks[i] == 1 && i != highCard) {
+                    riverClassification[classIndex++] = cardRankBuckets[i];
+                    break;
+                } else if (i == 12) {
+                    riverClassification[classIndex++] = 4;
+                }
+            }
+        } else {
+            riverClassification[classIndex++] = 4;
+        }
+        
         uint32_t key = 0;
         key = 6 * key + riverClassification[0];
         key = 4 * key + riverClassification[1];
         key = 12 * key + riverClassification[2];
         key = 2 * key + riverClassification[3];
-        key = 5 * key + riverClassification[4];
-        key = 5 * key + riverClassification[5];
-        key = 2 * key + riverClassification[6];
+        key = 4 * key + riverClassification[4];
+        key = 4 * key + riverClassification[5];
+        key = 4 * key + riverClassification[6];
         key = 4 * key + riverClassification[7];
-        key = 4 * key + riverClassification[8];
-        key = 4 * key + riverClassification[9];
-        key = 4 * key + riverClassification[10];
+        key = 2 * key + riverClassification[8];
+        key = 5 * key + riverClassification[9];
+        key = 5 * key + riverClassification[10];
         return key + 1;
     }   
 
     uint32_t classifyHand(const std::array<int, 5>& boardCards, const std::array<int, 2>& holeCards, int street) {
-        std::array<int, 11> handClassification;
+        std::array<int, 14> handClassification;
         int classIndex = 0;
 
         std::fill(cardRanks.begin(), cardRanks.end(), 0);
@@ -608,15 +626,17 @@ struct HandClusterer {
         int holeFlushSuit = -1;
         for (int i = 0; i < 4; i++) {
             if (holeCardSuits[i] > 0 && cardSuits[i] + holeCardSuits[i] > street + 1) {
-                flushState = std::min(cardSuits[i] + holeCardSuits[i] - 1, 4);
+                flushState = std::min(cardSuits[i] + holeCardSuits[i] - 2, 3);
                 holeFlushSuit = i;
                 break;
             }
         }
-        
+
         int suitedStraightState = 0;
         int suitedStraightRank = 0;
-        if (flushState == 4) {
+        std::array<int, 2> suitedStraightStates = {0, 0};
+        std::array<std::array<int, 2>, 2> suitedStraightRanks = {0, 0};
+        if (flushState > 1) {
             std::fill(suitedCardRanks.begin(), suitedCardRanks.end(), 0);
             for (int j = 0; j < street + 2; j++) {
                 if (boardCards[j] % 4 == holeFlushSuit) {
@@ -635,10 +655,9 @@ struct HandClusterer {
             if (suitedHoleCardRanks[0] > 0) {
                 suitedHoleCardRanks[13] = 1;
             }
-
             bool full = false;
-            for (int k = 0; k < 10; k++) {
-                if (suitedCardRanks[k] + suitedHoleCardRanks[k] > 0) {
+            for (int i = 0; i < 10; i++) {
+                if (suitedCardRanks[i] + suitedHoleCardRanks[i] > 0) {
                     if (full) {
                         continue;
                     } else {
@@ -650,43 +669,64 @@ struct HandClusterer {
                 } 
                 int singleSuitedStraightState = 0;
                 int holeCardCount = 0; 
-                for (int l = k; l < k + 5; l++) {
-                    if (suitedCardRanks[l] + suitedHoleCardRanks[l] == 0) {
+                for (int j = i; j < i + 5; j++) {
+                    if (suitedCardRanks[j] + suitedHoleCardRanks[j] == 0) {
                         singleSuitedStraightState++; 
-                    } else if (suitedCardRanks[l] == 0) {
+                    } else if (suitedCardRanks[j] == 0) {
                         holeCardCount++;
                     }
                 }
-                if (holeCardCount > 0 && singleSuitedStraightState == 0) {
-                    suitedStraightState = 1;
-                    bool fullRank = false;
-                    for (int m = std::max(k - 4, 0); m < k; m++) {
-                        if (suitedCardRanks[m] > 0 || (m >= k && suitedHoleCardRanks[m] == 0)) {
-                            if (fullRank) {
+                if (holeCardCount > 0 && singleSuitedStraightState < 2 && singleSuitedStraightState < 4 - street) {
+                    int index = 1 - singleSuitedStraightState;
+                    if (suitedStraightStates[index] < 2) {
+                        bool fullRank = false;
+                        for (int k = std::max(i - 4, 0); k < i; k++) {
+                            if (suitedCardRanks[k] > 0 || (k >= i && suitedHoleCardRanks[k] == 0)) {
+                                if (fullRank) {
+                                    continue;
+                                } else {
+                                    fullRank = true;
+                                }
+                            } else if (fullRank) {
+                                fullRank = false;
                                 continue;
-                            } else {
-                                fullRank = true;
+                            } 
+                            int singleStraightRank = 0;
+                            for (int l = k; l < k + 5; l++) {
+                                if (suitedCardRanks[l] == 0 && !(l >= i && suitedHoleCardRanks[l] == 0)) {
+                                    singleStraightRank++; 
+                                }                     
                             }
-                        } else if (fullRank) {
-                            fullRank = false;
-                            continue;
-                        } 
-                        int singleSuitedStraightRank = 0;
-                        for (int n = m; n < m + 5; n++) {
-                            if (suitedCardRanks[n] == 0 && !(n >= k && suitedHoleCardRanks[n] == 0)) {
-                                singleSuitedStraightRank++; 
-                            }                     
-                        }
-                        if (singleSuitedStraightRank < 2) {
-                            suitedStraightRank = 1;
+                            if (singleStraightRank == 1) {
+                                suitedStraightRanks[index][suitedStraightStates[index]] = 1;
+                                break;
+                            } 
                         }
                     }
+                    suitedStraightStates[1 - singleSuitedStraightState]++;
                 }
             }
         } 
-        handClassification[classIndex++] = suitedStraightState + suitedStraightRank;
+        if (suitedStraightStates[1] > 0) {
+            suitedStraightState = 3;
+            suitedStraightRank = 2 * suitedStraightRanks[1][0] + suitedStraightRanks[1][1];
+        } else if (suitedStraightStates[0] > 0) {
+            if (suitedStraightStates[0] == 1) {
+                suitedStraightState = 2;
+                suitedStraightRank = 2 * suitedStraightRanks[0][0] + suitedStraightRanks[0][1];
+            } else {
+                suitedStraightState = 1;
+                suitedStraightRank = 2 * suitedStraightRanks[0][0] + suitedStraightRanks[0][1];
+            }
+        } else {
+            suitedStraightState = 0;
+            suitedStraightRank = 0;
+        }
+        handClassification[classIndex++] = suitedStraightState;
+        handClassification[classIndex++] = suitedStraightRank;
 
         int flushRank = 0;
+        bool suited = 0;
         if (flushState > 0) {
             int highCard = 0;
             if (holeCards[0] % 4 == holeFlushSuit) {
@@ -700,33 +740,39 @@ struct HandClusterer {
                     overCount++;
                 }
             }
-            if (overCount > 4 || (flushState == 2 && highCard - overCount > 2)) {
+            if (overCount > 4 || (flushState == 1 && highCard - overCount > 4)) {
                 flushState = 0;
             } else {
-                if (flushState == 2 && holeCards[0] % 4 != holeCards[1] % 4) {
-                    flushState = 1;
-                }
+                suited = holeCards[0] % 4 == holeCards[1] % 4;
                 if (highCard - overCount < 1) {
                     flushRank = 0;
-                } else if (highCard - overCount < 3) {
+                } else if (highCard - overCount < 2) {
                     flushRank = 1;
-                } else if (highCard - overCount < 6) {
+                } else if (highCard - overCount < 3) {
                     flushRank = 2;
-                } else {
+                } else if (highCard - overCount < 5) {
                     flushRank = 3;
+                } else if (highCard - overCount < 7) {
+                    flushRank = 4;
+                } else {
+                    flushRank = 5;
                 }
             }
         }
         handClassification[classIndex++] = flushState;
         handClassification[classIndex++] = flushRank;
+        handClassification[classIndex++] = suited;
 
+        if (cardRanks[0] > 0) {
+            cardRanks[13] = 1;
+        }
         if (holeCardRanks[0] > 0) {
             holeCardRanks[13] = 1;
         }
         int straightState = 0;
         int straightRank = 0;
-        std::array<int, 3> straightStates = {0, 0, 0};
-        std::array<int, 3> straightRanks = {0, 0, 0};
+        std::array<int, 3> straightStates = {0};
+        std::array<std::array<int, 2>, 3> straightRanks = {0};
         bool full = false;
         for (int i = 0; i < 10; i++) {
             if (holeCardRanks[i] + cardRanks[i] > 0) {
@@ -749,46 +795,56 @@ struct HandClusterer {
                 }
             }
             if (holeCardCount > 0 && singleStraightState < 4 - street) {
-                straightStates[2 - singleStraightState]++;
-                bool fullRank = false;
-                for (int k = std::max(i - 4, 0); k < i; k++) {
-                    if (cardRanks[k] > 0 || (k >= i && holeCardRanks[k] == 0)) {
-                        if (fullRank) {
+                int index = 2 - singleStraightState;
+                if (straightStates[index] < 2) {
+                    bool fullRank = false;
+                    for (int k = std::max(i - 4, 0); k < i; k++) {
+                        if (cardRanks[k] > 0 || (k >= i && holeCardRanks[k] == 0)) {
+                            if (fullRank) {
+                                continue;
+                            } else {
+                                fullRank = true;
+                            }
+                        } else if (fullRank) {
+                            fullRank = false;
                             continue;
-                        } else {
-                            fullRank = true;
+                        } 
+                        int singleStraightRank = 0;
+                        for (int l = k; l < k + 5; l++) {
+                            if (cardRanks[l] == 0 && !(l >= i && holeCardRanks[l] == 0)) {
+                                singleStraightRank++; 
+                            } 
                         }
-                    } else if (fullRank) {
-                        fullRank = false;
-                        continue;
-                    } 
-                    int singleStraightRank = 0;
-                    for (int l = k; l < k + 5; l++) {
-                        if (cardRanks[l] == 0 && !(l >= i && holeCardRanks[l] == 0)) {
-                            singleStraightRank++; 
-                        }                     
-                    }
-                    if (singleStraightRank < 3) {
-                        straightRanks[2 - singleStraightState] = std::max
-                            (straightRanks[2 - singleStraightState], 3 - singleStraightRank);
+                        if (singleStraightRank == 1) {
+                            straightRanks[index][straightStates[index]] = 3;
+                            break;
+                        } else if (singleStraightRank == 2) {
+                            if (straightRanks[index][straightStates[index]] == 0) {
+                                straightRanks[index][straightStates[index]] = 2;
+                            } else {
+                                straightRanks[index][straightStates[index]] = 1;
+                                break;
+                            }
+                        }
                     }
                 }
+                straightStates[index]++;
             }
         }
         if (straightStates[2] > 0) {
             straightState = 4;
-            straightRank = std::min(straightRanks[2], 2);
+            straightRank = 4 * straightRanks[2][0] + straightRanks[2][1];
         } else if (straightStates[1] > 0) {
             if (straightStates[1] == 1) {
                 straightState = 3;
-                straightRank = std::min(straightRanks[1], 2);
-            } else if (straightStates[1] == 2) {
+                straightRank = 4 * straightRanks[1][0] + straightRanks[1][1];
+            } else {
                 straightState = 2;
-                straightRank = std::min(straightRanks[1], 2);
+                straightRank = 4 * straightRanks[1][0] + straightRanks[1][1];
             }
-        } else if (straightStates[0] > 2 && straightRanks[0] < 2) {
+        } else if (straightStates[0] > 1 && straightRanks[0][0] < 3 && straightRanks[0][1] < 3) {
             straightState = 1;
-            straightRank = std::min(straightRanks[0], 2);
+            straightRank = 4 * straightRanks[0][0] + straightRanks[0][1];
         } else {
             straightState = 0;
             straightRank = 0;
@@ -800,30 +856,38 @@ struct HandClusterer {
         for (int i = 0; i < 13; i++) {
             for (int j = 0; j < holeCardRanks[i]; j++) {
                 handClassification[classIndex++] = holeCardRankBuckets[i];
-                handClassification[classIndex++] = std::min(relativeRank, 2);
-                if (cardRanks[i] > 0) {
-                    handClassification[classIndex++] = cardRanks[i] + holeCardRanks[i];
+                if (relativeRank < 1) {
+                    handClassification[classIndex++] = 0;
+                } else if (relativeRank < 2) {
+                    handClassification[classIndex++] = 1;
+                } else if (relativeRank < 4) {
+                    handClassification[classIndex++] = 2;
                 } else {
-                    handClassification[classIndex++] = holeCardRanks[i] - 1;
+                    handClassification[classIndex++] = 3;
                 }
+                handClassification[classIndex++] = cardRanks[i] + holeCardRanks[i] - 1;
             }
             if (cardRanks[i] > 0) {
                 relativeRank++;
             }
         }
+        handClassification[classIndex++] = holeCards[0] / 4 == holeCards[1] / 4;
 
         uint32_t key = 0;
-        key = 3 * key + handClassification[0];
-        key = 5 * key + handClassification[1];
+        key = 4 * key + handClassification[0];
+        key = 4 * key + handClassification[1];
         key = 4 * key + handClassification[2];
-        key = 5 * key + handClassification[3];
-        key = 3 * key + handClassification[4];
+        key = 6 * key + handClassification[3];
+        key = 2 * key + handClassification[4];
         key = 5 * key + handClassification[5];
-        key = 3 * key + handClassification[6];
-        key = 5 * key + handClassification[7];
-        key = 5 * key + handClassification[8];
-        key = 3 * key + handClassification[9];
-        key = 5 * key + handClassification[10];
+        key = 16 * key + handClassification[6];
+        key = 7 * key + handClassification[7];
+        key = 4 * key + handClassification[8];
+        key = 4 * key + handClassification[9];
+        key = 7 * key + handClassification[10];
+        key = 4 * key + handClassification[11];
+        key = 4 * key + handClassification[12];
+        key = 2 * key + handClassification[13];
         return key + 1;
     }
 };

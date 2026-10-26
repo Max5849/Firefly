@@ -12,14 +12,14 @@ constexpr bool BASE_METAS_BASIC = true;
 constexpr bool BASE_MEMORY_BASIC = true;
 constexpr bool USE_BASE = false;
 constexpr double BASE_CONFIDENCE = 16.0;
-constexpr uint64_t EPOCHS = 13 * 131072000;
+constexpr uint64_t EPOCHS = 2 * 131072000;
 constexpr double INV_TEMP = 8 * 0.69314718056;
-constexpr double SAMPLE_INV_TEMP = 2 * 0.69314718056;
+constexpr double SAMPLE_INV_TEMP = 0 * 0.69314718056;
 constexpr double FLEXIBILITY = 1.0;
-constexpr double LEARNING_RATE = 0.8339;
+constexpr double LEARNING_RATE = 2.8339;
 constexpr double VISITS_FLOOR = 5.0;
 constexpr double VISITS_CEIL = 4000317440.0;
-constexpr double RANGE_FLOOR = 0.00003771;
+constexpr double RANGE_FLOOR = 0.0000003771;
 
 
 constexpr bool USE_BLOCKERS = true;

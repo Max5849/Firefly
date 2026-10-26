@@ -22,10 +22,13 @@ struct SpotRow {
     bool found = false;
     // Option 1..4 values from the record, pot normalised, relative to folding.
     std::array<double, 4> weights = {};
+    // Option 1..4 variances of that return from the record, in pots squared, floored at
+    // VARIANCE_CODE_FLOOR.
+    std::array<double, 4> variances = {};
     // The policy over the legal options, at the replay's inverse temperature.
     std::array<double, 5> frequencies = {};
-    // Each option's value in chips relative to folding - the stored weight itself - and
-    // their mean under the policy.
+    // Each option's value in chips relative to folding (weight * pot after calling),
+    // and their mean under the policy.
     std::array<double, 5> evOptions = {};
     double ev = 0;
     // The record's visits (cooldown block, reach weighted), shared by its cluster, and
@@ -118,13 +121,14 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
             std::array<double, 5> values = {};
             for (int j = 1; j < 5; j++) {
                 row.weights[j - 1] = double(group.record.weights[j - 1]);
+                row.variances[j - 1] = decodeVariance(group.record.variances, j - 1);
                 values[j] = row.weights[j - 1];
             }
             row.frequencies = policyFromWeights(group.record.weights, out.legal, replay.invTemp);
             row.visits = group.record.visits;
             row.ev = 0;
             for (int j = 0; j < 5; j++) {
-                row.evOptions[j] = out.legal[j] ? values[j] : 0.0;
+                row.evOptions[j] = out.legal[j] ? values[j] * out.potAfterCall : 0.0;
                 row.ev += row.frequencies[j] * row.evOptions[j];
             }
         }

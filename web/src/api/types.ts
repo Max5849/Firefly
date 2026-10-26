@@ -30,9 +30,9 @@ export interface MetaResponse {
   limits: { players: [number, number]; chipsMax: number; chipsEven: boolean };
   available: ConfigWithSpec[];
   blinds: [number, number];
-  /** The inverse temperature training ran at, ln(2^8). */
+  /** The inverse temperature training ran at, ln(2^20). */
   invTemp: number;
-  /** What a request may ask for: [ln(2^4), ln(2^64)]. */
+  /** What a request may ask for: [ln(2^5), ln(2^80)]. */
   invTempRange: [number, number];
   rangeFloor: number;
   comboCount: number;
@@ -158,6 +158,8 @@ export interface SpotRow {
   clusterCombos: number;
   /** Options 1..4, pot normalised against folding. null where illegal. */
   weights?: (number | null)[];
+  /** Options 1..4, the variance of that return in pots squared. null where illegal. */
+  variances?: (number | null)[];
   /** Five entries, fold first, summing to 1 over the legal options. */
   frequencies?: number[];
   /** Each option's value in chips relative to folding. null where illegal. */

@@ -62,20 +62,19 @@ export interface HandState {
   /** Visits summed over the distinct records the acting range reaches. */
   totalVisits: number | null;
   /**
-   * The inverse temperature, per chip of EV, is ln(2^(2^(tempStep / 8))): each step
-   * multiplies it by 2^(1/8). The page asks for every node at it.
+   * The inverse temperature, per pot, is ln(2^TEMP_EXPONENTS[tempStep]). The page
+   * asks for every node at it.
    */
   tempStep: number;
-  /** The steps a request may use, inclusive: ln(2^(1/64)) .. ln(2^4). */
-  tempLimits: [number, number];
 }
 
-/** In eighths of a power of two: 2^(1/64) = 2^(2^-6) .. 2^4 = 2^(2^2). */
-const TEMP_LIMITS: [number, number] = [-48, 16];
+/** The temperatures on offer, as k in ln(2^k). 20 is the singleHand trainer's. */
+export const TEMP_EXPONENTS = [5, 10, 20, 40, 80] as const;
+const DEFAULT_TEMP_STEP = 2;
 
-/** ln(2^(2^(step / 8))), the inverse temperature a step stands for. */
+/** ln(2^k), the inverse temperature a step stands for. */
 export function invTempOf(step: number): number {
-  return Math.pow(2, step / 8) * Math.LN2;
+  return TEMP_EXPONENTS[step] * Math.LN2;
 }
 
 export function useHand(): HandState & {
@@ -93,10 +92,11 @@ export function useHand(): HandState & {
   const [error, setError] = useState<string | null>(null);
   const [missing, setMissing] = useState<MissingStrategy | null>(null);
   const [loading, setLoading] = useState(false);
-  const [tempStep, setTempStepState] = useState(0);
+  // ln(2^20), training's INV_TEMP, until /meta says otherwise.
+  const [tempStep, setTempStepState] = useState(DEFAULT_TEMP_STEP);
   // Read by send(), so every request goes out at the temperature current when it is
   // sent without each caller having to carry it.
-  const invTemp = useRef(invTempOf(0));
+  const invTemp = useRef(invTempOf(DEFAULT_TEMP_STEP));
 
   // A newer keystroke must win, so every request supersedes the one before it.
   const inflight = useRef<AbortController | null>(null);
@@ -174,11 +174,14 @@ export function useHand(): HandState & {
           return;
         }
         setMeta(loaded);
-        // Start at the server's default, on the nearest step.
-        const step = Math.min(
-          TEMP_LIMITS[1],
-          Math.max(TEMP_LIMITS[0], Math.round(8 * Math.log2(loaded.invTemp / Math.LN2))),
-        );
+        // Start at the option nearest the server's default, by ratio.
+        const exponent = loaded.invTemp / Math.LN2;
+        let step = 0;
+        TEMP_EXPONENTS.forEach((k, i) => {
+          if (Math.abs(Math.log2(k / exponent)) < Math.abs(Math.log2(TEMP_EXPONENTS[step] / exponent))) {
+            step = i;
+          }
+        });
         setTempStepState(step);
         invTemp.current = invTempOf(step);
         const { spec: _spec, ...defaults } = loaded.defaults;
@@ -204,7 +207,7 @@ export function useHand(): HandState & {
   );
 
   const setTempStep = useCallback((step: number) => {
-    const clamped = Math.min(TEMP_LIMITS[1], Math.max(TEMP_LIMITS[0], Math.round(step)));
+    const clamped = Math.min(TEMP_EXPONENTS.length - 1, Math.max(0, Math.round(step)));
     invTemp.current = invTempOf(clamped);
     setTempStepState(clamped);
   }, []);
@@ -412,7 +415,6 @@ export function useHand(): HandState & {
     black: stats?.black ?? new Set<number>(),
     totalVisits: live?.response.spot?.totalVisits ?? null,
     tempStep,
-    tempLimits: TEMP_LIMITS,
     setTempStep,
     handleKey,
     jumpTo,

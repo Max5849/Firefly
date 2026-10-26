@@ -109,18 +109,17 @@ inline std::string actionName(int option, float toCall, int round, int streetRai
     return (round > 0 && streetRaises == 0) ? "bet" : "raise";
 }
 
-// The inverse temperature a request gets when it names none: ln 2, so an option worth
-// one chip more is played twice as often.
-inline const double DEFAULT_INV_TEMP = std::log(2.0);
+// The inverse temperature a request gets when it names none: solver/singleHand's
+// INV_TEMP, ln(2^20), which the strategy files are trained at. (The INV_TEMP in scope
+// is multiHand's.)
+inline const double DEFAULT_INV_TEMP = 20 * std::log(2.0);
 
 // The policy over the legal options, from a record's four weights, at inverse
-// temperature invTemp per chip.
+// temperature invTemp per pot.
 //
-// A record's weights are each option's true EV: its return in chips from the decision
-// on, relative to folding, as solver/singleHand stores them. They are used as they
-// are, with no pot scaling. Fold's EV is the exact 0, so it draws exp(0) = 1.
-// (solver/multiHand stores shares of the pot after calling instead; its files read as
-// chips here and come out wrong.)
+// A record's weights are each option's return from the decision on as a share of the
+// pot after calling, relative to folding, whose value is the exact 0 - so fold draws
+// exp(0) = 1. At INV_TEMP this is the softmax the trainers play by.
 inline std::array<double, 5> policyFromWeights(const std::array<float, 4>& weights,
         const std::array<bool, 5>& legal, double invTemp) {
     std::array<double, 5> draws = {};
@@ -265,7 +264,8 @@ struct ReplayDrops {
 // And a range is the product of its seat's own policy along the line, so every past
 // decision is looked up in the strategy and narrowed exactly as the trainer narrows it
 // (TableEngine::applyPolicy), with each decision's policy a softmax over the stored
-// chip EVs at the request's inverse temperature (policyFromWeights). A node the
+// pot-relative weights at the request's inverse temperature (policyFromWeights); at
+// INV_TEMP these are training's ranges. A node the
 // strategy has no record of drops the combos that reach it.
 template <int P>
 struct Replay {

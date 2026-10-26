@@ -5,8 +5,10 @@
 struct BaseEntry {
     uint64_t key;
     std::array<float, 4> weights;
+    // The four 16-bit variance codes, packed as in Entry::variances.
+    uint64_t variances;
 };
-static_assert(sizeof(BaseEntry) == 24, "BaseEntry must stay packed at 24 bytes");
+static_assert(sizeof(BaseEntry) == 32, "BaseEntry must stay packed at 32 bytes");
 
 struct BaseTable {
     std::vector<BaseEntry> slots;
@@ -26,7 +28,7 @@ struct BaseTable {
 
     uint64_t indexOf(uint64_t key) const { return mix64(key) >> (64 - logSize); }
 
-    void insert(uint64_t key, const std::array<float, 4>& weights) {
+    void insert(uint64_t key, const std::array<float, 4>& weights, uint64_t variances) {
         if (key == 0) {
             throw std::runtime_error("the base file holds a zero key, which collides "
                 "with the empty slot sentinel");
@@ -35,6 +37,7 @@ struct BaseTable {
             if (slots[i].key == 0) {
                 slots[i].key = key;
                 slots[i].weights = weights;
+                slots[i].variances = variances;
                 count++;
                 return;
             }

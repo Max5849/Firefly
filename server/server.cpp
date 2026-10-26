@@ -155,9 +155,10 @@ struct IncludeMask {
     bool spot = true;
 };
 
-// The inverse temperatures per chip of EV a request may ask for: ln(2^(1/64)) to ln(2^4).
-inline const double MIN_INV_TEMP = std::log(2.0) / 64;
-inline const double MAX_INV_TEMP = 4 * std::log(2.0);
+// The inverse temperatures per pot a request may ask for: ln(2^5) to ln(2^80). The
+// singleHand trainer runs at ln(2^20).
+inline const double MIN_INV_TEMP = 5 * std::log(2.0);
+inline const double MAX_INV_TEMP = 80 * std::log(2.0);
 
 struct Request {
     StrategyConfig config;
@@ -501,6 +502,16 @@ void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops) 
                 }
             }
             w.endArray();
+            w.key("variances");
+            w.beginArray();
+            for (int j = 1; j < 5; j++) {
+                if (spot.legal[j]) {
+                    w.number(row.variances[j - 1]);
+                } else {
+                    w.null();
+                }
+            }
+            w.endArray();
             w.key("frequencies");
             w.beginArray();
             for (double share : row.frequencies) {
@@ -652,12 +663,13 @@ int main(int argc, char** argv) {
             body["cardEncoding"] = "rank * 4 + suit, rank 0 = ace descending to 12 = "
                 "deuce, suits cdhs; combos are indexed i * (101 - i) / 2 + j - 1 for "
                 "cards i < j";
-            body["evUnits"] = "chips, relative to folding: a record's weights are true EV, "
-                "used as stored";
-            body["invTempUnits"] = "per chip of EV: every policy is a softmax over each "
-                "option's EV in chips, so ln 2 plays an option one chip better twice as often";
-            body["replay"] = "ranges are replayed through that same EV softmax at the "
-                "request's invTemp and this server's RANGE_FLOOR";
+            body["evUnits"] = "chips, relative to folding: a record's weight times the pot "
+                "after calling";
+            body["invTempUnits"] = "per pot: every policy is a softmax over each option's "
+                "weight, its return as a share of the pot after calling";
+            body["replay"] = "ranges are replayed through that same softmax at the request's "
+                "invTemp and this server's RANGE_FLOOR; the default is the singleHand "
+                "trainer's INV_TEMP";
             response.set_content(body.dump(2), "application/json");
         });
 
@@ -722,7 +734,7 @@ int main(int argc, char** argv) {
                         || value.get<double>() < MIN_INV_TEMP * (1 - 1e-9)
                         || value.get<double>() > MAX_INV_TEMP * (1 + 1e-9)) {
                     fail(response, 400, "badRequest", "\"invTemp\" must be a number from "
-                        "ln(2^(1/64)) = " + std::to_string(MIN_INV_TEMP) + " to ln(2^4) = "
+                        "ln(2^5) = " + std::to_string(MIN_INV_TEMP) + " to ln(2^80) = "
                         + std::to_string(MAX_INV_TEMP));
                     return;
                 }

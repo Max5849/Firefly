@@ -42,7 +42,6 @@ export default function App() {
         onConfig={hand.setConfig}
         temp={{
           step: hand.tempStep,
-          limits: hand.tempLimits,
           onChange: hand.setTempStep,
         }}
       />

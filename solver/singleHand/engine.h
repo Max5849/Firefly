@@ -9,7 +9,6 @@ struct Engine {
         uint64_t metaState;
         uint64_t metaStateBasic;
         uint32_t handScore;
-        double ratio;
         float chips;
         bool inHand;
         uint8_t position;
@@ -28,7 +27,6 @@ struct Engine {
             metaState = preflopHandClass;
             metaStateBasic = preflopHandClass;
             handScore = 0;
-            ratio = 1.0;
             chips = CHIP_COUNT;
             inHand = true;
             this->position = position;
@@ -406,10 +404,6 @@ struct Engine {
         return pot + (bet - players[action].bet);
     }
 
-    double& getRatio(int action) {
-        return players[action].ratio;
-    }
-
     int getHoleCombo(int action) {
         return holePairIndex(players[action].holeCards[0], players[action].holeCards[1]);
     }
@@ -418,7 +412,6 @@ struct Engine {
         return !memoryBasic ? actionState : actionStateBasic;
     }
 
-    // The acting player's meta state, the high part of its key.
     uint64_t getMetaState(bool metasBasic) {
         return !metasBasic ? players[action].metaState : players[action].metaStateBasic;
     }
@@ -507,8 +500,6 @@ struct Engine {
         }
     }
 
-    // Classifies each live player's hand once and fills whichever meta states are
-    // needed.
     void setMetaState(bool needFull, bool needBasic) {
         uint32_t boardIndex = getBoardIndex();
         boardClass = boardClassTable[boardIndex];
@@ -537,7 +528,7 @@ struct Engine {
             return false;
         }
         round++;
-        if (round == 1) {
+        if (round == 4) {
             return false;
         } 
         firstAction = 1;
@@ -560,9 +551,6 @@ struct Engine {
         return true;
     }
 
-    // Pays the pot to the best remaining hand, splitting ties. With one player left
-    // that is simply the pot going to them. The whole pot goes to the winners, with no
-    // side pots.
     void showdown() {
         uint32_t handMax = 0;
         int handMaxCount = 0;
@@ -584,7 +572,6 @@ struct Engine {
         }
     }
 
-    // Every player's chips at the end of the hand.
     std::array<float, PLAYER_COUNT> getRewards() {
         std::array<float, PLAYER_COUNT> rewards;
         for (int i = 0; i < PLAYER_COUNT; i++) {

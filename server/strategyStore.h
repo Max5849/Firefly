@@ -13,24 +13,42 @@
 #include <string>
 
 // A record as strategy_<spec>.bin stores it: the state key, the option 1..4
-// expected values, and the visit count from the cooldown block. There is no
+// expected values, the visit count, and the four options' variance codes. There is no
 // weight for option 0, because folding's pot normalised return is analytically
 // exactly zero.
 //
 // The solver holds the weights as doubles while it trains and narrows them to
 // float on the way out, so the file is float and nothing here needs more.
 //
-// The file packs these at STRATEGY_RECORD_BYTES with no padding, so records after
-// the first are not 8 byte aligned. Never point a StrategyRecord* into the
-// mapping; copy the fields out with memcpy.
+// The file packs these at RECORD_BYTES with no padding, so records after the first
+// are not 8 byte aligned. Never point a StrategyRecord* into the mapping; copy the
+// fields out with memcpy.
 struct StrategyRecord {
     uint64_t key;
     std::array<float, 4> weights;
     uint32_t visits;
+    // Option j's 16-bit variance code in bits 16 (j - 1) to 16 (j - 1) + 15, as
+    // solver/singleHand/strategyTable.h packs Entry::variances.
+    uint64_t variances;
 };
 
-// STRATEGY_RECORD_BYTES and STRATEGY_HEADER_BYTES come from solver/multiHand/config.h, so
-// the writer and every reader move together.
+// solver/singleHand's record layout (its STRATEGY_RECORD_BYTES). solver/multiHand's
+// config.h, which the server includes for the game rules, still names its own 28 byte
+// layout, so the server keeps its own copy. STRATEGY_HEADER_BYTES is 8 in both.
+inline constexpr uint64_t RECORD_BYTES = 36;
+
+// solver/singleHand/strategyTable.h's variance code: VARIANCE_CODE_FLOOR times 2 to the
+// code over VARIANCE_CODES_PER_OCTAVE, in pots squared. Code 0 is the floor and
+// everything below it. singleHand's config.h cannot be included beside multiHand's, so
+// these are copies and must move with it.
+inline constexpr double VARIANCE_CODE_FLOOR = 0.25;
+inline constexpr double VARIANCE_CODES_PER_OCTAVE = 3072.0;
+
+// Option slot o (option o + 1) of a packed variances word.
+inline double decodeVariance(uint64_t packed, int o) {
+    return VARIANCE_CODE_FLOOR * std::exp2(double(packed >> (16 * o) & 0xFFFF)
+        / VARIANCE_CODES_PER_OCTAVE);
+}
 
 // The index is a sidecar rather than a rewrite of the strategy file, so the
 // hundreds of megabytes the solver wrote are mapped and never copied.
@@ -87,9 +105,9 @@ inline std::string indexPathFor(const std::string& strategyPath) {
     return path + ".idx";
 }
 
-// Validates strategy_<spec>.bin against the current 28 byte record format and
-// returns its record count. The 44 byte double layout, the pre-visits 40 byte one
-// and the legacy 56/64 byte ones all decode into plausible looking nonsense rather
+// Validates strategy_<spec>.bin against the current 36 byte record format and
+// returns its record count. multiHand's 28 byte layout, the 44 byte double one, the
+// pre-visits 40 byte one and the legacy 56/64 byte ones all decode into plausible looking nonsense rather
 // than failing, so this check is the only thing standing between a stale file and
 // silently wrong answers.
 inline uint64_t strategyRecordCount(const std::string& path) {
@@ -103,9 +121,9 @@ inline uint64_t strategyRecordCount(const std::string& path) {
     if (records == 0) {
         throw std::runtime_error(path + " declares zero records");
     }
-    if (bytes != STRATEGY_HEADER_BYTES + records * STRATEGY_RECORD_BYTES) {
+    if (bytes != STRATEGY_HEADER_BYTES + records * RECORD_BYTES) {
         throw std::runtime_error(path + " is not in the "
-            + std::to_string(STRATEGY_RECORD_BYTES) + " byte record format: "
+            + std::to_string(RECORD_BYTES) + " byte record format: "
             + std::to_string(records) + " records declared but "
             + std::to_string(bytes) + " bytes on disk. Regenerate it from a run of "
             "the current solver.");
@@ -183,7 +201,7 @@ struct StrategyStore {
         if (std::memcmp(header.magic, STRATEGY_INDEX_MAGIC, 8) != 0) {
             throw std::runtime_error(indexPath + " is not a Firefly strategy index");
         }
-        if (header.recordBytes != STRATEGY_RECORD_BYTES) {
+        if (header.recordBytes != RECORD_BYTES) {
             throw std::runtime_error(indexPath + " was built for a different record size");
         }
         // The index is built from one specific strategy file. A count mismatch
@@ -204,10 +222,11 @@ struct StrategyStore {
 
     void readRecord(uint64_t index, StrategyRecord& out) const {
         const uint8_t* cursor = strategyMap.data + STRATEGY_HEADER_BYTES
-            + index * STRATEGY_RECORD_BYTES;
+            + index * RECORD_BYTES;
         std::memcpy(&out.key, cursor, sizeof(out.key));
         std::memcpy(out.weights.data(), cursor + 8, sizeof(float) * 4);
         std::memcpy(&out.visits, cursor + 24, sizeof(out.visits));
+        std::memcpy(&out.variances, cursor + 28, sizeof(out.variances));
     }
 
     // The 32 bit tag in the slot resolves almost every miss without touching the
@@ -266,7 +285,7 @@ inline void buildIndex(const std::string& strategyPath, const std::string& index
     auto keyAt = [&](uint64_t i) {
         uint64_t key;
         std::memcpy(&key, strategyMap.data + STRATEGY_HEADER_BYTES
-            + i * STRATEGY_RECORD_BYTES, sizeof(key));
+            + i * RECORD_BYTES, sizeof(key));
         return key;
     };
 
@@ -300,7 +319,7 @@ inline void buildIndex(const std::string& strategyPath, const std::string& index
     std::memcpy(header.magic, STRATEGY_INDEX_MAGIC, 8);
     header.records = records;
     header.slotBits = slotBits;
-    header.recordBytes = STRATEGY_RECORD_BYTES;
+    header.recordBytes = RECORD_BYTES;
 
     CheckedWriter writeFile(indexPath);
     writeFile.write(&header, sizeof(header));

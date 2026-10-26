@@ -197,29 +197,8 @@ struct BoardClusterer {
         }
         classification[classIndex++] = straightState;
 
-        highCardRank = 13;
-        int highCard = 0;
-        for (int i = 0; i < 13; i++) {
-            if (cardRanks[i] == 1) {
-                highCardRank = i;
-                highCard = i;
-                classification[classIndex++] = cardRankBuckets[i];
-                break;
-            } else if (i == 12) {
-                classification[classIndex++] = 4;
-            }
-        }
-        for (int i = 0; i < 13; i++) {
-            if (cardRanks[i] == 1 && i != highCard) {
-                classification[classIndex++] = cardRankBuckets[i];
-                break;
-            } else if (i == 12) {
-                classification[classIndex++] = 4;
-            }
-        }
-
         highPairRank = 13;
-        highCard = 0;
+        int highCard = 0;
         for (int i = 0; i < 13; i++) {
             if (cardRanks[i] > 1) {
                 highPairRank = i;
@@ -243,17 +222,44 @@ struct BoardClusterer {
                 classification[classIndex++] = 0;
             }
         }
+
+        highCardRank = 13;
+        highCard = 0;
+        for (int i = 0; i < 13; i++) {
+            if (cardRanks[i] == 1) {
+                highCardRank = i;
+                highCard = i;
+                classification[classIndex++] = cardRankBuckets[i];
+                break;
+            } else if (i == 12) {
+                classification[classIndex++] = 4;
+            }
+        }
+        
+        if (classification[4] == 0) {
+            for (int i = 0; i < 13; i++) {
+                if (cardRanks[i] == 1 && i != highCard) {
+                    classification[classIndex++] = cardRankBuckets[i];
+                    break;
+                } else if (i == 12) {
+                    classification[classIndex++] = 4;
+                }
+            }
+        } else {
+            classification[classIndex++] = 4;
+        }
+        
         uint32_t key = 0;
         key = 4 * key + street;
         key = 5 * key + classification[0];
         key = 4 * key + classification[1];
         key = 9 * key + classification[2];
-        key = 5 * key + classification[3];
-        key = 5 * key + classification[4];
+        key = 4 * key + classification[3];
+        key = 4 * key + classification[4];
         key = 4 * key + classification[5];
         key = 4 * key + classification[6];
-        key = 4 * key + classification[7];
-        key = 4 * key + classification[8];
+        key = 5 * key + classification[7];
+        key = 5 * key + classification[8];
         return key + 1;
     }    
 };

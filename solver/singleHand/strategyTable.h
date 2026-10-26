@@ -10,32 +10,62 @@ inline void cpuRelax() {
 #endif
 }
 
-// One stored option (call, the two raises and all in) of a node. Fold's return is the
-// exact 0, so it has none. Every field is a 64 bit word and none is ever reset.
-//   weight    double, the value the policy reads
-//   mean      double, the Welford mean of the option's return, as a share of the pot
-//             after calling
-//   variance  double, the Welford variance of that return, in pots squared
-//   visits    the Welford weight so far, fixed point: 48 bits whole, 16 bits fraction
-// visits is bumped first, and its new total sets the mean and variance steps. Each
-// field is its own atomic, so updates racing on one option can leave the three a
-// sample out of step with each other.
-struct OptionStats {
-    std::atomic<uint64_t> weight;
-    std::atomic<uint64_t> mean;
-    std::atomic<uint64_t> variance;
-    std::atomic<uint64_t> visits;
-};
-
-// legal is the legal-option mask in its low 8 bits, set at insert before publish.
+// stats: bits 0-4 the legal options, bit 7 seeded from the base, bits 8-63 visits.
+// variances: option j's 16-bit variance code in bits 16 (j - 1) to 16 (j - 1) + 15.
+// weights: options 1..4 as doubles; fold's is the exact 0.
 struct Entry {
     std::atomic<uint64_t> key;
-    std::atomic<uint64_t> legal;
-    std::array<OptionStats, 4> options;
+    std::atomic<uint64_t> stats;
+    std::atomic<uint64_t> variances;
+    std::array<std::atomic<uint64_t>, 4> weights;
 };
-static_assert(sizeof(Entry) == 144, "Entry must stay packed at 144 bytes");
+static_assert(sizeof(Entry) == 56, "Entry must stay packed at 56 bytes");
 
 inline constexpr double VISITS_ONE = 65536.0;
+inline constexpr int VISITS_SHIFT = 8;
+inline constexpr uint64_t LEGAL_MASK = 0x1F;
+inline constexpr uint64_t SEEDED_BIT = 0x80;
+
+// A variance code is 3072 per octave of variance from VARIANCE_MIN, so 65536 codes span
+// 21.3 octaves: [0.25, 6.7e5) pots squared at VARIANCE_MIN = 0.25. A variance below the
+// floor is stored as the floor, which is all the step reads. A return is at most
+// PLAYER_COUNT * CHIP_COUNT over the smallest pot after calling, 4 chips, so its variance
+// is at most that squared. Strategy files carry the codes, so VARIANCE_MIN and these must
+// match between a run and the base it reads.
+inline constexpr double VARIANCE_CODE_FLOOR = VARIANCE_MIN;
+inline constexpr double VARIANCE_CODES_PER_OCTAVE = 3072.0;
+static_assert(VARIANCE_CODE_FLOOR * double(1ULL << int(65535 / VARIANCE_CODES_PER_OCTAVE))
+    >= (PLAYER_COUNT * CHIP_COUNT / 4.0) * (PLAYER_COUNT * CHIP_COUNT / 4.0),
+    "the largest variance code is below the largest variance a return can have");
+
+inline const std::vector<double> varianceCodes = [] {
+    std::vector<double> values(65536);
+    for (int code = 0; code < 65536; code++) {
+        values[code] = VARIANCE_CODE_FLOOR * std::exp2(double(code) / VARIANCE_CODES_PER_OCTAVE);
+    }
+    return values;
+}();
+
+// Option slot o (option o + 1) of a packed variances word.
+inline double decodeVariance(uint64_t packed, int o) {
+    return varianceCodes[packed >> (16 * o) & 0xFFFF];
+}
+
+// Rounds a variance to one of its two neighbouring codes, the upper with probability
+// equal to how far up the gap between them it lies, so the stored value is unbiased.
+// u is uniform on [0, 1).
+inline uint64_t encodeVariance(double variance, double u) {
+    if (!(variance > VARIANCE_CODE_FLOOR)) {
+        return 0;
+    }
+    const double exact = VARIANCE_CODES_PER_OCTAVE * std::log2(variance / VARIANCE_CODE_FLOOR);
+    if (exact >= 65535.0) {
+        return 65535;
+    }
+    const uint64_t low = uint64_t(exact);
+    const double below = varianceCodes[low];
+    return low + (u * (varianceCodes[low + 1] - below) < variance - below);
+}
 
 inline double loadDouble(const std::atomic<uint64_t>& word) {
     return std::bit_cast<double>(word.load(std::memory_order_relaxed));
@@ -46,20 +76,24 @@ inline void storeDouble(std::atomic<uint64_t>& word, double value) {
 }
 
 inline uint8_t entryLegal(const Entry& entry) {
-    return uint8_t(entry.legal.load(std::memory_order_relaxed));
+    return uint8_t(entry.stats.load(std::memory_order_relaxed) & LEGAL_MASK);
 }
 
-inline double optionVisits(const OptionStats& option) {
-    return double(option.visits.load(std::memory_order_relaxed)) / VISITS_ONE;
+inline bool entrySeeded(const Entry& entry) {
+    return entry.stats.load(std::memory_order_relaxed) & SEEDED_BIT;
 }
 
-// The node's whole visits: its options' together. Fold choices are not counted.
+inline uint64_t entryVisitUnits(const Entry& entry) {
+    return entry.stats.load(std::memory_order_relaxed) >> VISITS_SHIFT;
+}
+
 inline uint64_t entryVisits(const Entry& entry) {
-    uint64_t total = 0;
-    for (const OptionStats& option : entry.options) {
-        total += option.visits.load(std::memory_order_relaxed);
-    }
-    return total >> 16;
+    return entryVisitUnits(entry) >> 16;
+}
+
+inline uint64_t addVisits(Entry& entry, uint64_t add) {
+    return (entry.stats.fetch_add(add << VISITS_SHIFT, std::memory_order_relaxed)
+        >> VISITS_SHIFT) + add;
 }
 
 struct StrategyTable {
@@ -92,8 +126,6 @@ struct StrategyTable {
 
     uint64_t count() const { return used.load(std::memory_order_relaxed); }
 
-    // Pulls the key's home slot word toward the cache ahead of locate(), so a batch
-    // of lookups overlaps its misses instead of taking them one at a time.
     void prefetch(uint64_t key) const {
         __builtin_prefetch(&slots[mix64(key) >> (64 - STRATEGY_CAP_LOG2)]);
     }
@@ -147,19 +179,14 @@ struct StrategyTable {
 
     static void copyRecord(Entry& dst, const Entry& src) {
         dst.key.store(src.key.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        dst.legal.store(src.legal.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dst.stats.store(src.stats.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dst.variances.store(src.variances.load(std::memory_order_relaxed), std::memory_order_relaxed);
         for (int j = 0; j < 4; j++) {
-            const OptionStats& from = src.options[j];
-            OptionStats& to = dst.options[j];
-            to.weight.store(from.weight.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            to.mean.store(from.mean.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            to.variance.store(from.variance.load(std::memory_order_relaxed),
+            dst.weights[j].store(src.weights[j].load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
-            to.visits.store(from.visits.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
     }
 
-    // Drops every node with fewer than VISITS_FLOOR visits and rebuilds the slots.
     uint64_t compact() {
         uint64_t n = used.load(std::memory_order_relaxed);
         uint64_t kept = 0;

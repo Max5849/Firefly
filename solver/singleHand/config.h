@@ -1,35 +1,28 @@
 #pragma once
-//use chip ev
-//fix temp scaling
-//ignore personal decision on update
-//use entropy for decisisons
+//shift to odds floor
 #include "solver/include/library.h"
-
 #include <cmath>
 
-constexpr int PLAYER_COUNT = 3;
+constexpr int PLAYER_COUNT = 7;
 constexpr float CHIP_COUNT = 400.0;
 constexpr bool METAS_BASIC = true;
 constexpr bool MEMORY_BASIC = true;
+constexpr bool USE_BASE = false;
 constexpr bool BASE_METAS_BASIC = true;
 constexpr bool BASE_MEMORY_BASIC = true;
-constexpr bool USE_BASE = false;
-// An option survives the base prune when it would still be drawn at least once in
-// BASE_CONFIDENCE at INV_TEMP.
 constexpr double BASE_CONFIDENCE = 16.0;
-constexpr uint64_t EPOCHS = uint64_t(2) * 131072000;
-constexpr double INV_TEMP = 8 * 0.69314718056;
-constexpr double SAMPLE_INV_TEMP = 0.0;
-constexpr double LEARNING_RATE = 1.0 / 246.0;
+
+constexpr uint64_t EPOCHS = uint64_t(4) * 131072000;
+// The policy's temperature, per pot: every seat plays P(j) ∝ exp(INV_TEMP * w_j), and an
+// opponent's option is drawn from it, so external sampling needs no reweighting.
+constexpr double INV_TEMP = 20 * 0.69314718056;
+// (E / z)^2: an option's weight is the running mean of its returns until its node has
+// variance / LEARNING_RATE visits, the sample size that puts it within E pots at
+// confidence z, then an EMA that holds that margin.
+constexpr double LEARNING_RATE = 1.0 / 1537.0;
 // A node with fewer visits at the end of the run is not saved.
-constexpr double VISITS_FLOOR = 5.0;
-// The first WARMUP_HANDS build each option's mean, variance and visits without moving
-// its weight.
-constexpr uint64_t WARMUP_HANDS = EPOCHS / 20;
-// The least variance of pot-relative return, in pots squared, the step reads for an
-// option, so an option with only a few samples, whose variance can read near 0, cannot
-// take a near-full step.
-constexpr double VARIANCE_MIN = 1.0;
+constexpr double VISITS_FLOOR = 0.0;
+
 
 // Prints every decision that reaches TRACE_KEY, and its update. The key is on the
 // current layout: action state in bits 0-41, meta state in bits 42-63.
@@ -39,13 +32,14 @@ constexpr uint64_t TRACE_KEY = 0xfc0012000021;
 // counted across all threads. 1 prints them all.
 constexpr uint64_t TRACE_EVERY = 10000;
 
-// A strategy_<spec>.bin record: uint64 key, float weights[4] for options 1..4, and
-// uint32 visits. Weights are doubles only while the run holds them; every file the
-// solver writes or reads carries floats.
-constexpr uint64_t STRATEGY_RECORD_BYTES = 28;
+// A strategy_<spec>.bin record: uint64 key, float weights[4] for options 1..4, uint32
+// visits, and uint64 variances, the four 16-bit codes packed as in Entry::variances.
+// Weights are doubles only while the run holds them; every file the solver writes or
+// reads carries floats.
+constexpr uint64_t STRATEGY_RECORD_BYTES = 36;
 constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
 
-constexpr uint64_t STRATEGY_CAP_LOG2 = 27;
+constexpr uint64_t STRATEGY_CAP_LOG2 = 28;
 constexpr double MAX_LOAD = 0.95;
 // The base table carries no fingerprint array, so a miss walks the whole cluster and
 // touches a 24 byte record at every step. Half the load is worth twice the slots.
@@ -57,6 +51,10 @@ constexpr uint64_t PRINT_CHUNKS = 1ULL << 8;
 // Clamp on INV_TEMP * w before exp, so a runaway weight cannot turn the option total
 // into inf or zero.
 inline constexpr double MAX_EXP_ARG = 700.0;
+// The least variance of pot-relative return, in pots squared, the step reads for an
+// option, so an option with only a few samples, whose variance can read near 0, cannot
+// take a near-full step.
+constexpr double VARIANCE_MIN = 0.25;
 
 // Every two card holding. For cards i < j the combo index is
 // i * (101 - i) / 2 + j - 1, the addressing used throughout handAnalysis.

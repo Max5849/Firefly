@@ -38,15 +38,11 @@ looks up the acting seat's nodes in the strategy and narrows the range with
 node with **no record drops the combos that reach it**, and the response counts
 those drops (`spot.replayDrops`).
 
-**Every policy here is a softmax over true EV.** A record's weights are each option's
-EV in chips, relative to folding, as the singleHand trainer stores them. The server
-uses them as stored and takes `P(j) ∝ exp(invTemp × w_j)`, both at each past decision
-and at the spot. At ln 2, an option one chip better is played twice as often.
-`RANGE_FLOOR` is the compiled one.
-
-**Every file is read as chips.** The multiHand trainer stores shares of the pot after
-calling instead, under the same `strategy_<spec>.bin` names, so its files are served
-with wrong EVs, frequencies and ranges.
+**Weights are pot-relative.** Both trainers store each option's return as a share of
+the pot after calling, relative to folding. Every policy here is `P(j) ∝ exp(invTemp ×
+w_j)` over those shares, both at each past decision and at the spot, so `invTemp` is per
+pot. The default is ln(2^20), solver/singleHand's `INV_TEMP`.
+`RANGE_FLOOR` is the compiled one. EVs are reported in chips: `weight × potAfterCall`.
 
 ## Building
 
@@ -100,7 +96,7 @@ records. `build/indexBuilder` does the same ahead of time:
 | `config` | Which strategy to read. Each field is optional and defaults to `config.h`. `players` is 3–7. `chips` must be a positive even integer, because the spec `10000·players + 10·chips + 10·metasBasic + memoryBasic` is ambiguous for odd stacks. |
 | `actions` | Option indices in order: 0 fold, 1 call/check, 2 raise to half pot, 3 raise to one and a half pot, 4 all in. Empty means the first preflop decision (seat `3 % players`). |
 | `board` | `"As7h2d"`, `"As 7h 2d"` or `"As,7h,2d"`. It must hold exactly the cards for the street the actions reach: 0, 3, 4 or 5. |
-| `invTemp` | Optional inverse temperature **per chip of EV**, from ln(2^(1/64)) ≈ 0.0108 to ln(2^4) ≈ 2.773. Defaults to ln 2. It sets **both** the policy each past decision narrows its range with and the policy shown at the spot, so ranges, frequencies, EV and the range mix all belong to one temperature. Echoed as `spot.invTemp`. |
+| `invTemp` | Optional inverse temperature **per pot**, from ln(2^5) ≈ 3.466 to ln(2^80) ≈ 55.45. Defaults to ln(2^20), solver/singleHand's `INV_TEMP`. It sets **both** the policy each past decision narrows its range with and the policy shown at the spot, so ranges, frequencies, EV and the range mix all belong to one temperature. Echoed as `spot.invTemp`. |
 | `include` | Optional. Leaving it out means all three sections. When present, only the sections set to `true` are returned. |
 
 An unknown field or section is a 400 that names it.
@@ -177,12 +173,16 @@ digits, but not stored in the key), and the exact `spr` and `cpr`.
 - **`reach`** is the acting seat's: the product of its own policy along the line,
   after `RANGE_FLOOR`. It is 0 for a combo the line has ruled out, which still
   carries its strategy.
-- **`weights`** are the record's four values for options 1–4: chip EV relative to
-  folding, which is exactly 0. An illegal option is `null`.
-- **`frequencies`** is the softmax of `invTemp × evOptions` over the legal options,
+- **`weights`** are the record's four values for options 1–4: returns as a share of
+  the pot after calling, relative to folding, which is exactly 0. An illegal option is
+  `null`.
+- **`variances`** are the record's variance of each of those returns, in pots
+  squared, decoded from its 16-bit codes and floored at 0.25. An illegal option is
+  `null`.
+- **`frequencies`** is the softmax of `invTemp × weights` over the legal options,
   fold first.
-- **`evOptions`** gives each option's value in **chips relative to folding**, which
-  is the weight itself (fold is 0). `ev` is the policy-weighted mean.
+- **`evOptions`** gives each option's value in **chips relative to folding**:
+  `weight × potAfterCall`. `ev` is the policy-weighted mean.
 - **`visits`** is the record's count, from the cooldown block and reach-weighted.
   It is shared by every combo in the cluster, and `clusterCombos` is how many valid
   combos share it.
@@ -214,7 +214,7 @@ Every error body has a machine-readable `code` and an `error` message:
 - the limits
 - the `available` strategies, decoded from `solver/strategies/strategy_*.bin`
 - seat names per player count
-- the default `invTemp` and `invTempRange` (per chip), `RANGE_FLOOR`, the blinds, the
+- the default `invTemp` and `invTempRange` (per pot), `RANGE_FLOOR`, the blinds, the
   option names and the card encoding
 
 `/health` lists the specs opened so far and their record counts.
@@ -270,7 +270,8 @@ repository root:
 
 - `solver/handAnalysis/boardClasses.bin`, `boardClassesBasic.bin`,
   `handMetas.bin` and `handMetasBasic.bin`
-- every `solver/strategies/strategy_<spec>.bin` to serve (8 + 28 bytes per record)
+- every `solver/strategies/strategy_<spec>.bin` to serve (8 + 36 bytes per record: key, four float weights, uint32 visits, uint64 packed
+  variance codes - solver/singleHand's format; multiHand's 28 byte files are rejected)
 
 **Not** `handScores.bin` (535 MB). Only `setRewards()` reads it, and the API never
 reaches a showdown, so `ServerTables::load()` skips it.

@@ -4,11 +4,6 @@
 #include "solver/singleHand/baseTable.h"
 #include "solver/singleHand/trace.h"
 
-// The step's 1 / variance for an option: its Welford variance, no lower than VARIANCE_MIN.
-static inline double inverseVariance(const OptionStats& option) {
-    return 1.0 / std::max(loadDouble(option.variance), VARIANCE_MIN);
-}
-
 // Applies w <- scale * w + shift atomically. An EMA step w <- w + s (t - w) is the map
 // with scale 1 - s and shift s * t.
 static inline std::pair<double, double> affineUpdate(std::atomic<uint64_t>& word,
@@ -24,33 +19,34 @@ static inline std::pair<double, double> affineUpdate(std::atomic<uint64_t>& word
     return {value, std::bit_cast<double>(next)};
 }
 
-// One decision of the hand: the acting seat's hand looked up its one node.
-struct Decision {
-    Entry* entry;
-    int seat;
-    int option;
-    float chips;
-    float pot;
-    // The seat's ratio just before the decision: the expected weight of the touch given
-    // the hand reached it.
-    double ratio;
-    // The chosen option's INV_TEMP probability over its sampled probability.
-    double own;
-    // exp(-H) of the node's INV_TEMP policy: 1 when one option is certain, 1 / n when n
-    // are equally likely.
-    double certainty;
-};
+// Applies v <- scale[o] * v + shift[o] to each legal option's variance in one CAS,
+// rounding each back to a code with its uniform u[o]. Returns the word written.
+static inline uint64_t affineUpdateVariances(std::atomic<uint64_t>& word, uint8_t legal,
+        const std::array<double, 4>& scale, const std::array<double, 4>& shift,
+        const std::array<double, 4>& u) {
+    uint64_t old = word.load(std::memory_order_relaxed);
+    uint64_t next;
+    do {
+        next = old;
+        for (int o = 0; o < 4; o++) {
+            if (!(legal & (2u << o))) {
+                continue;
+            }
+            const uint64_t code = encodeVariance(scale[o] * decodeVariance(old, o) + shift[o], u[o]);
+            next = (next & ~(0xFFFFULL << (16 * o))) | code << (16 * o);
+        }
+    } while (!word.compare_exchange_weak(old, next,
+        std::memory_order_relaxed, std::memory_order_relaxed));
+    return next;
+}
 
 struct Worker {
     Engine engine;
     std::mt19937 gen;
     std::uniform_real_distribution<double> unit{0.0, 1.0};
-    std::vector<Decision> decisions;
     std::vector<TraceNode> tracePath;
 
-    explicit Worker(unsigned t) : gen(15 + t) {
-        decisions.reserve(64);
-    }
+    explicit Worker(unsigned t) : gen(15 + t) {}
 };
 
 struct Explorer {
@@ -75,7 +71,7 @@ struct Explorer {
         lastReportTime(std::chrono::steady_clock::now()) {}
 
     // Finds the node for one key, inserting it if new. Visits are not counted here: they
-    // are counted at the end of the hand, weighted by the ratio.
+    // are counted at the traverser's decisions, weighted by its reach.
     Entry& locateNode(Engine& engine, uint64_t key, const std::array<bool, 5>& options) {
         bool inserted = false;
         uint64_t slotIndex = 0;
@@ -116,124 +112,74 @@ struct Explorer {
                     }
                 }
             }
+            // A seeded node starts from the base's weights and variances, and its options
+            // skip the running mean.
             for (int j = 0; j < 4; j++) {
-                OptionStats& option = weights.options[j];
-                storeDouble(option.weight, base != nullptr ? double(base->weights[j]) : 0.0);
-                storeDouble(option.mean, 0.0);
-                storeDouble(option.variance, 0.0);
-                option.visits.store(0, std::memory_order_relaxed);
+                storeDouble(weights.weights[j], base != nullptr ? double(base->weights[j]) : 0.0);
             }
-            weights.legal.store(legal, std::memory_order_relaxed);
+            weights.variances.store(base != nullptr ? base->variances : 0, std::memory_order_relaxed);
+            weights.stats.store(legal | (base != nullptr ? SEEDED_BIT : 0), std::memory_order_relaxed);
             strategy.publish(slotIndex, word);
         }
         return weights;
     }
 
-    // The node's policy at INV_TEMP, and its sampling policy at SAMPLE_TEMP, over its
-    // legal options. Fold's weight is the exact 0, so it draws exp(0) = 1 in both.
-    static void nodePolicy(const Entry& weights, std::array<double, 5>& probabilities,
-            std::array<double, 5>& sampling) {
+    // The node's policy at INV_TEMP over its legal options. Fold's weight is the exact 0,
+    // so it draws exp(0) = 1.
+    static void nodePolicy(const Entry& weights, std::array<double, 5>& probabilities) {
         const uint8_t legal = entryLegal(weights);
         double sum = 0;
-        double sampleSum = 0;
         for (int j = 0; j < 5; j++) {
             double draw = 0;
-            double sampleDraw = 0;
             if (legal & (1u << j)) {
-                double w = j == 0 ? 0.0 : loadDouble(weights.options[j - 1].weight);
+                const double w = j == 0 ? 0.0 : loadDouble(weights.weights[j - 1]);
                 draw = std::exp(std::clamp(INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
-                sampleDraw = std::exp(std::clamp(SAMPLE_INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
             }
             probabilities[j] = draw;
             sum += draw;
-            sampling[j] = sampleDraw;
-            sampleSum += sampleDraw;
         }
         for (int j = 0; j < 5; j++) {
             probabilities[j] /= sum;
-            sampling[j] /= sampleSum;
         }
     }
 
-    // Draws the acting seat's action from its node's sampling policy.
-    //
-    // Every seat still in the hand, the acting one included, multiplies its ratio by the
-    // option's INV_TEMP probability over its sampled probability, so its weights count
-    // the line at the frequency the policy really plays it rather than the softer one it
-    // was drawn at. This is the range trainer's reach / odds for a range of one combo.
-    int chooseOption(Worker& worker) {
-        Engine& engine = worker.engine;
-        const int seat = engine.getAction();
-        // setActionState() wrote spr and cpr, which getOptions() reads.
-        const std::array<bool, 5> options = engine.getOptions();
-        const uint64_t key = engine.getActionState(MEMORY_BASIC)
-            | engine.getMetaState(METAS_BASIC) << 42;
-        Entry& weights = locateNode(engine, key, options);
-        std::array<double, 5> policy;
-        std::array<double, 5> sampling;
-        nodePolicy(weights, policy, sampling);
-
-        double running = 0;
-        std::array<double, 5> dividers;
-        for (int j = 0; j < 5; j++) {
-            running += sampling[j];
-            dividers[j] = running;
-        }
+    int drawOption(Worker& worker, const std::array<double, 5>& policy) {
+        double sample = worker.unit(worker.gen);
         int option = 0;
-        double sample = worker.unit(worker.gen) * running;
-        for (int j = 0; j < 5; j++) {
-            if (sample < dividers[j] && sampling[j] > 0) {
-                option = j;
-                break;
-            }
-        }
-
-        double negativeEntropy = 0;
         for (int j = 0; j < 5; j++) {
             if (policy[j] > 0) {
-                negativeEntropy += policy[j] * std::log(policy[j]);
-            }
-        }
-        const double ratio = policy[option] / sampling[option];
-        const int decisionIndex = int(worker.decisions.size());
-        worker.decisions.push_back({&weights, seat, option, engine.getChips(),
-            engine.getPot(), engine.getRatio(seat), ratio,
-            std::exp(negativeEntropy)});
-        for (int other = 0; other < PLAYER_COUNT; other++) {
-            if (engine.players[other].inHand) {
-                engine.getRatio(other) *= ratio;
-            }
-        }
-
-        if constexpr (TRACE_KEY_ENABLED) {
-            if (key == TRACE_KEY) {
-                TraceNode node{};
-                node.key = key;
-                node.decision = decisionIndex;
-                node.combo = engine.getHoleCombo(seat);
-                node.action = seat;
-                node.option = option;
-                node.legal = entryLegal(weights);
-                for (int j = 0; j < 4; j++) {
-                    const OptionStats& stats = weights.options[j];
-                    node.visits[j] = optionVisits(stats);
-                    node.means[j] = loadDouble(stats.mean);
-                    node.variances[j] = loadDouble(stats.variance);
+                option = j;
+                if (sample < policy[j]) {
+                    break;
                 }
-                node.ratio = worker.decisions.back().ratio;
-                node.certainty = worker.decisions.back().certainty;
-                for (int j = 0; j < 4; j++) {
-                    node.weights[j] = loadDouble(weights.options[j].weight);
-                }
-                node.probabilities = policy;
-                node.sampled = sampling;
-                node.chips = worker.decisions.back().chips;
-                node.pot = worker.decisions.back().pot;
-                node.updated = false;
-                worker.tracePath.push_back(node);
+                sample -= policy[j];
             }
         }
         return option;
+    }
+
+    static void setActionStates(Engine& engine) {
+        if (!MEMORY_BASIC || (USE_BASE && !BASE_MEMORY_BASIC)) {
+            engine.setActionState(false);
+        }
+        if (MEMORY_BASIC || (USE_BASE && BASE_MEMORY_BASIC)) {
+            engine.setActionState(true);
+        }
+    }
+
+    // Plays option and runs the hand on to its next decision. False when the hand is over
+    // and its pot has been paid out.
+    static bool advance(Engine& engine, int option) {
+        if (engine.play(option)) {
+            return true;
+        }
+        if (!engine.beginNewRound()) {
+            engine.showdown();
+            return false;
+        }
+        engine.setMetaState(!METAS_BASIC || (USE_BASE && !BASE_METAS_BASIC),
+            METAS_BASIC || (USE_BASE && BASE_METAS_BASIC));
+        return true;
     }
 
     void printTrace(Worker& worker) {
@@ -252,116 +198,141 @@ struct Explorer {
         std::cout << out.str() << std::flush;
     }
 
-    // Walked backward, each seat keeps a running product of the later decisions' ratios,
-    // by any seat, up to and including its own fold: after the fold nothing changes its
-    // return.
-    //
-    // The ratio of a decision is the one before it times the later decisions' own
-    // ratios, leaving out its own: the option's mean is its return given it was chosen.
-    // Every other decision reweights the line from SAMPLE_INV_TEMP to INV_TEMP.
-    //
-    // The chosen option takes one weighted Welford step of its pot-relative return, with the
-    // ratio as the weight, in 1/65536 visit units with stochastic rounding. If that
-    // rounds to nothing, nothing moves.
-    //
-    // Past warmup the weight then takes an EMA step toward the return times the hand's
-    // certainty, the product over every decision in it, so every node of the hand takes
-    // the same factor: a hand whose play stays undecided pulls its weights short of their
-    // returns, and only reaches them as that play firms up. The step is scaled by the
-    // same ratio, so neither its INV_TEMP nor its sampled probability shrinks or grows
-    // it, and by 1 / variance of the option's return, read before this sample. The Welford
-    // mean and variance take the raw return: they describe the return itself.
-    void updateWeights(Worker& worker, bool moveWeights) {
-        Engine& engine = worker.engine;
-        const std::array<float, PLAYER_COUNT> rewards = engine.getRewards();
-        double certainty = 1.0;
-        for (const Decision& decision : worker.decisions) {
-            certainty *= decision.certainty;
+    double traverse(Worker& worker, Engine& engine, int traverser, double reach) {
+        while (true) {
+            setActionStates(engine);
+            // setActionState() wrote spr and cpr, which getOptions() reads.
+            const std::array<bool, 5> options = engine.getOptions();
+            const uint64_t key = engine.getActionState(MEMORY_BASIC)
+                | engine.getMetaState(METAS_BASIC) << 42;
+            Entry& weights = locateNode(engine, key, options);
+            std::array<double, 5> policy;
+            nodePolicy(weights, policy);
+            if (engine.getAction() == traverser) {
+                return explore(worker, engine, traverser, reach, weights, key, policy);
+            }
+            if (!advance(engine, drawOption(worker, policy))) {
+                return engine.players[traverser].chips;
+            }
         }
-        std::array<double, PLAYER_COUNT> onwardRatio;
-        onwardRatio.fill(1.0);
-        for (size_t d = worker.decisions.size(); d-- > 0; ) {
-            const Decision& decision = worker.decisions[d];
-            if (decision.option == 0) {
-                onwardRatio[decision.seat] = 1.0;
-            }
-            const double ratio = decision.ratio * onwardRatio[decision.seat];
-            for (int seat = 0; seat < PLAYER_COUNT; seat++) {
-                onwardRatio[seat] *= decision.own;
-            }
-            if (decision.option == 0 || !(ratio > 0.0)) {
+    }
+
+    double explore(Worker& worker, Engine& engine, int traverser, double reach,
+            Entry& weights, uint64_t key, const std::array<double, 5>& policy) {
+        const uint8_t legal = entryLegal(weights);
+        const float chips = engine.getChips();
+        const float pot = engine.getPot();
+        std::array<double, 5> ends;
+        ends.fill(chips);
+        double value = 0;
+        for (int j = 0; j < 5; j++) {
+            if (!(legal & (1u << j))) {
                 continue;
             }
-            OptionStats& option = decision.entry->options[decision.option - 1];
+            if (j > 0) {
+                Engine branch = engine;
+                ends[j] = advance(branch, j)
+                    ? traverse(worker, branch, traverser, reach * policy[j])
+                    : branch.players[traverser].chips;
+            }
+            value += policy[j] * ends[j];
+        }
+
+        // The visit's weight is the traverser's reach, stochastically rounded to
+        // 1 / VISITS_ONE, and it is the only weight the update uses: the visits, the
+        // running mean's share and the EMA's step all read it.
+        const double mass = VISITS_ONE * reach;
+        uint64_t add = uint64_t(mass);
+        add += worker.unit(worker.gen) < mass - double(add);
+        if (add == 0) {
+            return value;
+        }
+        const double touch = double(add) / VISITS_ONE;
+        const double share = double(add) / double(addVisits(weights, add));
+        const bool seeded = entrySeeded(weights);
+        const uint64_t packed = weights.variances.load(std::memory_order_relaxed);
+
+        TraceNode* node = nullptr;
+        if constexpr (TRACE_KEY_ENABLED) {
+            if (key == TRACE_KEY) {
+                node = &worker.tracePath.emplace_back();
+                node->key = key;
+                node->combo = engine.getHoleCombo(traverser);
+                node->seat = traverser;
+                node->legal = legal;
+                node->seeded = seeded;
+                node->visits = double(entryVisitUnits(weights)) / VISITS_ONE;
+                node->share = share;
+                for (int o = 0; o < 4; o++) {
+                    node->variances[o] = decodeVariance(packed, o);
+                }
+                node->reach = reach;
+                node->probabilities = policy;
+                node->chips = chips;
+                node->pot = pot;
+                node->value = (value - chips) / pot;
+            }
+        }
+
+        // Each option's step is the running mean's share until that is smaller than the
+        // EMA's, which is when the node's visits reach variance / LEARNING_RATE. A seeded
+        // option starts on the EMA. The variance is centred on the weight and takes the
+        // same step: v <- (1 - a) (v + a d^2), with d the return's gap to the weight
+        // before the step, which is weighted Welford while a is the share.
+        std::array<double, 4> scale;
+        std::array<double, 4> shift;
+        std::array<double, 4> u;
+        scale.fill(1.0);
+        shift.fill(0.0);
+        for (int j = 1; j < 5; j++) {
+            if (!(legal & (1u << j))) {
+                continue;
+            }
+            const int o = j - 1;
             // The return from the decision on, as a share of the pot after calling.
-            const double target = (rewards[decision.seat] - decision.chips) / decision.pot;
-            const double inverse = inverseVariance(option);
-            const double mass = VISITS_ONE * ratio;
-            uint64_t add = uint64_t(mass);
-            add += worker.unit(worker.gen) < mass - double(add);
-            if (add == 0) {
-                continue;
-            }
-            const uint64_t visits = option.visits.fetch_add(add, std::memory_order_relaxed) + add;
-            const double share = double(add) / double(visits);
-            auto [meanBefore, meanAfter] = affineUpdate(option.mean, 1.0 - share, share * target);
-            affineUpdate(option.variance, 1.0 - share,
-                share * (target - meanBefore) * (target - meanAfter));
-            if (!moveWeights) {
-                continue;
-            }
+            const double target = (ends[j] - chips) / pot;
+            const double variance = std::max(decodeVariance(packed, o), VARIANCE_MIN);
             // A touch of weight w is w unit steps: it keeps exp(-rate * w).
-            const double s = -std::expm1(-LEARNING_RATE * inverse * ratio);
-            const double weightTarget = certainty * target;
-            auto [before, after] = affineUpdate(option.weight, 1.0 - s, s * weightTarget);
+            const double ema = -std::expm1(-LEARNING_RATE * touch / variance);
+            const double step = seeded ? ema : std::max(share, ema);
+            auto [before, after] = affineUpdate(weights.weights[o], 1.0 - step, step * target);
+            const double gap = target - before;
+            scale[o] = 1.0 - step;
+            shift[o] = (1.0 - step) * step * gap * gap;
+            u[o] = worker.unit(worker.gen);
             if constexpr (TRACE_KEY_ENABLED) {
-                for (TraceNode& node : worker.tracePath) {
-                    if (node.decision != int(d)) {
-                        continue;
-                    }
-                    node.updated = true;
-                    node.stepRatio = ratio;
-                    node.onward = certainty;
-                    node.inverseVariance = inverse;
-                    node.step = s;
-                    node.target = target;
-                    node.weightTarget = weightTarget;
-                    node.before = before;
-                    node.after = after;
+                if (node != nullptr) {
+                    node->running[o] = step == share && !seeded;
+                    node->step[o] = step;
+                    node->target[o] = target;
+                    node->before[o] = before;
+                    node->after[o] = after;
                 }
             }
         }
+        const uint64_t written = affineUpdateVariances(weights.variances, legal, scale, shift, u);
         if constexpr (TRACE_KEY_ENABLED) {
-            for (TraceNode& node : worker.tracePath) {
-                node.finalRatio = engine.getRatio(node.action);
+            if (node != nullptr) {
+                node->updated = true;
+                for (int o = 0; o < 4; o++) {
+                    node->variancesAfter[o] = decodeVariance(written, o);
+                }
             }
-            printTrace(worker);
         }
-        worker.decisions.clear();
+        return value;
     }
 
-    void playHand(Worker& worker, bool moveWeights) {
+    void playHand(Worker& worker) {
         Engine& engine = worker.engine;
         engine.shuffle(worker.gen);
         engine.deal();
-        worker.decisions.clear();
-        while (true) {
-            do {
-                if (!MEMORY_BASIC || (USE_BASE && !BASE_MEMORY_BASIC)) {
-                    engine.setActionState(false);
-                }
-                if (MEMORY_BASIC || (USE_BASE && BASE_MEMORY_BASIC)) {
-                    engine.setActionState(true);
-                }
-            } while (engine.play(chooseOption(worker)));
-            if (!engine.beginNewRound()) {
-                engine.showdown();
-                break;
-            }
-            engine.setMetaState(!METAS_BASIC || (USE_BASE && !BASE_METAS_BASIC),
-                METAS_BASIC || (USE_BASE && BASE_METAS_BASIC));
+        for (int traverser = 0; traverser < PLAYER_COUNT; traverser++) {
+            Engine hand = engine;
+            traverse(worker, hand, traverser, 1.0);
         }
-        updateWeights(worker, moveWeights);
+        if constexpr (TRACE_KEY_ENABLED) {
+            printTrace(worker);
+        }
     }
 
     void runTraining(Worker& worker) {
@@ -374,7 +345,7 @@ struct Explorer {
             const uint64_t base = chunk * CHUNK_HANDS;
             uint64_t hands = std::min(CHUNK_HANDS, EPOCHS - base);
             for (uint64_t j = 0; j < hands; j++) {
-                playHand(worker, base + j >= WARMUP_HANDS);
+                playHand(worker);
                 // Counted per hand, not per chunk, so a report's rate is not quantised to chunks.
                 totalHands.fetch_add(1, std::memory_order_relaxed);
             }
@@ -394,8 +365,7 @@ struct Explorer {
             doneChunks.load(std::memory_order_relaxed) * CHUNK_HANDS, EPOCHS);
         std::ostringstream out;
         out << std::fixed << std::setprecision(3);
-        out << (played <= WARMUP_HANDS ? "Warm up: " : "Training: ")
-            << 100.0 * double(played) / double(EPOCHS) << "% Complete\n";
+        out << "Training: " << 100.0 * double(played) / double(EPOCHS) << "% Complete\n";
         out << "Strategy Size: " << strategy.count() << "\n";
         // The rate covers only the hands finished since the last report.
         const uint64_t hands = totalHands.load(std::memory_order_relaxed);
@@ -432,8 +402,6 @@ struct Explorer {
         std::cout << "Pruned " << pruned << " nodes under " << VISITS_FLOOR << " visits" << std::endl;
     }
 
-    // The trailing s marks a single hand strategy, keeping it apart from the range
-    // trainer's file at the same spec.
     static std::string spec(bool metasBasic, bool memoryBasic) {
         return std::to_string((int)(10000 * PLAYER_COUNT + 10 * CHIP_COUNT
             + 10 * metasBasic + 1 * memoryBasic));
@@ -460,9 +428,11 @@ struct Explorer {
             for (uint64_t i = 0; i < take; i++) {
                 uint64_t key;
                 std::array<float, 4> weights;
+                uint64_t variances;
                 std::memcpy(&key, cursor, sizeof(key));
                 std::memcpy(weights.data(), cursor + 8, sizeof(weights));
-                strategyBase.insert(key, weights);
+                std::memcpy(&variances, cursor + 28, sizeof(variances));
+                strategyBase.insert(key, weights, variances);
                 cursor += STRATEGY_RECORD_BYTES;
             }
             done += take;
@@ -482,13 +452,15 @@ struct Explorer {
             Entry& weights = strategy.dense[i];
             std::array<float, 4> out;
             for (int j = 0; j < 4; j++) {
-                out[j] = float(loadDouble(weights.options[j].weight));
+                out[j] = float(loadDouble(weights.weights[j]));
             }
             uint32_t visits = uint32_t(std::min<uint64_t>(entryVisits(weights), UINT32_MAX));
             uint64_t key = weights.key.load(std::memory_order_relaxed);
+            uint64_t variances = weights.variances.load(std::memory_order_relaxed);
             writeFile.write(&key, sizeof(key));
             writeFile.write(&out, sizeof(out));
             writeFile.write(&visits, sizeof(visits));
+            writeFile.write(&variances, sizeof(variances));
         }
         writeFile.commit();
     }
@@ -525,11 +497,8 @@ int main () {
                   << "BASE_CONFIDENCE: " << BASE_CONFIDENCE << "\n"
                   << "EPOCHS: " << EPOCHS << "\n"
                   << "INV_TEMP: " << INV_TEMP << "\n"
-                  << "SAMPLE_INV_TEMP: " << SAMPLE_INV_TEMP << "\n"
                   << "LEARNING_RATE: " << LEARNING_RATE << "\n"
-                  << "VISITS_FLOOR: " << VISITS_FLOOR << "\n"
-                  << "WARMUP_HANDS: " << WARMUP_HANDS << "\n"
-                  << "VARIANCE_MIN: " << VARIANCE_MIN << std::endl;
+                  << "VISITS_FLOOR: " << VISITS_FLOOR << std::endl;
 
         Engine::loadTables();
 

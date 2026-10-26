@@ -59,10 +59,11 @@ Changing the config starts a new hand.
 
 ## Temperature
 
-`temp` in the header sets the inverse temperature **per chip of EV**, ln(2^k) for k
-from 1/64 to 4. Each step multiplies k by 2^(1/8), and `[` and `]` step it. Every policy
-is a softmax over each option's EV in chips, so at ln(2^k) an option one chip better is
-played 2^k times as often, whatever the pot. The default is k = 1.
+`temp` in the header sets the inverse temperature **per pot**, ln(2^k) for k one of 5,
+10, 20, 40 and 80, picked by button; `[` and `]` step through them. Every policy is a
+softmax over each option's return as a share of the pot, so at ln(2^k) an option worth
+one pot more is played 2^k times as often. The default is k = 20, training's
+`INV_TEMP`.
 
 It changes the whole page at once: the policy each earlier decision narrowed its range
 with, and the policy shown now. Changing it re-asks for the current node, and undo or
