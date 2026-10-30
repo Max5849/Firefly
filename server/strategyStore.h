@@ -13,34 +13,37 @@
 #include <string>
 
 // A record as strategy_<spec>.bin stores it: the state key, the option 1..4
-// expected values, the visit count, and the four options' variance codes. There is no
-// weight for option 0, because folding's pot normalised return is analytically
-// exactly zero.
+// expected values, and the four options' variance codes. There is no weight for
+// option 0, because folding's pot normalised return is analytically exactly zero.
+// The file holds no visits and no legal options; legality is recomputed.
 //
-// The solver holds the weights as doubles while it trains and narrows them to
-// float on the way out, so the file is float and nothing here needs more.
+// The file carries each weight as a 16-bit code of 1/256 pot steps (solver/singleHand's
+// encodeWeight); readRecord decodes it. Every code is exact as a float.
 //
-// The file packs these at RECORD_BYTES with no padding, so records after the first
-// are not 8 byte aligned. Never point a StrategyRecord* into the mapping; copy the
-// fields out with memcpy.
+// The file packs these at RECORD_BYTES with no padding. Never point a StrategyRecord*
+// into the mapping; copy the fields out with memcpy.
 struct StrategyRecord {
     uint64_t key;
     std::array<float, 4> weights;
-    uint32_t visits;
     // Option j's 16-bit variance code in bits 16 (j - 1) to 16 (j - 1) + 15, as
     // solver/singleHand/strategyTable.h packs Entry::variances.
     uint64_t variances;
 };
 
-// solver/singleHand's record layout (its STRATEGY_RECORD_BYTES). solver/multiHand's
-// config.h, which the server includes for the game rules, still names its own 28 byte
-// layout, so the server keeps its own copy. STRATEGY_HEADER_BYTES is 8 in both.
-inline constexpr uint64_t RECORD_BYTES = 36;
+// solver/singleHand's record layout (its STRATEGY_RECORD_BYTES): uint64 key, int16
+// weights[4], uint64 variances. solver/multiHand's config.h, which the server includes
+// for the game rules, still names its own 28 byte layout, so the server keeps its own
+// copy. STRATEGY_HEADER_BYTES is 8 in both.
+inline constexpr uint64_t RECORD_BYTES = 24;
+
+// solver/singleHand/strategyTable.h's weight code: code / WEIGHT_CODES_PER_POT pots.
+inline constexpr double WEIGHT_CODES_PER_POT = 256.0;
 
 // solver/singleHand/strategyTable.h's variance code: VARIANCE_CODE_FLOOR times 2 to the
 // code over VARIANCE_CODES_PER_OCTAVE, in pots squared. Code 0 is the floor and
-// everything below it. singleHand's config.h cannot be included beside multiHand's, so
-// these are copies and must move with it.
+// everything below it. The scale is fixed, independent of the trainer's VARIANCE_MIN.
+// singleHand's headers cannot be included beside multiHand's, so these are copies and
+// must move with strategyTable.h.
 inline constexpr double VARIANCE_CODE_FLOOR = 0.25;
 inline constexpr double VARIANCE_CODES_PER_OCTAVE = 3072.0;
 
@@ -105,10 +108,10 @@ inline std::string indexPathFor(const std::string& strategyPath) {
     return path + ".idx";
 }
 
-// Validates strategy_<spec>.bin against the current 36 byte record format and
-// returns its record count. multiHand's 28 byte layout, the 44 byte double one, the
-// pre-visits 40 byte one and the legacy 56/64 byte ones all decode into plausible looking nonsense rather
-// than failing, so this check is the only thing standing between a stale file and
+// Validates strategy_<spec>.bin against the current 24 byte record format and
+// returns its record count. The 36 byte float one, multiHand's 28 byte one, the 44 byte
+// double one and the legacy 40/56/64 byte ones all decode into plausible looking
+// nonsense rather than failing, so this check is the only thing standing between a stale file and
 // silently wrong answers.
 inline uint64_t strategyRecordCount(const std::string& path) {
     uint64_t bytes = fileSize(path);
@@ -224,9 +227,12 @@ struct StrategyStore {
         const uint8_t* cursor = strategyMap.data + STRATEGY_HEADER_BYTES
             + index * RECORD_BYTES;
         std::memcpy(&out.key, cursor, sizeof(out.key));
-        std::memcpy(out.weights.data(), cursor + 8, sizeof(float) * 4);
-        std::memcpy(&out.visits, cursor + 24, sizeof(out.visits));
-        std::memcpy(&out.variances, cursor + 28, sizeof(out.variances));
+        std::array<int16_t, 4> codes;
+        std::memcpy(codes.data(), cursor + 8, sizeof(codes));
+        for (int j = 0; j < 4; j++) {
+            out.weights[j] = float(double(codes[j]) / WEIGHT_CODES_PER_POT);
+        }
+        std::memcpy(&out.variances, cursor + 16, sizeof(out.variances));
     }
 
     // The 32 bit tag in the slot resolves almost every miss without touching the

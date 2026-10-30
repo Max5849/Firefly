@@ -2,7 +2,7 @@ import type { HandState, LedgerLine } from '../hand/useHand';
 import { OPTION_COLORS, OPTION_KEYS } from '../hand/seats';
 import { CardRow } from './Card';
 import { Keycap } from './Keycap';
-import { formatChips, formatVisits } from './format';
+import { formatChips } from './format';
 
 function Spec({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -112,7 +112,7 @@ function ActingBlock({ state }: { state: Props }) {
 }
 
 export function ActionColumn(state: Props) {
-  const { frame, pending, mode, ledger, seatNames, error, loading, totalVisits } = state;
+  const { frame, pending, mode, ledger, seatNames, error, loading } = state;
   const game = mode === 'ended' ? null : frame?.response.game;
 
   const board = pending ? pending.board : (frame?.response.game?.board ?? '');
@@ -139,7 +139,6 @@ export function ActionColumn(state: Props) {
           )}
         </Spec>
         <Spec label="players">{game ? `${game.heads} of ${game.seats.length}` : '—'}</Spec>
-        <Spec label="visits">{totalVisits !== null ? formatVisits(totalVisits) : '—'}</Spec>
       </div>
 
       <Seats state={state} />

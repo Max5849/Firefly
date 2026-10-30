@@ -7,7 +7,7 @@ a board, it returns three things at the node that sequence reaches:
   turn it is, what they may do and for how much, and the hand so far.
 - **`key`**: the acting seat's state key, decoded field by field from its own bits.
 - **`spot`**: for all 1326 hole card combinations, the actions, the acting seat's
-  range (reach), the EV in chips, and the visits.
+  range (reach), the EV in chips, and each option's return variance.
 
 ## Why it replays
 
@@ -155,15 +155,16 @@ digits, but not stored in the key), and the exact `spr` and `cpr`.
 
 ```json
 { "legal": [...], "potAfterCall": 13.5,
-  "totalVisits": 2081228, "records": 27, "found": 1142, "missing": 34, "invalid": 150,
+  "records": 27, "found": 1142, "missing": 34, "invalid": 150,
   "rangeCombos": 1110, "rangeWeight": 95.69, "rangeMix": [0, 0.84, 0.078, 0.081, 0],
   "rangeEv": 0.14, "emptySeats": [], "replayDrops": {"decisions": 0, "groups": 0, "combos": 0},
   "combos": [null, {"combo": "KcQd", "reach": 0.3345, "cluster": 8, "key": "0x200af40018001521",
                     "found": true, "clusterCombos": 41,
-                    "weights": [-0.627, -1.194, -1.736, null],
+                    "weights": [-0.627, -1.195, -1.737, null],
+                    "variances": [null, 2.41, 6.87, null],
                     "frequencies": [0, 0.957, 0.041, 0.002, 0],
-                    "evOptions": [null, -8.47, -16.12, -23.44, null], "ev": -8.81,
-                    "visits": 185510}, ...] }
+                    "evOptions": [null, -8.47, -16.12, -23.44, null], "ev": -8.81},
+         ...] }
 ```
 
 - **Rows** are in hole-pair index order, `i * (101 - i) / 2 + j - 1` for cards
@@ -174,20 +175,18 @@ digits, but not stored in the key), and the exact `spr` and `cpr`.
   after `RANGE_FLOOR`. It is 0 for a combo the line has ruled out, which still
   carries its strategy.
 - **`weights`** are the record's four values for options 1–4: returns as a share of
-  the pot after calling, relative to folding, which is exactly 0. An illegal option is
-  `null`.
+  the pot after calling, relative to folding, which is exactly 0, stored to 1/256 of a
+  pot and clamped to [-128, 127.996]. An illegal option is `null`.
 - **`variances`** are the record's variance of each of those returns, in pots
-  squared, decoded from its 16-bit codes and floored at 0.25. An illegal option is
+  squared, decoded from its 16-bit codes and floored at 0.25. The code scale is fixed, so it
+  does not depend on the `VARIANCE_MIN` a run trained with. An illegal option is
   `null`.
 - **`frequencies`** is the softmax of `invTemp × weights` over the legal options,
   fold first.
 - **`evOptions`** gives each option's value in **chips relative to folding**:
   `weight × potAfterCall`. `ev` is the policy-weighted mean.
-- **`visits`** is the record's count, from the cooldown block and reach-weighted.
-  It is shared by every combo in the cluster, and `clusterCombos` is how many valid
-  combos share it.
-- **`totalVisits`** sums the distinct records the acting range reaches (combos
-  with reach > 0).
+- **`clusterCombos`** is how many valid combos share the row's record. Files carry
+  no visit counts.
 - **`rangeMix`** and **`rangeEv`** are reach-weighted over the combos that have a
   record.
 - **`emptySeats`** lists seats whose range the line has emptied. Training drops
@@ -270,8 +269,8 @@ repository root:
 
 - `solver/handAnalysis/boardClasses.bin`, `boardClassesBasic.bin`,
   `handMetas.bin` and `handMetasBasic.bin`
-- every `solver/strategies/strategy_<spec>.bin` to serve (8 + 36 bytes per record: key, four float weights, uint32 visits, uint64 packed
-  variance codes - solver/singleHand's format; multiHand's 28 byte files are rejected)
+- every `solver/strategies/strategy_<spec>.bin` to serve (8 + 24 bytes per record: uint64 key, int16 weights[4] in 1/256 pot steps, uint64 packed
+  variance codes - solver/singleHand's format; any other record size is rejected)
 
 **Not** `handScores.bin` (535 MB). Only `setRewards()` reads it, and the API never
 reaches a showdown, so `ServerTables::load()` skips it.

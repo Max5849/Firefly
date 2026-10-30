@@ -10,8 +10,8 @@ The page has three columns:
   it has folded or is all in, the hand so far, and the acting seat's options with
   their sizes. All of it comes from the server's `game` section.
 - **centre — the grid.** Every combination's action mix, filled to its reach.
-- **right — the spot and the key.** The range's visits, size, action mix and EV;
-  the hovered combination's reach, frequency and EV per option, visits and key;
+- **right — the spot and the key.** The range's records, size, action mix and EV;
+  the hovered combination's reach, frequency and EV per option, cluster size and key;
   and the acting seat's state key, bit by bit, with each field decoded.
 
 ```
@@ -90,20 +90,14 @@ both hold three spades, and the ace outranks the five. The order changes with th
 board, which is the point: it is the board that decides what "suited" is worth.
 
 **Eliminated combinations are black and shift to the right**, so the live columns stay
-together on the left. Three separate things eliminate a column, and the grid does
+together on the left. Two separate things eliminate a column, and the grid does
 not distinguish them:
 
 - the combination uses a board card;
-- the strategy has no record of that node;
-- the hand cluster is too thin to read — its visit count, divided by the number of
-  combinations in the cluster, is under 5% of the largest such figure at this node.
+- the strategy has no record of that node.
 
-That last one is normalised deliberately. A cluster covering 255 holdings would
-otherwise always outrank one covering 12 on raw counts alone.
-
-`VISITS` is the node total: the sum over the *distinct* records the acting range
-reaches, not the sum of per-combination figures, which would multiply each cluster
-by its size. EVs are in chips relative to folding.
+Strategy files carry no visit counts, so there is no thin-cluster cut. EVs are in
+chips relative to folding.
 
 ## Street changes
 

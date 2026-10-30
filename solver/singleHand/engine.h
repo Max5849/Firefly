@@ -238,6 +238,11 @@ struct Engine {
     }
 
     void setActionState(bool memoryBasic) {
+        //exact positions
+        //allow limping pre
+        //expand calling from 2 to 4
+        //simplify clusters by prioritizing whatever is best
+        //ignore elements when others take over
         Player& player = players[action];
         Player& villan = players[player.villanPosition];
         uint64_t state = 0;
@@ -384,8 +389,7 @@ struct Engine {
                     options[2] = true;
                 }
             }
-            if (raiseHistory[0] == 0 || player.raisesFaced > 2 || player.calls > 1
-                || (calls > 1 && (raiseHistory[0] > 1 || round != 0))) {
+            if (raiseHistory[0] == 0 || player.raisesFaced > 2 || player.calls > 1 || calls > 1) {
                 options[1] = false;
             }
         }

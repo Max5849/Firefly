@@ -58,13 +58,12 @@ export default function App() {
       ) : null}
       <div className="flex min-h-0 flex-1">
         <ActionColumn {...hand} />
-        <RangeGrid response={response} black={hand.black} onHover={setHovered} />
+        <RangeGrid response={response} onHover={setHovered} />
         <SpotColumn
           game={response?.game ?? null}
           spot={response?.spot ?? null}
           keySection={response?.key ?? null}
           hovered={hovered}
-          black={hand.black}
         />
       </div>
     </div>

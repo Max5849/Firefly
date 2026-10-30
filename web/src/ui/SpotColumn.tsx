@@ -1,7 +1,7 @@
 import type { GameSection, KeyField, KeySection, SpotSection } from '../api/types';
 import { COMBO_CARDS, comboName } from '../grid/comboIndex';
 import { OPTION_COLORS } from '../hand/seats';
-import { formatEv, formatShare, formatVisits } from './format';
+import { formatEv, formatShare } from './format';
 
 function Heading({ children, aside }: { children: React.ReactNode; aside?: React.ReactNode }) {
   return (
@@ -44,9 +44,7 @@ function SpotSummary({ spot, game }: { spot: SpotSection; game: GameSection }) {
   return (
     <section className="border-b px-4 py-3" style={{ borderColor: 'var(--color-rule)' }}>
       <Heading aside={`${game.actor.name} to act`}>spot</Heading>
-      <Row label="visits">
-        {formatVisits(spot.totalVisits)} · {spot.records} records
-      </Row>
+      <Row label="records">{spot.records}</Row>
       <Row label="range">
         {spot.rangeCombos} combos · weight {spot.rangeWeight.toFixed(1)}
       </Row>
@@ -84,11 +82,10 @@ function SpotSummary({ spot, game }: { spot: SpotSection; game: GameSection }) {
 }
 
 /** Everything known about the combination under the cursor. */
-function HoverReadout({ hovered, spot, game, black }: {
+function HoverReadout({ hovered, spot, game }: {
   hovered: number | null;
   spot: SpotSection;
   game: GameSection;
-  black: Set<number>;
 }) {
   if (hovered === null) {
     return (
@@ -116,11 +113,7 @@ function HoverReadout({ hovered, spot, game, black }: {
           {row.found ? (
             <>
               <Row label="ev">{formatEv(row.ev ?? 0)} chips</Row>
-              <Row label="visits">
-                {formatVisits(row.visits ?? 0)} / {row.clusterCombos} ={' '}
-                {formatVisits((row.visits ?? 0) / Math.max(1, row.clusterCombos))}
-              </Row>
-              {black.has(hovered) ? <Row label="status">cluster too thin - black</Row> : null}
+              <Row label="cluster">{row.clusterCombos} combos</Row>
               <div className="mt-1.5 grid grid-cols-[1fr_4rem_4.5rem] gap-x-2 text-[11px]">
                 <span style={{ color: 'var(--color-ash)' }}>option</span>
                 <span className="text-right" style={{ color: 'var(--color-ash)' }}>freq</span>
@@ -235,13 +228,11 @@ export function SpotColumn({
   spot,
   keySection,
   hovered,
-  black,
 }: {
   game: GameSection | null;
   spot: SpotSection | null;
   keySection: KeySection | null;
   hovered: number | null;
-  black: Set<number>;
 }) {
   return (
     <aside
@@ -251,7 +242,7 @@ export function SpotColumn({
       {game && spot ? (
         <>
           <SpotSummary spot={spot} game={game} />
-          <HoverReadout hovered={hovered} spot={spot} game={game} black={black} />
+          <HoverReadout hovered={hovered} spot={spot} game={game} />
         </>
       ) : null}
       {game && keySection ? <KeyPanel keySection={keySection} game={game} /> : null}

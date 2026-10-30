@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, getMeta, postStrategy } from '../api/client';
 import type { ApiFailure } from '../api/client';
 import type { Config, MetaResponse, StrategyResponse } from '../api/types';
-import { metaStats } from '../grid/metas';
 import { cardCount, optionFromKey, rankFromKey, suitFromKey } from './keys';
 
 /** One settled node: the action list that reached it and the answer it gave. */
@@ -57,10 +56,6 @@ export interface HandState {
   seatNames: string[];
   /** Total bet each option would produce, indexed by option. */
   sizes: (number | null)[];
-  /** Combinations whose cluster is too thin to read at this node. */
-  black: Set<number>;
-  /** Visits summed over the distinct records the acting range reaches. */
-  totalVisits: number | null;
   /**
    * The inverse temperature, per pot, is ln(2^TEMP_EXPONENTS[tempStep]). The page
    * asks for every node at it.
@@ -389,7 +384,6 @@ export function useHand(): HandState & {
     [mode, pending, top, config, reset, undo, play, commitBoard, tempStep, setTempStep],
   );
 
-  const stats = useMemo(() => metaStats(top?.response.spot), [top]);
   const players = top?.response.game?.config.players ?? config?.players ?? 0;
   const seatNames = meta?.seats[String(players)] ?? [];
   const live = mode !== 'ended' ? top : null;
@@ -412,8 +406,6 @@ export function useHand(): HandState & {
       null,
       null,
     ],
-    black: stats?.black ?? new Set<number>(),
-    totalVisits: live?.response.spot?.totalVisits ?? null,
     tempStep,
     setTempStep,
     handleKey,

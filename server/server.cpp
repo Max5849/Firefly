@@ -9,7 +9,7 @@
 //                             "memoryBasic": true},
 //                  "actions": [2, 1], "board": "As7h2d"}
 //   -> the table (game), the acting seat's key decoded (key), and the strategy, range,
-//      EV and visits of all 1326 hole card combinations at that node (spot).
+//      EV and variances of all 1326 hole card combinations at that node (spot).
 // GET  /health
 // GET  /meta
 
@@ -447,7 +447,6 @@ void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops) 
     writeLegal(w, spot.legal);
     w.field("invTemp", spot.invTemp);
     w.field("potAfterCall", spot.potAfterCall);
-    w.field("totalVisits", int64_t(spot.totalVisits));
     w.field("records", spot.records);
     w.field("found", spot.found);
     w.field("missing", spot.missing);
@@ -529,7 +528,6 @@ void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops) 
             }
             w.endArray();
             w.field("ev", row.ev);
-            w.field("visits", int64_t(row.visits));
         }
         w.endObject();
     }

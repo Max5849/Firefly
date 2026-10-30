@@ -3,6 +3,7 @@
 #include "solver/singleHand/strategyTable.h"
 #include "solver/singleHand/baseTable.h"
 #include "solver/singleHand/trace.h"
+#include <numbers>
 
 // Applies w <- scale * w + shift atomically. An EMA step w <- w + s (t - w) is the map
 // with scale 1 - s and shift s * t.
@@ -40,11 +41,22 @@ static inline uint64_t affineUpdateVariances(std::atomic<uint64_t>& word, uint8_
     return next;
 }
 
+// LEARNING_RATE until COOLDOWN_START of the run, then a half cosine down to 0 at its end.
+static inline double learningRate(double progress) {
+    if (progress <= COOLDOWN_START) {
+        return LEARNING_RATE;
+    }
+    const double cooled = std::min((progress - COOLDOWN_START) / (1.0 - COOLDOWN_START), 1.0);
+    return LEARNING_RATE * 0.5 * (1.0 + std::cos(std::numbers::pi * cooled));
+}
+
 struct Worker {
     Engine engine;
     std::mt19937 gen;
     std::uniform_real_distribution<double> unit{0.0, 1.0};
     std::vector<TraceNode> tracePath;
+    // The learning rate for the hand being played.
+    double learningRate = LEARNING_RATE;
 
     explicit Worker(unsigned t) : gen(15 + t) {}
 };
@@ -99,7 +111,7 @@ struct Explorer {
                 for (int j = 1; j < 5; j++) {
                     if (options[j]) {
                         draw[j] = std::exp(std::clamp(
-                            INV_TEMP * double(base->weights[j - 1]),
+                            INV_TEMP * decodeWeight(base->weights[j - 1]),
                             -MAX_EXP_ARG, MAX_EXP_ARG));
                     }
                 }
@@ -115,7 +127,7 @@ struct Explorer {
             // A seeded node starts from the base's weights and variances, and its options
             // skip the running mean.
             for (int j = 0; j < 4; j++) {
-                storeDouble(weights.weights[j], base != nullptr ? double(base->weights[j]) : 0.0);
+                storeDouble(weights.weights[j], base != nullptr ? decodeWeight(base->weights[j]) : 0.0);
             }
             weights.variances.store(base != nullptr ? base->variances : 0, std::memory_order_relaxed);
             weights.stats.store(legal | (base != nullptr ? SEEDED_BIT : 0), std::memory_order_relaxed);
@@ -275,7 +287,7 @@ struct Explorer {
         }
 
         // Each option's step is the running mean's share until that is smaller than the
-        // EMA's, which is when the node's visits reach variance / LEARNING_RATE. A seeded
+        // EMA's, which is when the node's visits reach variance / the learning rate. A seeded
         // option starts on the EMA. The variance is centred on the weight and takes the
         // same step: v <- (1 - a) (v + a d^2), with d the return's gap to the weight
         // before the step, which is weighted Welford while a is the share.
@@ -293,7 +305,7 @@ struct Explorer {
             const double target = (ends[j] - chips) / pot;
             const double variance = std::max(decodeVariance(packed, o), VARIANCE_MIN);
             // A touch of weight w is w unit steps: it keeps exp(-rate * w).
-            const double ema = -std::expm1(-LEARNING_RATE * touch / variance);
+            const double ema = -std::expm1(-worker.learningRate * touch / variance);
             const double step = seeded ? ema : std::max(share, ema);
             auto [before, after] = affineUpdate(weights.weights[o], 1.0 - step, step * target);
             const double gap = target - before;
@@ -345,6 +357,7 @@ struct Explorer {
             const uint64_t base = chunk * CHUNK_HANDS;
             uint64_t hands = std::min(CHUNK_HANDS, EPOCHS - base);
             for (uint64_t j = 0; j < hands; j++) {
+                worker.learningRate = learningRate(double(base + j) / double(EPOCHS));
                 playHand(worker);
                 // Counted per hand, not per chunk, so a report's rate is not quantised to chunks.
                 totalHands.fetch_add(1, std::memory_order_relaxed);
@@ -427,11 +440,11 @@ struct Explorer {
             const char* cursor = buffer.data();
             for (uint64_t i = 0; i < take; i++) {
                 uint64_t key;
-                std::array<float, 4> weights;
+                std::array<int16_t, 4> weights;
                 uint64_t variances;
                 std::memcpy(&key, cursor, sizeof(key));
                 std::memcpy(weights.data(), cursor + 8, sizeof(weights));
-                std::memcpy(&variances, cursor + 28, sizeof(variances));
+                std::memcpy(&variances, cursor + 16, sizeof(variances));
                 strategyBase.insert(key, weights, variances);
                 cursor += STRATEGY_RECORD_BYTES;
             }
@@ -450,16 +463,14 @@ struct Explorer {
         writeFile.write(&size, sizeof(size));
         for (uint64_t i = 0; i < size; i++) {
             Entry& weights = strategy.dense[i];
-            std::array<float, 4> out;
+            std::array<int16_t, 4> out;
             for (int j = 0; j < 4; j++) {
-                out[j] = float(loadDouble(weights.weights[j]));
+                out[j] = encodeWeight(loadDouble(weights.weights[j]));
             }
-            uint32_t visits = uint32_t(std::min<uint64_t>(entryVisits(weights), UINT32_MAX));
             uint64_t key = weights.key.load(std::memory_order_relaxed);
             uint64_t variances = weights.variances.load(std::memory_order_relaxed);
             writeFile.write(&key, sizeof(key));
             writeFile.write(&out, sizeof(out));
-            writeFile.write(&visits, sizeof(visits));
             writeFile.write(&variances, sizeof(variances));
         }
         writeFile.commit();
@@ -491,13 +502,14 @@ int main () {
                   << "CHIP_COUNT: " << CHIP_COUNT << "\n"
                   << "METAS_BASIC: " << METAS_BASIC << "\n"
                   << "MEMORY_BASIC: " << MEMORY_BASIC << "\n"
+                  << "USE_BASE: " << USE_BASE << "\n"
                   << "BASE_METAS_BASIC: " << BASE_METAS_BASIC << "\n"
                   << "BASE_MEMORY_BASIC: " << BASE_MEMORY_BASIC << "\n"
-                  << "USE_BASE: " << USE_BASE << "\n"
                   << "BASE_CONFIDENCE: " << BASE_CONFIDENCE << "\n"
                   << "EPOCHS: " << EPOCHS << "\n"
                   << "INV_TEMP: " << INV_TEMP << "\n"
                   << "LEARNING_RATE: " << LEARNING_RATE << "\n"
+                  << "COOLDOWN_START: " << COOLDOWN_START << "\n"
                   << "VISITS_FLOOR: " << VISITS_FLOOR << std::endl;
 
         Engine::loadTables();

@@ -23,7 +23,7 @@ struct SpotRow {
     // Option 1..4 values from the record, pot normalised, relative to folding.
     std::array<double, 4> weights = {};
     // Option 1..4 variances of that return from the record, in pots squared, floored at
-    // VARIANCE_CODE_FLOOR.
+    // VARIANCE_CODE_FLOOR, not at the trainer's VARIANCE_MIN.
     std::array<double, 4> variances = {};
     // The policy over the legal options, at the replay's inverse temperature.
     std::array<double, 5> frequencies = {};
@@ -31,9 +31,7 @@ struct SpotRow {
     // and their mean under the policy.
     std::array<double, 5> evOptions = {};
     double ev = 0;
-    // The record's visits (cooldown block, reach weighted), shared by its cluster, and
-    // how many valid combos share it.
-    uint32_t visits = 0;
+    // How many valid combos share the record.
     int clusterCombos = 0;
 };
 
@@ -44,8 +42,6 @@ struct SpotResult {
     double invTemp = DEFAULT_INV_TEMP;
     // The weight denominator: the pot once the actor has called.
     double potAfterCall = 0;
-    // The sum of visits over the distinct records the acting range reaches.
-    uint64_t totalVisits = 0;
     int records = 0;
     int found = 0;
     int missing = 0;
@@ -84,7 +80,6 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
         bool found = false;
         StrategyRecord record;
         int combos = 0;
-        bool reached = false;
     };
     std::array<Group, GROUP_COUNT> groups;
     std::array<uint8_t, COMBO_COUNT> groupOf;
@@ -111,7 +106,6 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
                 group.found = store.lookup(row.key, group.record);
             }
             group.combos++;
-            group.reached |= row.reach > 0.0f;
             row.found = group.found;
             if (!row.found) {
                 out.missing++;
@@ -125,7 +119,6 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
                 values[j] = row.weights[j - 1];
             }
             row.frequencies = policyFromWeights(group.record.weights, out.legal, replay.invTemp);
-            row.visits = group.record.visits;
             row.ev = 0;
             for (int j = 0; j < 5; j++) {
                 row.evOptions[j] = out.legal[j] ? values[j] * out.potAfterCall : 0.0;
@@ -161,9 +154,6 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
     for (const Group& group : groups) {
         if (group.looked && group.found) {
             out.records++;
-            if (group.reached) {
-                out.totalVisits += group.record.visits;
-            }
         }
     }
     for (int seat = 0; seat < P; seat++) {

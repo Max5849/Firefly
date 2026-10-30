@@ -29,16 +29,14 @@ function useSquareSide(): [React.RefObject<HTMLDivElement | null>, number] {
 }
 
 /**
- * Three ways a column carries nothing to read, all drawn black: the combination
- * uses a board card, the solver has no record of its node, or its cluster fell
- * under the 5% visits cut at this node.
+ * Two ways a column carries nothing to read, both drawn black: the combination
+ * uses a board card, or the solver has no record of its node.
  */
-function makeEliminated(combos: SpotCombo[] | null, black: Set<number>) {
+function makeEliminated(combos: SpotCombo[] | null) {
   return (index: number): boolean => {
     if (!combos) return true;
     const row = combos[index];
-    if (!row?.found || !row.frequencies) return true;
-    return black.has(index);
+    return !row?.found || !row.frequencies;
   };
 }
 
@@ -53,12 +51,9 @@ function makeEliminated(combos: SpotCombo[] | null, black: Set<number>) {
  */
 export function RangeGrid({
   response,
-  black,
   onHover,
 }: {
   response: StrategyResponse | null;
-  /** Combinations whose cluster is too thin to read at this node. */
-  black: Set<number>;
   /** The combination under the cursor, or null when it leaves the grid. */
   onHover: (combo: number | null) => void;
 }) {
@@ -99,7 +94,7 @@ export function RangeGrid({
     );
 
     const board = boardSuitCounts(response?.game?.board ?? '');
-    const eliminated = makeEliminated(combos, black);
+    const eliminated = makeEliminated(combos);
 
     context.fillStyle = VOID_HEX;
     context.fillRect(0, 0, pixels, pixels);
@@ -154,7 +149,7 @@ export function RangeGrid({
         }
       }
     }
-  }, [side, response, black, combos]);
+  }, [side, response, combos]);
 
   /**
    * Labels are DOM, not canvas.
@@ -171,7 +166,7 @@ export function RangeGrid({
   const labels = useMemo(() => {
     const { pixels, dpr } = metrics;
     if (pixels <= 0) return [];
-    const eliminated = makeEliminated(combos, black);
+    const eliminated = makeEliminated(combos);
     const bound = (i: number) => Math.round((i * pixels) / 13) / dpr;
 
     return CELLS.map((cell, index) => ({
@@ -182,7 +177,7 @@ export function RangeGrid({
         combos !== null &&
         cell.strips.some((combo) => !eliminated(combo) && (combos[combo]?.reach ?? 0) > 0),
     }));
-  }, [metrics, combos, black]);
+  }, [metrics, combos]);
 
   /**
    * Pixel -> combination. The canvas is a single element, so there is no node

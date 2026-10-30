@@ -204,7 +204,7 @@ stat -c "%s  %n" solver/handAnalysis/*.bin solver/strategies/*.bin
 | `solver/handAnalysis/boardClassesBasic.bin` | 121859400 |
 | `solver/handAnalysis/handMetas.bin` | 27899243 |
 | `solver/handAnalysis/handMetasBasic.bin` | 27899243 |
-| `solver/strategies/strategy_<spec>.bin` | 8 + 28 × records |
+| `solver/strategies/strategy_<spec>.bin` | 8 + 24 × records |
 
 You do not have to be careful here: every one of these files has its exact
 expected size checked at startup, and a wrong size is a clear error on the spot
@@ -858,7 +858,7 @@ API serves.
 | --- | --- | --- |
 | `cannot find -lz` at link time | zlib headers missing | `sudo apt install zlib1g-dev` |
 | `solver/handAnalysis/boardClasses.bin has an unexpected size` | copy truncated or missing | re-run the rsync; compare against the byte table in §5 |
-| `... is not in the 28 byte record format` | strategy file in an old layout, or a partial copy | re-copy `strategy_<spec>.bin` from a run of the current solver |
+| `... is not in the 24 byte record format` | strategy file in an old layout, or a partial copy | re-copy `strategy_<spec>.bin` from a run of the current solver |
 | `strategyUnreadable` from the API | the index could not be rebuilt, or the file is corrupt | check write access to `solver/strategies/`; run `./build/indexBuilder <path>` to see the error |
 | `failed to open ... for reading` | wrong working directory | run from `/opt/firefly`; check `WorkingDirectory` in the unit |
 | Service dies instantly | see the real error | `journalctl -u firefly-api -n 50 --no-pager` |

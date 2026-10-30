@@ -2,7 +2,7 @@
 #include "solver/handAnalysis/handClusterer.h"
 #include "solver/handAnalysis/dealer.h"
 
-bool BASIC = false;
+bool BASIC = true;
 
 struct BoardClusterer {
 
@@ -11,7 +11,6 @@ struct BoardClusterer {
     std::array<int, 14> suitedCardRanks;
 
     std::array<int, 13> cardRankBuckets;
-    int flushSuit;
     std::array<std::array<int, 13>, 13> straightDraws;
     std::array<int, 13> straightOneDraws;
     int highCardRank;
@@ -26,30 +25,29 @@ struct BoardClusterer {
         int classIndex = 0;
         std::fill(cardRanks.begin(), cardRanks.end(), 0);
         std::fill(cardSuits.begin(), cardSuits.end(), 0);
-        flushSuit = -1;
+        int flushState = 0;
+        int flushSuit = 0;
         straightDraws = {0};
         straightOneDraws = {0};
 
         for (int i = 0; i < street + 2; i++) {
             cardRanks[boardCards[i] / 4]++;
             cardSuits[boardCards[i] % 4]++;
-            if (flushSuit == -1) {
-                if (street < 3) {
-                    if (cardSuits[boardCards[i] % 4] == 2) {
-                        flushSuit = boardCards[i] % 4;
-                    }
-                } else {
-                    if (cardSuits[boardCards[i] % 4] == 3) {
-                        flushSuit = boardCards[i] % 4;
-                    }
-                }
-            }
         }
-        if (flushSuit != -1) {
-            classification[classIndex++] = cardSuits[flushSuit] - 1;
-        } else {
-            classification[classIndex++] = 0;
+        for (int i = 0; i < 4; i++) {
+            if (cardSuits[i] == 2) {
+                flushState++;
+            } 
+            if (cardSuits[i] > 2) {
+                flushState = cardSuits[i];
+                flushSuit = i;
+                break;
+            } 
         }
+        if (street == 3 && flushState < 3) {
+            flushState = 0;
+        }
+        classification[classIndex++] = flushState;
 
         int suitedStraightState = 0;
         int suitedStraightOneFillCount = 0;
@@ -88,7 +86,7 @@ struct BoardClusterer {
             }
         }
         if (suitedStraightZeroFillCount < 1) { 
-            if (suitedStraightOneFillCount < 1) {
+            if (suitedStraightOneFillCount < 1 || street == 3) {
                 suitedStraightState = 0;
             } else if (suitedStraightOneFillCount < 2) {
                 suitedStraightState = 1;
@@ -166,35 +164,76 @@ struct BoardClusterer {
             }
         }
 
-        if (straightZeroFillCount < 1) {
-            if (straightOneFillCount < 1) {
-                if (straightFillCount < 1) {
-                    if (straightDrawCount < 2 || street == 3) {
+        if (classification[0] < 3) {
+            if (straightZeroFillCount < 1) {
+                if (straightOneFillCount < 1) {
+                    if (straightFillCount < 1) {
+                        if (straightDrawCount < 2 || street == 3) {
+                            straightState = 0;
+                        } else {
+                            straightState = 1;
+                        }
+                    } else if (straightFillCount < 2) {
+                        if (straightDrawCount < 2 || street == 3) {
+                            straightState = 2;
+                        } else {
+                            straightState = 3;
+                        }
+                    } else if (straightFillCount < 3) {
+                        straightState = 4;
+                    } else {
+                        straightState = 5;
+                    }
+                } else {
+                    if (straightOneFillCount < 2) {
+                        straightState = 6;
+                    } else {
+                        straightState = 7;
+                    }
+                } 
+            } else {
+                straightState = 8;
+            }
+        } else if (classification[0] == 3) {
+            if (straightZeroFillCount < 1) {
+                if (straightOneFillCount < 1) {
+                    if (straightFillCount < 2) {
                         straightState = 0;
                     } else {
-                        straightState = 1;
+                        straightState = 5;
                     }
-                } else if (straightFillCount < 2) {
-                    if (straightDrawCount < 2 || street == 3) {
-                        straightState = 2;
+                } else {
+                    if (straightOneFillCount < 2) {
+                        straightState = 6;
                     } else {
-                        straightState = 3;
+                        straightState = 7;
                     }
-                } else if (straightFillCount < 3) {
-                    straightState = 4;
-                } else {
-                    straightState = 5;
-                }
+                } 
             } else {
-                if (straightOneFillCount < 2) {
-                    straightState = 6;
+                straightState = 8;
+            }
+        } else if (classification[0] == 4) {
+            if (straightZeroFillCount < 1) {
+                if (straightOneFillCount < 1) {
+                    straightState = 0;
                 } else {
-                    straightState = 7;
-                }
-            } 
-        } else {
-            straightState = 8;
+                    if (straightOneFillCount < 2) {
+                        straightState = 6;
+                    } else {
+                        straightState = 7;
+                    }
+                } 
+            } else {
+                straightState = 8;
+            }
+        } else if (classification[0] == 5) {
+            if (straightZeroFillCount < 1) {
+                straightState = 0;
+            } else {
+                straightState = 8;
+            }
         }
+        
         classification[classIndex++] = straightState;
 
         highPairRank = 13;
@@ -225,17 +264,21 @@ struct BoardClusterer {
 
         highCardRank = 13;
         highCard = 0;
-        for (int i = 0; i < 13; i++) {
-            if (cardRanks[i] == 1) {
-                highCardRank = i;
-                highCard = i;
-                classification[classIndex++] = cardRankBuckets[i];
-                break;
-            } else if (i == 12) {
-                classification[classIndex++] = 4;
+        if (classification[6] == 0) {
+            for (int i = 0; i < 13; i++) {
+                if (cardRanks[i] == 1) {
+                    highCardRank = i;
+                    highCard = i;
+                    classification[classIndex++] = cardRankBuckets[i];
+                    break;
+                } else if (i == 12) {
+                    classification[classIndex++] = 4;
+                }
             }
+        } else {
+            classification[classIndex++] = 4;
         }
-        
+
         if (classification[4] == 0) {
             for (int i = 0; i < 13; i++) {
                 if (cardRanks[i] == 1 && i != highCard) {
@@ -248,10 +291,19 @@ struct BoardClusterer {
         } else {
             classification[classIndex++] = 4;
         }
+
+        if (classification[4] == 2 || classification[6] == 2) {
+            if (classification[0] < 4) {
+                classification[0] = 0;
+            }
+            if (classification[2] < 6) {
+                classification[2] = 0;
+            }
+        }
         
         uint32_t key = 0;
         key = 4 * key + street;
-        key = 5 * key + classification[0];
+        key = 6 * key + classification[0];
         key = 4 * key + classification[1];
         key = 9 * key + classification[2];
         key = 4 * key + classification[3];

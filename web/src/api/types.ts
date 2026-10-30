@@ -166,8 +166,6 @@ export interface SpotRow {
   evOptions?: (number | null)[];
   /** The policy-weighted EV in chips relative to folding. */
   ev?: number;
-  /** The record's visits, shared by every combo in its cluster. */
-  visits?: number;
 }
 
 export type SpotCombo = SpotRow | null;
@@ -177,8 +175,6 @@ export interface SpotSection {
   /** The inverse temperature the ranges were replayed and the policy taken at. */
   invTemp: number;
   potAfterCall: number;
-  /** Visits summed over the distinct records the acting range reaches. */
-  totalVisits: number;
   records: number;
   found: number;
   missing: number;

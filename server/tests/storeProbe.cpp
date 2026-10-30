@@ -32,7 +32,10 @@ int main(int argc, char** argv) {
             for (int j = 0; j < 4; j++) {
                 std::cout << " " << record.weights[j];
             }
-            std::cout << " " << record.visits << std::endl;
+            for (int j = 0; j < 4; j++) {
+                std::cout << " " << decodeVariance(record.variances, j);
+            }
+            std::cout << std::endl;
         }
         return 0;
     } catch (const std::exception& e) {

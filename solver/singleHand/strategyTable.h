@@ -26,17 +26,20 @@ inline constexpr int VISITS_SHIFT = 8;
 inline constexpr uint64_t LEGAL_MASK = 0x1F;
 inline constexpr uint64_t SEEDED_BIT = 0x80;
 
-// A variance code is 3072 per octave of variance from VARIANCE_MIN, so 65536 codes span
-// 21.3 octaves: [0.25, 6.7e5) pots squared at VARIANCE_MIN = 0.25. A variance below the
-// floor is stored as the floor, which is all the step reads. A return is at most
-// PLAYER_COUNT * CHIP_COUNT over the smallest pot after calling, 4 chips, so its variance
-// is at most that squared. Strategy files carry the codes, so VARIANCE_MIN and these must
-// match between a run and the base it reads.
-inline constexpr double VARIANCE_CODE_FLOOR = VARIANCE_MIN;
+// A variance code is 3072 per octave of variance from 0.25, so 65536 codes span 21.3
+// octaves: [0.25, 6.7e5) pots squared. The scale is fixed rather than tied to
+// VARIANCE_MIN, so a file reads the same whatever VARIANCE_MIN the run reading it has;
+// the step applies VARIANCE_MIN when it reads a variance. A variance below the floor is
+// stored as the floor. A return is at most PLAYER_COUNT * CHIP_COUNT over the smallest
+// pot after calling, 4 chips, so its variance is at most that squared. Strategy files
+// carry the codes, so these must match between a run, the base it reads and the server.
+inline constexpr double VARIANCE_CODE_FLOOR = 0.25;
 inline constexpr double VARIANCE_CODES_PER_OCTAVE = 3072.0;
 static_assert(VARIANCE_CODE_FLOOR * double(1ULL << int(65535 / VARIANCE_CODES_PER_OCTAVE))
     >= (PLAYER_COUNT * CHIP_COUNT / 4.0) * (PLAYER_COUNT * CHIP_COUNT / 4.0),
     "the largest variance code is below the largest variance a return can have");
+static_assert(VARIANCE_MIN >= VARIANCE_CODE_FLOOR,
+    "VARIANCE_MIN is below the smallest variance a code can record");
 
 inline const std::vector<double> varianceCodes = [] {
     std::vector<double> values(65536);
@@ -65,6 +68,20 @@ inline uint64_t encodeVariance(double variance, double u) {
     const uint64_t low = uint64_t(exact);
     const double below = varianceCodes[low];
     return low + (u * (varianceCodes[low + 1] - below) < variance - below);
+}
+
+// A strategy file's weight, in pots: a 16-bit code of 1/256 pot steps, so it spans
+// [-128, 127.996]. A trained weight outside that is all but unheard of, so it is clamped
+// rather than given more bits.
+inline constexpr double WEIGHT_CODES_PER_POT = 256.0;
+
+inline int16_t encodeWeight(double weight) {
+    return int16_t(std::clamp(std::lround(weight * WEIGHT_CODES_PER_POT),
+        long(INT16_MIN), long(INT16_MAX)));
+}
+
+inline double decodeWeight(int16_t code) {
+    return double(code) / WEIGHT_CODES_PER_POT;
 }
 
 inline double loadDouble(const std::atomic<uint64_t>& word) {

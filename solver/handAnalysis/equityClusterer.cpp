@@ -2,7 +2,7 @@
 #include "solver/handAnalysis/handClusterer.h"
 #include "solver/handAnalysis/dealer.h"
 
-bool BASIC = true;
+bool BASIC = false;
 
 // Showdown histograms keyed by boardClass | handClass << 16, where boardClass is the full
 // class, or the basic class when BASIC is set.
@@ -19,7 +19,7 @@ void computeCdf(const std::array<float, 165>& point, std::array<double, 165>& cd
 double cdfDistance(const std::array<double, 165>& a, const std::array<double, 165>& b) {
     double distance = 0;
     for (int p = 0; p < 165; p++) {
-        distance += (164.5 - p) * (164.5 - p) * std::abs(a[p] - b[p]);
+        distance += (164.5 - p) * std::abs(a[p] - b[p]);
     }
     return distance;
 }
@@ -54,7 +54,7 @@ void mergeDivision(std::vector<std::vector<uint64_t>>& clusterHands, std::vector
         double nb = clusterSizes[begin + j];
         double sa = strengths[i];
         double sb = strengths[j];
-        return na * nb / (na + nb) * std::sqrt(sa * sa + sb * sb) * cdfDistance(cdfs[i], cdfs[j]);
+        return na * nb / (na + nb) * (sa * sa + sb * sb) * cdfDistance(cdfs[i], cdfs[j]);
     };
     auto rescan = [&](int i) {
         nn[i] = -1;
