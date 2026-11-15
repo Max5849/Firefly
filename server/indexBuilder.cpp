@@ -1,12 +1,11 @@
 // Builds the sidecar hash index for a strategy file:
 //
 //   build/indexBuilder [strategy.bin]
-//   build/indexBuilder --players 3 --chips 200 --metas 1 --memory 1
+//   build/indexBuilder --players 7 --chips 400 --ante 2 --metas 1 --memory 0 --tag A
 //
-// With no arguments it indexes the file config.h names. The server builds a missing or
+// With no arguments it indexes the file solver/singleHand/config.h names. The server builds a missing or
 // stale index itself on first use; this does it ahead of time, and checks the result.
 
-#include "solver/multiHand/config.h"
 #include "server/strategyStore.h"
 
 int main(int argc, char** argv) {
@@ -25,10 +24,18 @@ int main(int argc, char** argv) {
                 config.players = std::stoi(next());
             } else if (flag == "--chips") {
                 config.chips = std::stoi(next());
+            } else if (flag == "--ante") {
+                config.ante = std::stoi(next());
             } else if (flag == "--metas") {
-                config.metasBasic = std::stoi(next()) != 0;
+                config.metasStage = std::stoi(next());
             } else if (flag == "--memory") {
-                config.memoryBasic = std::stoi(next()) != 0;
+                config.memoryStage = std::stoi(next());
+            } else if (flag == "--tag") {
+                const std::string tag = next();
+                if (tag.size() != 1 || !validTag(tag[0])) {
+                    throw std::runtime_error("--tag takes a single letter");
+                }
+                config.tag = tag[0];
             } else if (path.empty() && flag.rfind("--", 0) != 0) {
                 path = flag;
             } else {

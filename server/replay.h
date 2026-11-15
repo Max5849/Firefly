@@ -110,16 +110,15 @@ inline std::string actionName(int option, float toCall, int round, int streetRai
 }
 
 // The inverse temperature a request gets when it names none: solver/singleHand's
-// INV_TEMP, ln(2^20), which the strategy files are trained at. (The INV_TEMP in scope
-// is multiHand's.)
-inline const double DEFAULT_INV_TEMP = 20 * std::log(2.0);
+// INV_TEMP, ln(2^20), which the strategy files are trained at.
+inline const double DEFAULT_INV_TEMP = INV_TEMP;
 
 // The policy over the legal options, from a record's four weights, at inverse
 // temperature invTemp per pot.
 //
 // A record's weights are each option's return from the decision on as a share of the
 // pot after calling, relative to folding, whose value is the exact 0 - so fold draws
-// exp(0) = 1. At INV_TEMP this is the softmax the trainers play by.
+// exp(0) = 1. At INV_TEMP this is Explorer::nodePolicy, the softmax self-play draws from.
 inline std::array<double, 5> policyFromWeights(const std::array<float, 4>& weights,
         const std::array<bool, 5>& legal, double invTemp) {
     std::array<double, 5> draws = {};
@@ -162,26 +161,11 @@ std::string illegalReason(const TableEngine<P>& engine, int option) {
     }
 
     if (option == 1) {
-        // The call clauses only apply inside this guard; outside it, calling is
+        // The call clause only applies inside this guard; outside it, calling is
         // always legal.
-        if (!(player.spr >= 0.0005f && raises < 6)) {
-            return "";
-        }
-        // First in source order, matching how the || chain reads.
-        if (engine.raiseHistory[0] == 0) {
-            return "no preflop limping: the pot is unraised, so every seat must "
-                "fold or raise";
-        }
-        if (player.raisesFaced > 2) {
+        if (player.spr >= 0.0005f && raises < 6 && player.raisesFaced > 2) {
             return "you are facing three or more raises since you last acted: fold or "
                 "re-raise, no flat call";
-        }
-        if (player.calls > 1) {
-            return "no third call on the same street";
-        }
-        if (engine.calls > 1 && (engine.raiseHistory[0] > 1 || engine.round != 0)) {
-            return "no third cold-caller in a 3-bet-plus preflop pot or on any "
-                "postflop street";
         }
         return "";
     }
@@ -199,31 +183,33 @@ std::string illegalReason(const TableEngine<P>& engine, int option) {
         }
         return "the sixth raise can only be all-in";
     }
-    if (option == 2 && player.spr < 0.866f) {
+    if (option == 2 && player.spr < 1.5f) {
         return "the stack-to-pot ratio is " + sprText()
-            + ", below the 0.866 needed to raise half pot";
+            + ", below the 1.5 needed to raise half pot";
     }
-    if (option == 3 && player.spr < 2.6f) {
+    if (option == 3 && player.spr < 3.5f) {
         return "the stack-to-pot ratio is " + sprText()
-            + ", below the 2.6 needed to raise one and a half pot";
+            + ", below the 3.5 needed to raise one and a half pot";
     }
-    if (option == 4 && player.spr >= 7.8f) {
+    if (option == 4 && player.spr >= 7.5f) {
         return "the stack-to-pot ratio is " + sprText()
-            + ", at or above the 7.8 beyond which an all-in is not offered";
+            + ", at or above the 7.5 beyond which an all-in is not offered";
     }
     return "";
 }
 
 // One line of the hand as the table saw it.
 struct HistoryEntry {
-    enum Kind { Post, Action, Street };
+    // AutoFold: a seat that had called twice this street folding to a bet, which the
+    // engine plays itself (Engine::autoFold) - it takes no entry in the action list.
+    enum Kind { Post, Action, AutoFold, Street };
     Kind kind = Action;
     int seat = -1;
     int option = -1;
     std::string name;
     int round = 0;
-    // Post and Action: the seat's total in front on the street afterwards, the chips
-    // the action put in, and the stack left.
+    // Post, Action and AutoFold: the seat's total in front on the street afterwards, the
+    // chips the action put in, and the stack left.
     float betTo = 0;
     float adds = 0;
     float stack = 0;
@@ -261,17 +247,20 @@ struct ReplayDrops {
 //
 // The 64 bit state key is the accumulated residue of Engine::play(), so there is no way
 // to construct a node from a snapshot of stacks and pot: replaying is the only route.
-// And a range is the product of its seat's own policy along the line, so every past
-// decision is looked up in the strategy and narrowed exactly as the trainer narrows it
-// (TableEngine::applyPolicy), with each decision's policy a softmax over the stored
-// pot-relative weights at the request's inverse temperature (policyFromWeights); at
-// INV_TEMP these are training's ranges. A node the
-// strategy has no record of drops the combos that reach it.
+// A seat's range is the product of its own policy along the line: every past decision
+// is looked up in the strategy and narrowed by TableEngine::applyPolicy, with each
+// decision's policy a softmax over the stored pot-relative weights at the request's
+// inverse temperature (policyFromWeights) - at INV_TEMP, the policy self-play drew
+// from. A node the strategy has no record of drops the combos that reach it.
+//
+// Forced folds (TableEngine::autoFold) are played as the trainer plays them, with no
+// key and no entry in the action list, so the action list holds decisions only and a
+// replay always stops at a decision.
 template <int P>
 struct Replay {
     TableEngine<P> engine;
     StrategyConfig config;
-    // The inverse temperature per chip every past decision's policy is taken at.
+    // The inverse temperature per pot every past decision's policy is taken at.
     double invTemp = DEFAULT_INV_TEMP;
     // The cards the caller actually supplied. Engine::boardCards also holds placeholders
     // for streets the replay has not reached.
@@ -312,8 +301,9 @@ struct Replay {
     void narrow(const StrategyStore& store, const std::array<bool, 5>& legal, int option) {
         const int seat = engine.action;
         const auto& range = engine.players[seat].range;
-        const uint64_t actionState = engine.getActionState(config.memoryBasic);
-        const auto& meta = engine.getMetaState(config.metasBasic);
+        const uint64_t actionState = engine.getActionState(config.memoryStage);
+        const auto& meta = engine.getMetaState(config.metasStage);
+        const bool calledTwice = engine.players[seat].calls > 1;
         std::array<int8_t, GROUP_COUNT> seen;
         seen.fill(-1);
         groups.fill(NO_GROUP);
@@ -323,11 +313,11 @@ struct Replay {
             if (!engine.commonRange[combo] || !(range[combo] > 0.0f)) {
                 continue;
             }
-            const uint8_t group = engine.getGroup(config.metasBasic, combo);
+            const uint8_t group = engine.getGroup(config.metasStage, combo);
             groups[combo] = group;
             if (seen[group] < 0) {
-                const uint64_t key = actionState | meta[combo] << 42;
-                seen[group] = store.lookup(key, record) ? 1 : 0;
+                const uint64_t key = actionState | meta[combo] << ACTION_STATE_BITS;
+                seen[group] = store.lookup(key, calledTwice, record) ? 1 : 0;
                 if (seen[group] == 1) {
                     policy[group] = policyFromWeights(record.weights, legal, invTemp);
                 } else {
@@ -344,9 +334,77 @@ struct Replay {
         engine.applyPolicy(seat, groups, policy, option);
     }
 
+    // Plays option for the acting seat and records it.
+    bool playAndRecord(int option, HistoryEntry::Kind kind) {
+        const int seat = engine.action;
+        auto& player = engine.players[seat];
+        HistoryEntry entry;
+        entry.kind = kind;
+        entry.seat = seat;
+        entry.option = option;
+        entry.round = engine.round;
+        entry.name = actionName(option, engine.bet - player.bet, engine.round,
+            engine.raiseHistory[engine.round]);
+        entry.betTo = engine.betTo(option);
+        const float stackBefore = player.chips;
+        const bool more = engine.play(option);
+        entry.adds = stackBefore - player.chips;
+        entry.stack = player.chips;
+        history.push_back(entry);
+        return more;
+    }
+
+    // After play() returned false: deals the next street, or reports why the hand has
+    // no next decision. False with result filled on failure.
+    bool nextStreet(const std::vector<int>& boardCards, int actionIndex, ReplayResult& result) {
+        if (!engine.beginNewRound()) {
+            result.code = "handEnded";
+            result.endedBy = engine.heads == 1 ? "fold" : "showdown";
+            result.error = std::string("the hand ended at action ") + std::to_string(actionIndex)
+                + (engine.heads == 1 ? ", when every other seat had folded"
+                    : ", when the betting finished and the board runs out to showdown")
+                + ", so there is no node to query";
+            result.actionIndex = actionIndex;
+            return false;
+        }
+        const int needed = roundBoardCards(engine.round);
+        if (int(boardCards.size()) < needed) {
+            result.code = "needsBoard";
+            result.needRound = engine.round;
+            result.error = std::string("the action list reaches the ")
+                + STREET_NAMES[engine.round] + ", which needs " + std::to_string(needed)
+                + " board cards, but " + std::to_string(boardCards.size()) + " were given";
+            result.actionIndex = actionIndex;
+            return false;
+        }
+        engine.setCommonRange();
+        engine.setMetaState();
+        HistoryEntry street;
+        street.kind = HistoryEntry::Street;
+        street.round = engine.round;
+        street.name = STREET_NAMES[engine.round];
+        street.board = boardToString(std::vector<int>(boardCards.begin(),
+            boardCards.begin() + needed));
+        history.push_back(street);
+        return true;
+    }
+
+    // Plays every forced fold up to the next decision, as Explorer::traverse does.
+    // actionIndex is the action the folds follow (-1 before the first). False with
+    // result filled when they end the hand or reach a street with no board.
+    bool settle(const std::vector<int>& boardCards, int actionIndex, ReplayResult& result) {
+        while (engine.autoFold()) {
+            if (!playAndRecord(0, HistoryEntry::AutoFold)
+                    && !nextStreet(boardCards, actionIndex, result)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Replays the option indices in order. Each is checked against getOptions() before
     // it is played. store == nullptr replays the action state alone and leaves every
-    // range at 1.
+    // range at 1. Throws when the config's metas stage has no tables.
     ReplayResult run(const StrategyConfig& setup, const std::vector<int>& actions,
             const std::vector<int>& boardCards, const StrategyStore* store,
             double temperature = DEFAULT_INV_TEMP) {
@@ -355,7 +413,10 @@ struct Replay {
         invTemp = temperature;
         history.clear();
         drops = {};
+        ServerTables::requireStage(config.metasStage);
+        engine.metasStageMask = 1u << config.metasStage;
         engine.startingChips = float(config.chips);
+        engine.ante = float(config.ante);
         engine.deal(fullBoard(boardCards));
         for (int seat = 1; seat <= 2; seat++) {
             HistoryEntry post;
@@ -379,7 +440,7 @@ struct Replay {
             }
             // setActionState() writes player.spr and player.cpr and getOptions() reads
             // them, so this ordering is load bearing.
-            engine.setActionState(config.memoryBasic);
+            engine.setActionState(config.memoryStage);
             std::array<bool, 5> legal = engine.getOptions();
             if (!legal[option]) {
                 result.code = "illegal";
@@ -394,54 +455,16 @@ struct Replay {
             if (store != nullptr) {
                 narrow(*store, legal, option);
             }
-
-            const int seat = engine.action;
-            auto& player = engine.players[seat];
-            HistoryEntry entry;
-            entry.seat = seat;
-            entry.option = option;
-            entry.round = engine.round;
-            entry.name = actionName(option, engine.bet - player.bet, engine.round,
-                engine.raiseHistory[engine.round]);
-            entry.betTo = engine.betTo(option);
-            const float stackBefore = player.chips;
-            const bool more = engine.play(option);
-            entry.adds = stackBefore - player.chips;
-            entry.stack = player.chips;
-            history.push_back(entry);
-            if (more) {
-                continue;
-            }
-
-            if (!engine.beginNewRound()) {
-                result.code = "handEnded";
-                result.endedBy = engine.heads == 1 ? "fold" : "showdown";
-                result.error = std::string("the hand ended at action ") + std::to_string(i)
-                    + (engine.heads == 1 ? ", when every other seat had folded"
-                        : ", when the betting finished and the board runs out to showdown")
-                    + ", so there is no node to query";
-                result.actionIndex = int(i);
+            if (!playAndRecord(option, HistoryEntry::Action)
+                    && !nextStreet(boardCards, int(i), result)) {
                 return result;
             }
-            const int needed = roundBoardCards(engine.round);
-            if (int(boardCards.size()) < needed) {
-                result.code = "needsBoard";
-                result.needRound = engine.round;
-                result.error = std::string("the action list reaches the ")
-                    + STREET_NAMES[engine.round] + ", which needs " + std::to_string(needed)
-                    + " board cards, but " + std::to_string(boardCards.size()) + " were given";
-                result.actionIndex = int(i);
+            if (!settle(boardCards, int(i), result)) {
                 return result;
             }
-            engine.setCommonRange();
-            engine.setMetaState(!config.metasBasic, config.metasBasic);
-            HistoryEntry street;
-            street.kind = HistoryEntry::Street;
-            street.round = engine.round;
-            street.name = STREET_NAMES[engine.round];
-            street.board = boardToString(std::vector<int>(boardCards.begin(),
-                boardCards.begin() + needed));
-            history.push_back(street);
+        }
+        if (actions.empty() && !settle(boardCards, -1, result)) {
+            return result;
         }
 
         const int expected = roundBoardCards(engine.round);
@@ -454,7 +477,7 @@ struct Replay {
             return result;
         }
 
-        engine.setActionState(config.memoryBasic);
+        engine.setActionState(config.memoryStage);
         result.legal = engine.getOptions();
         result.hasLegal = true;
         result.ok = true;
@@ -466,3 +489,53 @@ struct Replay {
         return std::vector<int>(board.begin(), board.begin() + roundBoardCards(engine.round));
     }
 };
+
+// Which key layout a strategy file uses, read off the opening node. Every hand passes
+// the first decision (seat 3 % P, nothing played), and self-play deals every 169 class
+// there, so a file holds that node for nearly every group in its own layout and for
+// none in another. Runs the config's opening node through TableEngine<P> and counts
+// the groups each layout finds. The config's metas stage must be loadable.
+template <int P>
+KeyFormat detectKeyFormat(const StrategyStore& store, const StrategyConfig& config) {
+    ServerTables::requireStage(config.metasStage);
+    auto engine = std::make_unique<TableEngine<P>>();
+    engine->startingChips = float(config.chips);
+    engine->ante = float(config.ante);
+    engine->metasStageMask = 1u << config.metasStage;
+    engine->deal({0, 1, 2, 3, 4});
+    engine->setActionState(config.memoryStage);
+    const uint64_t actionState = engine->getActionState(config.memoryStage);
+    const auto& meta = engine->getMetaState(config.metasStage);
+    std::array<bool, GROUP_COUNT> seen = {};
+    int current = 0;
+    int bit44 = 0;
+    StrategyRecord record;
+    for (int combo = 0; combo < COMBO_COUNT; combo++) {
+        const uint8_t group = engine->getGroup(config.metasStage, combo);
+        if (seen[group]) {
+            continue;
+        }
+        seen[group] = true;
+        const uint64_t key = actionState | meta[combo] << ACTION_STATE_BITS;
+        uint64_t fileKey;
+        current += fileKeyFor(KeyFormat::Current, key, false, fileKey) && store.lookupFileKey(fileKey, record);
+        bit44 += fileKeyFor(KeyFormat::Bit44, key, false, fileKey) && store.lookupFileKey(fileKey, record);
+    }
+    return bit44 > current ? KeyFormat::Bit44 : KeyFormat::Current;
+}
+
+// detectKeyFormat for the table size a spec names. Current for a spec that does not
+// decode.
+inline KeyFormat detectKeyFormatForSpec(const StrategyStore& store, const std::string& spec) {
+    StrategyConfig config;
+    if (!decodeSpec(spec, config)) {
+        return KeyFormat::Current;
+    }
+    switch (config.players) {
+        case 3: return detectKeyFormat<3>(store, config);
+        case 4: return detectKeyFormat<4>(store, config);
+        case 5: return detectKeyFormat<5>(store, config);
+        case 6: return detectKeyFormat<6>(store, config);
+        default: return detectKeyFormat<7>(store, config);
+    }
+}

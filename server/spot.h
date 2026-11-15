@@ -13,17 +13,18 @@ struct SpotRow {
     // False when the combo uses a revealed board card.
     bool valid = false;
     std::array<int, 2> cards = {0, 0};
-    // The acting seat's reach: the product of its own policy along the line,
-    // after RANGE_FLOOR. 0 for a combo the line has ruled out.
+    // The acting seat's reach: the product of its own policy along the line. 0 for a
+    // combo the line has ruled out (a missing record along the way).
     float reach = 0;
-    // The hand part of the key: the 169 class preflop, the hand cluster postflop.
+    // The hand part of the key: the 169 class (stage C: its preflop cluster) preflop,
+    // the hand cluster postflop.
     int cluster = 0;
     uint64_t key = 0;
     bool found = false;
     // Option 1..4 values from the record, pot normalised, relative to folding.
     std::array<double, 4> weights = {};
-    // Option 1..4 variances of that return from the record, in pots squared, floored at
-    // VARIANCE_CODE_FLOOR, not at the trainer's VARIANCE_MIN.
+    // Option 1..4 variances of that return from the record, in pots squared, clamped to
+    // the code's [VARIANCE_CODE_FLOOR, VARIANCE_CODE_MAX], not floored at VARIANCE_MIN.
     std::array<double, 4> variances = {};
     // The policy over the legal options, at the replay's inverse temperature.
     std::array<double, 5> frequencies = {};
@@ -54,8 +55,8 @@ struct SpotResult {
     // The range's action mix and mean EV, reach weighted over the combos with a record.
     std::array<double, 5> rangeMix = {};
     double rangeEv = 0;
-    // Seats, live or folded, whose range the line has emptied. The trainer drops such
-    // a hand at the next street.
+    // Seats, live or folded, whose range the line has emptied: every combo they could
+    // hold passed a node with no record.
     std::vector<int> emptySeats;
 };
 
@@ -72,8 +73,8 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
     out.invTemp = replay.invTemp;
     out.potAfterCall = double(engine.pot + (engine.bet - actor.bet));
 
-    const uint64_t actionState = config.memoryBasic ? engine.actionStateBasic : engine.actionState;
-    const auto& meta = config.metasBasic ? engine.metaStateBasic : engine.metaState;
+    const uint64_t actionState = engine.getActionState(config.memoryStage);
+    const auto& meta = engine.getMetaState(config.metasStage);
 
     struct Group {
         bool looked = false;
@@ -96,14 +97,14 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
             row.valid = true;
             row.reach = actor.range[combo];
             const uint64_t comboMeta = meta[combo];
-            row.cluster = int(engine.round == 0 ? comboMeta : comboMeta >> 16);
-            row.key = actionState | comboMeta << 42;
+            row.cluster = int(engine.round == 0 ? comboMeta : comboMeta >> BOARD_CLASS_BITS);
+            row.key = actionState | comboMeta << ACTION_STATE_BITS;
             const uint8_t g = uint8_t(row.cluster);
             groupOf[combo] = g;
             Group& group = groups[g];
             if (!group.looked) {
                 group.looked = true;
-                group.found = store.lookup(row.key, group.record);
+                group.found = store.lookup(row.key, actor.calls > 1, group.record);
             }
             group.combos++;
             row.found = group.found;

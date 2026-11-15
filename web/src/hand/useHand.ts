@@ -23,7 +23,7 @@ interface Pending {
 export type Mode = 'acting' | 'boardEntry' | 'ended';
 
 export interface LedgerLine {
-  kind: 'post' | 'action' | 'street' | 'terminal';
+  kind: 'post' | 'action' | 'autoFold' | 'street' | 'terminal';
   seat?: number;
   /** What the table would call it: small blind, check, call, bet, raise, all in. */
   name?: string;
@@ -162,7 +162,7 @@ export function useHand(): HandState & {
         if (cancelled) return;
         // A server from before the game / key / spot contract has no defaults, and
         // every request this page sends would be rejected by it.
-        if (!loaded.defaults) {
+        if (!loaded.defaults || loaded.defaults.metasStage === undefined) {
           setError(
             'the API is an older server build than this page - rebuild and restart build/server from the current source',
           );
@@ -416,7 +416,8 @@ export function useHand(): HandState & {
 
 /**
  * Read from the server's history at the newest node, so undo and jump-to cannot
- * leave a stale line behind. The k-th action produced frame k + 1.
+ * leave a stale line behind. The k-th action produced frame k + 1; an auto fold is not
+ * an action, so it shares the frame of the action before it.
  */
 function buildLedger(frames: Frame[], terminal: LedgerLine | null): LedgerLine[] {
   const top = frames.length > 0 ? frames[frames.length - 1] : null;

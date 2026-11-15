@@ -195,6 +195,22 @@ function renderLine(line: LedgerLine, seatNames: string[], jumpTo: (frame: numbe
     );
   }
 
+  if (line.kind === 'autoFold') {
+    // Played by the engine, not chosen: a seat that has called twice on the street
+    // folds to a further bet. It is not a node, so it is not a place to return to.
+    return (
+      <div
+        className="flex items-baseline justify-between py-[2px] text-[12px]"
+        style={{ color: 'var(--color-ash)' }}
+        title="a seat that has called twice this street folds to a further bet"
+      >
+        <span className="w-10 shrink-0">{seatNames[line.seat ?? 0]}</span>
+        <span className="flex-1">fold · auto</span>
+        <span>{formatChips(line.stack ?? 0)}</span>
+      </div>
+    );
+  }
+
   if (line.kind === 'terminal') {
     return (
       <div className="py-2">

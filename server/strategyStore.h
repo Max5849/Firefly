@@ -1,12 +1,14 @@
 #pragma once
 
-#include "solver/multiHand/config.h"
+#include "solver/singleHand/config.h"
+#include "solver/singleHand/strategyTable.h"
 
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
 #include <cmath>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -17,11 +19,13 @@
 // option 0, because folding's pot normalised return is analytically exactly zero.
 // The file holds no visits and no legal options; legality is recomputed.
 //
-// The file carries each weight as a 16-bit code of 1/256 pot steps (solver/singleHand's
-// encodeWeight); readRecord decodes it. Every code is exact as a float.
+// The file carries each weight as a 16-bit code of 1/1024 pot steps (solver/singleHand's
+// encodeWeight); readRecord decodes it with decodeWeight. Every code is exact as a float.
+// Variances stay as the packed codes; decodeVariance (strategyTable.h) reads them. Both
+// codecs are singleHand's own, so the server cannot drift from the trainer's format.
 //
-// The file packs these at RECORD_BYTES with no padding. Never point a StrategyRecord*
-// into the mapping; copy the fields out with memcpy.
+// The file packs these at STRATEGY_RECORD_BYTES with no padding. Never point a
+// StrategyRecord* into the mapping; copy the fields out with memcpy.
 struct StrategyRecord {
     uint64_t key;
     std::array<float, 4> weights;
@@ -30,28 +34,7 @@ struct StrategyRecord {
     uint64_t variances;
 };
 
-// solver/singleHand's record layout (its STRATEGY_RECORD_BYTES): uint64 key, int16
-// weights[4], uint64 variances. solver/multiHand's config.h, which the server includes
-// for the game rules, still names its own 28 byte layout, so the server keeps its own
-// copy. STRATEGY_HEADER_BYTES is 8 in both.
-inline constexpr uint64_t RECORD_BYTES = 24;
-
-// solver/singleHand/strategyTable.h's weight code: code / WEIGHT_CODES_PER_POT pots.
-inline constexpr double WEIGHT_CODES_PER_POT = 256.0;
-
-// solver/singleHand/strategyTable.h's variance code: VARIANCE_CODE_FLOOR times 2 to the
-// code over VARIANCE_CODES_PER_OCTAVE, in pots squared. Code 0 is the floor and
-// everything below it. The scale is fixed, independent of the trainer's VARIANCE_MIN.
-// singleHand's headers cannot be included beside multiHand's, so these are copies and
-// must move with strategyTable.h.
-inline constexpr double VARIANCE_CODE_FLOOR = 0.25;
-inline constexpr double VARIANCE_CODES_PER_OCTAVE = 3072.0;
-
-// Option slot o (option o + 1) of a packed variances word.
-inline double decodeVariance(uint64_t packed, int o) {
-    return VARIANCE_CODE_FLOOR * std::exp2(double(packed >> (16 * o) & 0xFFFF)
-        / VARIANCE_CODES_PER_OCTAVE);
-}
+inline constexpr uint64_t RECORD_BYTES = STRATEGY_RECORD_BYTES;
 
 // The index is a sidecar rather than a rewrite of the strategy file, so the
 // hundreds of megabytes the solver wrote are mapped and never copied.
@@ -86,13 +69,14 @@ inline uint64_t strategySlotBits(uint64_t records) {
 }
 
 // Names a strategy file, as Explorer::spec does for the config it was trained at:
-// 10000 * players + 10 * chips + 10 * metasBasic + memoryBasic. (explorer.cpp carries
-// main(), so its spec() cannot be included.) The chips and metasBasic terms overlap -
-// 200 chips with metasBasic is 201 without - so a spec is only unambiguous for an even
-// stack, and the server accepts only even ones.
-inline std::string strategySpec(int players, float chips, bool metasBasic, bool memoryBasic) {
-    return std::to_string((int)(10000 * players + 10 * chips
-        + 10 * metasBasic + 1 * memoryBasic));
+// 100000 * players + 100 * chips + 100 * ante + 10 * metasStage + memoryStage, then the
+// tag letter. (explorer.cpp carries main(), so its spec() cannot be included.) The chips
+// and ante terms overlap unless the stack is a multiple of 10, and the players digit
+// unless it is under 1000, so the server accepts only those stacks.
+inline std::string strategySpec(int players, int chips, int ante, int metasStage,
+        int memoryStage, char tag) {
+    return std::to_string(100000 * players + 100 * chips + 100 * ante
+        + 10 * metasStage + memoryStage) + tag;
 }
 
 inline std::string strategyPath(const std::string& spec) {
@@ -181,6 +165,40 @@ struct MappedFile {
     ~MappedFile() { close(); }
 };
 
+// How a strategy file lays out its keys. Nothing in the file says, so the registry
+// works it out when it opens one (detectKeyFormat in replay.h).
+//
+// Current: actionState (43 bits) | boardField (15) << 43 | cluster (6) << 58, the
+//   layout solver/singleHand/config.h names.
+// Bit44: the layout before 2026-11-15: the same 43-bit action state, then the acting
+//   seat's calls > 1 at bit 43, boardField << 44 and a 5-bit cluster << 59. The rules
+//   are otherwise today's: a seat with calls > 1 facing a bet never reaches a key now
+//   (Engine::autoFold), and one checking keeps its bit.
+enum class KeyFormat { Current, Bit44 };
+
+inline const char* keyFormatName(KeyFormat format) {
+    return format == KeyFormat::Current ? "current" : "bit44";
+}
+
+// A current-layout key in a file's layout. heroCalledTwice is the acting seat's
+// calls > 1, which only Bit44 keeps. False when the layout cannot hold the key: a
+// Bit44 cluster has 5 bits.
+inline bool fileKeyFor(KeyFormat format, uint64_t key, bool heroCalledTwice, uint64_t& out) {
+    if (format == KeyFormat::Current) {
+        out = key;
+        return true;
+    }
+    const uint64_t actionState = key & ((1ULL << ACTION_STATE_BITS) - 1);
+    const uint64_t meta = key >> ACTION_STATE_BITS;
+    const uint64_t boardField = meta & BOARD_CLASS_MASK;
+    const uint64_t cluster = meta >> BOARD_CLASS_BITS;
+    if (cluster > 31) {
+        return false;
+    }
+    out = actionState | uint64_t(heroCalledTwice) << 43 | boardField << 44 | cluster << 59;
+    return true;
+}
+
 // Open addressed lookup over the mapped strategy file. Both mappings grow with
 // the strategy and cost page cache rather than resident memory, so a much larger
 // strategy file changes nothing here but the numbers.
@@ -190,6 +208,8 @@ struct StrategyStore {
     const uint64_t* slots = nullptr;
     uint64_t slotMask = 0;
     uint64_t records = 0;
+    // Set by the registry once the store is open, before it is shared.
+    KeyFormat format = KeyFormat::Current;
 
     void open(const std::string& strategyPath, const std::string& indexPath) {
         records = strategyRecordCount(strategyPath);
@@ -230,15 +250,24 @@ struct StrategyStore {
         std::array<int16_t, 4> codes;
         std::memcpy(codes.data(), cursor + 8, sizeof(codes));
         for (int j = 0; j < 4; j++) {
-            out.weights[j] = float(double(codes[j]) / WEIGHT_CODES_PER_POT);
+            out.weights[j] = float(decodeWeight(codes[j]));
         }
         std::memcpy(&out.variances, cursor + 16, sizeof(out.variances));
     }
 
+    // Looks up a key in the server's (current) layout, translated to the file's.
+    // heroCalledTwice is the acting seat's calls > 1 at the node.
+    bool lookup(uint64_t key, bool heroCalledTwice, StrategyRecord& out) const {
+        uint64_t fileKey;
+        return fileKeyFor(format, key, heroCalledTwice, fileKey) && lookupFileKey(fileKey, out);
+    }
+
+    // Looks up a key exactly as the file stores it.
+    //
     // The 32 bit tag in the slot resolves almost every miss without touching the
     // record mapping at all, which is what keeps a 1326 combo sweep cheap when
     // most of its keys are states self play never reached.
-    bool lookup(uint64_t key, StrategyRecord& out) const {
+    bool lookupFileKey(uint64_t key, StrategyRecord& out) const {
         uint64_t hash = mix64(key);
         uint32_t tag = strategySlotTag(hash);
         uint64_t index = hash & slotMask;
@@ -337,7 +366,7 @@ inline void buildIndex(const std::string& strategyPath, const std::string& index
     StrategyRecord record;
     for (uint64_t i = 0; i < records; i++) {
         uint64_t key = keyAt(i);
-        if (!store.lookup(key, record) || record.key != key) {
+        if (!store.lookupFileKey(key, record) || record.key != key) {
             throw std::runtime_error("record " + std::to_string(i)
                 + " is not reachable through the index it was just written to");
         }
@@ -347,36 +376,52 @@ inline void buildIndex(const std::string& strategyPath, const std::string& index
     }
 }
 
-// What a strategy file was trained at: the four settings its spec encodes.
+// The stacks a spec can name unambiguously: multiples of 10 below 1000.
+inline constexpr int MIN_CHIPS = 10;
+inline constexpr int MAX_CHIPS = 990;
+inline constexpr int CHIPS_STEP = 10;
+inline constexpr int MAX_ANTE = 9;
+
+// What a strategy file was trained at: the settings its spec encodes. The defaults are
+// solver/singleHand/config.h's.
 struct StrategyConfig {
     int players = PLAYER_COUNT;
     int chips = int(CHIP_COUNT);
-    bool metasBasic = METAS_BASIC;
-    bool memoryBasic = MEMORY_BASIC;
+    int ante = int(ANTE);
+    int metasStage = METAS_STAGE;
+    int memoryStage = MEMORY_STAGE;
+    char tag = STRATEGY_TAG;
 
     std::string spec() const {
-        return strategySpec(players, float(chips), metasBasic, memoryBasic);
+        return strategySpec(players, chips, ante, metasStage, memoryStage, tag);
     }
 };
 
-// Reads a spec back into its settings, assuming an even chip count (strategySpec is
-// ambiguous otherwise). False for a number no valid config produces.
+inline bool validTag(char tag) {
+    return (tag >= 'A' && tag <= 'Z') || (tag >= 'a' && tag <= 'z');
+}
+
+// Reads a spec back into its settings, assuming a stack that is a multiple of 10 (the
+// spec is ambiguous otherwise). False for a name no valid config produces.
 inline bool decodeSpec(const std::string& text, StrategyConfig& out) {
-    if (text.empty() || text.size() > 9
-            || !std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+    if (text.size() != 7 || !validTag(text.back())
+            || !std::all_of(text.begin(), text.end() - 1, [](char c) { return c >= '0' && c <= '9'; })) {
         return false;
     }
-    long value = std::stol(text);
-    int players = int(value / 10000);
-    long rest = value % 10000;
-    int memory = int(rest % 10);
-    long chipsAndMetas = rest / 10;
-    int metas = int(chipsAndMetas % 2);
-    long chips = chipsAndMetas - metas;
-    if (players < 3 || players > 7 || memory > 1 || chips <= 0) {
+    const long value = std::stol(text.substr(0, 6));
+    StrategyConfig config;
+    config.players = int(value / 100000);
+    const long rest = value % 100000;
+    config.chips = int(rest / 1000) * 10;
+    config.ante = int(rest / 100 % 10);
+    config.metasStage = int(rest / 10 % 10);
+    config.memoryStage = int(rest % 10);
+    config.tag = text.back();
+    if (config.players < 3 || config.players > 7 || config.chips < MIN_CHIPS
+            || config.metasStage >= METAS_STAGE_COUNT || config.memoryStage >= MEMORY_STAGE_COUNT) {
         return false;
     }
-    out = {players, int(chips), metas == 1, memory == 1};
+    out = config;
     return out.spec() == text;
 }
 
@@ -409,6 +454,9 @@ struct StrategyRegistry {
     std::map<std::string, std::shared_ptr<const StrategyStore>> stores;
     bool warm = false;
     std::ostream* log = nullptr;
+    // Works out a newly opened store's KeyFormat, before it is shared. Throws when it
+    // cannot (the request then fails as strategyUnreadable).
+    std::function<KeyFormat(const StrategyStore&, const std::string& spec)> detectFormat;
 
     // nullptr when strategy_<spec>.bin does not exist. Throws when it exists but cannot
     // be read.
@@ -435,21 +483,31 @@ struct StrategyRegistry {
             buildIndex(path, index, log);
             store->open(path, index);
         }
+        if (detectFormat) {
+            store->format = detectFormat(*store, spec);
+        }
         if (warm) {
             store->warm();
         }
         if (log != nullptr) {
-            *log << "Opened " << path << " (" << store->records << " records)" << std::endl;
+            *log << "Opened " << path << " (" << store->records << " records, "
+                 << keyFormatName(store->format) << " key layout)" << std::endl;
         }
         stores.emplace(spec, store);
         return store;
     }
 
-    std::vector<std::pair<std::string, uint64_t>> loaded() {
+    struct Loaded {
+        std::string spec;
+        uint64_t records;
+        KeyFormat format;
+    };
+
+    std::vector<Loaded> loaded() {
         std::lock_guard<std::mutex> lock(mutex);
-        std::vector<std::pair<std::string, uint64_t>> out;
+        std::vector<Loaded> out;
         for (const auto& [spec, store] : stores) {
-            out.emplace_back(spec, store->records);
+            out.push_back({spec, store->records, store->format});
         }
         return out;
     }

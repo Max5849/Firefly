@@ -165,10 +165,8 @@ Run this **on the Mac**, from the repository root. It pushes to the VM.
 cd ~/Poker/Firefly
 
 rsync -avP -e "ssh -i ~/.ssh/your-oracle-key" \
-  solver/handAnalysis/boardClasses.bin \
-  solver/handAnalysis/boardClassesBasic.bin \
-  solver/handAnalysis/handMetas.bin \
-  solver/handAnalysis/handMetasBasic.bin \
+  solver/handAnalysis/boardClassesB.bin \
+  solver/handAnalysis/handMetasB.bin \
   ubuntu@<VM_PUBLIC_IP>:/opt/firefly/solver/handAnalysis/
 
 rsync -avP -e "ssh -i ~/.ssh/your-oracle-key" \
@@ -176,18 +174,30 @@ rsync -avP -e "ssh -i ~/.ssh/your-oracle-key" \
   ubuntu@<VM_PUBLIC_IP>:/opt/firefly/solver/strategies/
 ```
 
+The tables are per metas stage, named by letter (`A` = stage 0, the full detail,
+`B` = 1, `C` = 2): copy `boardClasses<L>.bin` and `handMetas<L>.bin` for every stage
+a strategy you serve was trained at, and `preflopMetas.bin` too for stage C. The
+server loads a stage's tables on the first request for it, so a missing stage only
+fails the requests that ask for it (`tablesMissing`).
+
 Copy every `strategy_<spec>.bin` you want the front end to be able to pick: the
-UI chooses players, chips, metasBasic and memoryBasic, and the server answers with
-the matching file or a `strategyMissing` 404.
+UI chooses players, chips, ante, metas and memory stage and tag, and the server
+answers with the matching file or a `strategyMissing` 404. The spec is
+`100000·players + 100·chips + 100·ante + 10·metasStage + memoryStage` then the tag,
+for example `740210A`. Copy the `.idx` beside it too if you built one on the Mac
+(§7) — it saves the VM building it.
 
 `-P` shows progress and lets you resume: if the transfer drops, run the same
 command again and it picks up where it stopped.
 
-451 MB over a home upload link takes a while — roughly 6 minutes at 10 Mbit/s,
-70 seconds at 50 Mbit/s.
+Stage B's tables are about 125 MB, but a strategy file is large: `strategy_740210A.bin`
+is 3.0 GB (126M records), and its index another 2 GB. 3 GB over a home upload link
+takes roughly 40 minutes at 10 Mbit/s, 8 minutes at 50 Mbit/s. The VM needs the disk
+for both files, and page cache to keep the lookups off the disk.
 
-**Do not copy** `handScores.bin` (510 MB). The API never reaches showdown, so it is
-dead weight, and `ServerTables::load()` never reads it.
+**Do not copy** `handScores.bin` (535 MB). The API never reaches showdown, so it is
+dead weight, and `ServerTables` never reads it. Nor the `handDists*.bin` files: only
+the clusterer that builds the hand metas reads them.
 There is no `strategyBase_*.bin` any more: a run writes one file, and a run that uses
 a base reads a previous `strategy_<spec>.bin`.
 
@@ -200,11 +210,15 @@ stat -c "%s  %n" solver/handAnalysis/*.bin solver/strategies/*.bin
 
 | File | Bytes, exactly |
 | --- | --- |
-| `solver/handAnalysis/boardClasses.bin` | 121859400 |
-| `solver/handAnalysis/boardClassesBasic.bin` | 121859400 |
-| `solver/handAnalysis/handMetas.bin` | 27899243 |
-| `solver/handAnalysis/handMetasBasic.bin` | 27899243 |
+| `solver/handAnalysis/boardClasses<L>.bin` | 121859400 |
+| `solver/handAnalysis/handMetasA.bin` | 54845027 |
+| `solver/handAnalysis/handMetasB.bin` | 3088817 |
+| `solver/handAnalysis/preflopMetas.bin` (stage C only) | 169 |
 | `solver/strategies/strategy_<spec>.bin` | 8 + 24 × records |
+
+A `handMetas<L>.bin` is 8 + 9 × entries bytes, so its size changes whenever the
+clusterer is rerun; the table above is the build of 2026-11-12. Compare against
+`stat` on the Mac rather than this table if they differ.
 
 You do not have to be careful here: every one of these files has its exact
 expected size checked at startup, and a wrong size is a clear error on the spot
@@ -256,7 +270,7 @@ g++ -std=c++2b -O2 -I. -o build/keyEquivalence server/tests/keyEquivalence.cpp
 Two things about that command line, both load-bearing:
 
 - `-I.` plus running from `/opt/firefly` — every `#include` in this project is
-  written from the repository root, as `"solver/multiHand/engine.h"`.
+  written from the repository root, as `"solver/singleHand/engine.h"`.
 - `-lz` on the server only — that is zlib, for gzipping responses.
 
 ---
@@ -266,21 +280,23 @@ Two things about that command line, both load-bearing:
 Each strategy file needs a sidecar `strategy_<spec>.idx`: a hash table that turns
 a state key into a record without scanning millions of them. **The server builds
 a missing or stale one itself** the first time that spec is requested, which takes
-about a second per 15 million records. To do it ahead of time instead:
+about 25 seconds at 126 million records (and 2 GB of memory and disk). To do it ahead
+of time instead:
 
 **[VM]**
 
 ```bash
 cd /opt/firefly
-./build/indexBuilder --players 3 --chips 200 --metas 1 --memory 1
+./build/indexBuilder --players 7 --chips 400 --ante 2 --metas 1 --memory 0 --tag A
 ```
 
 It verifies every key is reachable before it exits:
 
 ```
-Records: 15255796
-Mean probes per insert: 1.417
-Wrote and verified solver/strategies/strategy_32011.idx (15255796 keys)
+Records: 125732730
+Slots: 268435456 (2048.000 MB, load 46.839%)
+Mean probes per insert: 1.440
+Wrote and verified solver/strategies/strategy_740210A.idx (125732730 keys)
 ```
 
 The service user needs write access to `solver/strategies/` for the server to
@@ -832,10 +848,13 @@ sudo systemctl restart firefly-api      # an open file stays mapped until restar
 ```
 
 The index is rebuilt on first use, because the old one no longer matches. A file for
-a new config (players, chips, `METAS_BASIC`, `MEMORY_BASIC`) has a new spec and
-needs no server rebuild: the UI can pick it as soon as it is in
-`solver/strategies/`. A change to `INV_TEMP` or `RANGE_FLOOR` does need a rebuild,
-because the server replays ranges with its compiled values.
+a new config (players, chips, ante, stages, tag) has a new spec and needs no server
+rebuild: the UI can pick it as soon as it is in `solver/strategies/`. Its key layout
+(`current`, or `bit44` for a file written before 2026-11-15) is detected when it is
+opened. A change to `INV_TEMP` (the default temperature), the game rules or the key
+layout in solver/singleHand does need a rebuild — and the rules or layout a port to
+`server/engine/tableEngine.h` and `server/keyLayout.h` first, checked by
+`build/keyEquivalence`.
 
 **The front end**, which needs nothing on the VM unless you are serving it there
 (§15d):
@@ -857,7 +876,9 @@ API serves.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `cannot find -lz` at link time | zlib headers missing | `sudo apt install zlib1g-dev` |
-| `solver/handAnalysis/boardClasses.bin has an unexpected size` | copy truncated or missing | re-run the rsync; compare against the byte table in §5 |
+| `solver/handAnalysis/boardClassesB.bin has an unexpected size` | copy truncated or missing | re-run the rsync; compare against the byte table in §5 |
+| `tablesMissing` from the API | that metas stage's `boardClasses<L>.bin` / `handMetas<L>.bin` (or `preflopMetas.bin`) not copied | copy them (§5); the next request loads them |
+| `spot.found` near 0 on every node | a strategy file whose key layout is neither `current` nor `bit44` | retrain with the current solver; `/health` shows the layout each open file was read as |
 | `... is not in the 24 byte record format` | strategy file in an old layout, or a partial copy | re-copy `strategy_<spec>.bin` from a run of the current solver |
 | `strategyUnreadable` from the API | the index could not be rebuilt, or the file is corrupt | check write access to `solver/strategies/`; run `./build/indexBuilder <path>` to see the error |
 | `failed to open ... for reading` | wrong working directory | run from `/opt/firefly`; check `WorkingDirectory` in the unit |

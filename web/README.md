@@ -51,11 +51,18 @@ different things in the two modes, which never overlap.
 
 ## Choosing a strategy
 
-The header picks players (3–7), starting chips (even, blinds 1/2), and basic or
-full metas and memory. Those four name the strategy file, `strategy_<spec>.bin`;
-the spec beside them turns red when nothing has been trained for it, and a banner
-lists what has. The `trained` menu jumps straight to any file the server has.
-Changing the config starts a new hand.
+The header picks players (3–7), starting chips (a multiple of 10 up to 990, blinds
+1/2), the dead ante (0–9), the metas and memory stages (A is the full detail; click
+to step A → B → C) and, through the `trained` menu, the tag. Those name the strategy
+file, `strategy_<spec>.bin` with spec `100000·players + 100·chips + 100·ante +
+10·metas + memory` then the tag (for example `740210A`); the spec beside them turns
+red when nothing has been trained for it, and a banner lists what has. The `trained`
+menu jumps straight to any file the server has. Changing the config starts a new
+hand.
+
+Hands are played preflop and flop only, as the trainer plays them. A seat that has
+called twice on a street folds to a further bet by itself: the ledger shows it as
+`fold · auto`, and it is not a point to jump back to.
 
 ## Temperature
 

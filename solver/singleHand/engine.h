@@ -6,8 +6,8 @@
 struct Engine {
     struct Player {
         std::array<int, 2> holeCards;
-        uint64_t metaState;
-        uint64_t metaStateBasic;
+        // Indexed by metas stage.
+        std::array<uint64_t, METAS_STAGE_COUNT> metaState;
         uint32_t handScore;
         float chips;
         bool inHand;
@@ -24,13 +24,12 @@ struct Engine {
 
         void set(std::array<int, 2> holeCards, uint64_t preflopHandClass, int position) {
             this->holeCards = holeCards;
-            metaState = preflopHandClass;
-            metaStateBasic = preflopHandClass;
+            metaState.fill(preflopHandClass);
             handScore = 0;
             chips = CHIP_COUNT;
             inHand = true;
             this->position = position;
-            villanPosition = 0;
+            villanPosition = 2;
             bet = 0;
             positionBasic = position > 2 ? (3 + (position - 3) / 2) : position;
             for (int i = 0; i < 4; i++) {
@@ -44,36 +43,42 @@ struct Engine {
 
     inline static std::array<std::array<uint32_t, 8>, 53> binomials;
     inline static std::vector<uint32_t> handScoreTable;
-    inline static std::vector<uint16_t> boardClassTable;
-    inline static std::vector<uint16_t> boardClassBasicTable;
-    inline static ankerl::unordered_dense::map<uint64_t, uint8_t> handMetasBasic;
-    inline static ankerl::unordered_dense::map<uint64_t, uint8_t> handMetas;
+    // Indexed by metas stage.
+    inline static std::array<std::vector<uint16_t>, METAS_STAGE_COUNT> boardClassTables;
+    inline static std::array<ankerl::unordered_dense::map<uint64_t, uint8_t>, METAS_STAGE_COUNT> handMetas;
     inline static std::array<uint64_t, 1326> preflopHandClasses;
+    // The preflop cluster per 169-class index, from preflopMetas.bin; stage C keys on it.
+    inline static std::array<uint8_t, 169> preflopClusters;
     HandClusterer handClusterer;
     std::array<Player, PLAYER_COUNT> players;
     std::array<int, 52> deck;
     std::array<int, 5> boardCards;
-    uint64_t actionState;
-    uint64_t actionStateBasic;
+    // Indexed by memory stage.
+    std::array<uint64_t, MEMORY_STAGE_COUNT> actionState;
     uint8_t round;
     int heads;
     uint8_t headsBasic;
+    uint8_t preflopHeadsBasic;
     int firstAction;
+    bool opened;
+    uint8_t openedPosition;
+    uint8_t openedLimpers;
     uint8_t action;
     uint8_t actionPosition;
     float bet;
     float pot;
-    uint16_t boardClass;
-    uint16_t boardClassBasic;
+    // Indexed by metas stage.
+    std::array<uint16_t, METAS_STAGE_COUNT> boardClass;
     std::array<uint8_t, 4> raiseHistory;
     uint8_t raiseHistoryCompressed;
-    uint8_t raiseSize;
+    std::array<uint8_t, 4> raiseSizeHistory;
     uint8_t raiseStrength;
     uint8_t raiseActionPosition;
     uint8_t hiddenRaiseSize;
     uint8_t hiddenRaiseStrength;
     uint8_t hiddenRaiseActionPosition;
     uint8_t calls;
+    uint8_t hiddenCalls;
 
     uint32_t getHandIndex(std::array<int, 2>& holeCards) {
         std::array<int, 7> handCards = {boardCards[0], boardCards[1], boardCards[2], 
@@ -160,15 +165,20 @@ struct Engine {
             std::ifstream handScoreFile = openRead(handScorePath);
             readExact(handScoreFile, handScoreTable.data(), handScoreBytes, handScorePath);
 
-            loadTable("solver/handAnalysis/boardClasses.bin", boardClassTable);
-            loadTable("solver/handAnalysis/boardClassesBasic.bin", boardClassBasicTable);
-            if (*std::max_element(boardClassTable.begin(), boardClassTable.end()) + 169 > 0xFFFF
-                || *std::max_element(boardClassBasicTable.begin(), boardClassBasicTable.end()) + 169 > 0xFFFF) {
-                throw std::runtime_error("board class + 169 overflows the 16-bit key field");
+            for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
+                std::vector<uint16_t>& table = boardClassTables[stage];
+                loadTable(stagePath("boardClasses", stage), table);
+                if (*std::max_element(table.begin(), table.end()) + 169 > BOARD_CLASS_MASK) {
+                    throw std::runtime_error("board class + 169 overflows the 15-bit key field");
+                }
+                loadHandMetas(stagePath("handMetas", stage), handMetas[stage]);
+                for (const auto& [key, meta] : handMetas[stage]) {
+                    if (meta > HAND_META_MASK) {
+                        throw std::runtime_error("a hand meta overflows the 6-bit key field;"
+                            " rebuild the hand metas with at most 64 clusters per board class");
+                    }
+                }
             }
-
-            loadHandMetas("solver/handAnalysis/handMetasBasic.bin", handMetasBasic);
-            loadHandMetas("solver/handAnalysis/handMetas.bin", handMetas);
 
             for (int i = 0; i < 53; i++) {
                 for (int j = 0; j < 8; j++) {
@@ -183,6 +193,22 @@ struct Engine {
                     }
                 }
             }
+            {
+                const std::string path = "solver/handAnalysis/preflopMetas.bin";
+                if (fileSize(path) != preflopClusters.size()) {
+                    throw std::runtime_error(path + " has an unexpected size");
+                }
+                std::ifstream file = openRead(path);
+                readExact(file, preflopClusters.data(), preflopClusters.size(), path);
+                for (uint8_t cluster : preflopClusters) {
+                    // A preflop board field must stay below the postflop ones, which start at 169.
+                    if (cluster >= 169) {
+                        throw std::runtime_error(path + " has a cluster of 169 or more");
+                    }
+                }
+            }
+
+            // equityClusterer.cpp's preflopClass() copies this formula; keep the two identical.
             for (int i = 0; i < 51; i++) {
                 for (int j = i + 1; j < 52; j++) {
                     int preflopHandMeta = (i / 4) * (25 - (i / 4)) / 2
@@ -211,13 +237,19 @@ struct Engine {
             std::sort(holeCards.begin(), holeCards.end(), [](int a, int b) {
                 return a < b;
             });
-            players[i].set(holeCards,
-                preflopHandClasses[holePairIndex(holeCards[0], holeCards[1])], i);
+            const uint64_t preflopClass = preflopHandClasses[holePairIndex(holeCards[0], holeCards[1])];
+            players[i].set(holeCards, preflopClass, i);
+            // Stage C keys preflop on the class's cluster, in the board field like a class.
+            players[i].metaState[2] = preflopClusters[preflopClass];
         }
         round = 0;
         heads = PLAYER_COUNT;
         headsBasic = heads > 3 ? 2 + (heads - 4) / 2 : heads - 2;
+        preflopHeadsBasic = headsBasic;
         firstAction = 3 % PLAYER_COUNT;
+        opened = false;
+        openedPosition = 0;
+        openedLimpers = 0;
         action = firstAction;
         actionPosition = PLAYER_COUNT - 1;
         bet = 2;
@@ -225,147 +257,116 @@ struct Engine {
         players[1].bet = 1;
         players[2].chips -= 2;
         players[2].bet = 2;
-        pot = 3;
+        pot = 3 + ANTE;
         raiseHistory = {0};
         raiseHistoryCompressed = 0;
-        raiseSize = 0;
+        raiseSizeHistory = {0};
         raiseStrength = 0;
         raiseActionPosition = 0;
         hiddenRaiseSize = 0;
         hiddenRaiseStrength = 0;
         hiddenRaiseActionPosition = 0;
         calls = 0;
+        hiddenCalls = 0;
     }
 
-    void setActionState(bool memoryBasic) {
-        //exact positions
-        //allow limping pre
-        //expand calling from 2 to 4
-        //simplify clusters by prioritizing whatever is best
-        //ignore elements when others take over
+    void setActionState(int memoryStage) {
         Player& player = players[action];
         Player& villan = players[player.villanPosition];
         uint64_t state = 0;
         int shift = 0;
         state |= uint64_t(headsBasic & 0x3) << shift;
         shift += 2;
+        state |= uint64_t(preflopHeadsBasic & 0x3) << shift;
+        shift += 2;
+
         player.spr = float(player.chips - (bet - player.bet)) / (pot + (bet - player.bet));
         player.cpr = float(bet - player.bet) / (pot - (bet - player.bet));
-        if (!memoryBasic) {
-            if (player.spr < 0.0005f) {
-                if (player.cpr < 0.289f) {
-                    state |= uint64_t(9 & 0xF) << shift;
-                } else if (player.cpr < 0.5f) {
-                    state |= uint64_t(10 & 0xF) << shift;
-                } else if (player.cpr < 0.866f) {
-                    state |= uint64_t(11 & 0xF) << shift;
-                } else if (player.cpr < 1.5f) {
-                    state |= uint64_t(12 & 0xF) << shift;
-                } else if (player.cpr < 2.6f) {
-                    state |= uint64_t(13 & 0xF) << shift;
-                } else if (player.cpr < 4.5f) {
-                    state |= uint64_t(14 & 0xF) << shift;
-                } else {
-                    state |= uint64_t(15 & 0xF) << shift;
-                } 
-            } else if (player.spr < 0.289f) {
-                state |= uint64_t(0 & 0xF) << shift;
-            } else if (player.spr < 0.5f) {
-                state |= uint64_t(1 & 0xF) << shift;
-            } else if (player.spr < 0.866f) {
-                state |= uint64_t(2 & 0xF) << shift;
-            } else if (player.spr < 1.5f) {
-                state |= uint64_t(3 & 0xF) << shift;
-            } else if (player.spr < 2.6f) {
-                state |= uint64_t(4 & 0xF) << shift;
-            } else if (player.spr < 4.5f) {
-                state |= uint64_t(5 & 0xF) << shift;
-            } else if (player.spr < 7.8f) {
+        if (player.spr < 0.0005f) {
+            if (player.cpr < 0.5f) {
                 state |= uint64_t(6 & 0xF) << shift;
-            } else if (player.spr < 13.5f) {
+            } else if (player.cpr < 1.5f) {
                 state |= uint64_t(7 & 0xF) << shift;
-            } else {
+            } else if (player.cpr < 3.5f) {
                 state |= uint64_t(8 & 0xF) << shift;
-            }
+            } else {
+                state |= uint64_t(9 & 0xF) << shift;
+            } 
+        } else if (player.spr < 0.5f) {
+            state |= uint64_t(0 & 0xF) << shift;
+        } else if (player.spr < 1.5f) {
+            state |= uint64_t(1 & 0xF) << shift;
+        } else if (player.spr < 3.5f) {
+            state |= uint64_t(2 & 0xF) << shift;
+        } else if (player.spr < 7.5f) {
+            state |= uint64_t(3 & 0xF) << shift;
+        } else if (player.spr < 15.5f) {
+            state |= uint64_t(4 & 0xF) << shift;
         } else {
-            if (player.spr < 0.0005f) {
-                if (player.cpr < 0.289f) {
-                    state |= uint64_t(9 & 0xF) << shift;
-                } else if (player.cpr < 0.866f) {
-                    state |= uint64_t(11 & 0xF) << shift;
-                } else if (player.cpr < 2.6f) {
-                    state |= uint64_t(13 & 0xF) << shift;
-                } else {
-                    state |= uint64_t(15 & 0xF) << shift;
-                } 
-            } else if (player.spr < 0.289f) {
-                state |= uint64_t(0 & 0xF) << shift;
-            } else if (player.spr < 0.866f) {
-                state |= uint64_t(2 & 0xF) << shift;
-            } else if (player.spr < 2.6f) {
-                state |= uint64_t(4 & 0xF) << shift;
-            } else if (player.spr < 7.8f) {
-                state |= uint64_t(6 & 0xF) << shift;
-            } else {
-                state |= uint64_t(8 & 0xF) << shift;
-            }
+            state |= uint64_t(5 & 0xF) << shift;
         }
         shift += 4;
+
         state |= uint64_t(raiseHistoryCompressed & 0xFF) << shift;
         shift += 8;
+        for (int i = 0; i < 4; i++) {
+            state |= uint64_t((raiseSizeHistory[i] > 0) & 0x1) << (shift + i);
+        }
+        shift += 4;
+
         uint64_t heroVillanStory = 0;
         for (int i = 0; i < 4; ++i) {
             heroVillanStory *= 3;
             if (i != round) {
-                heroVillanStory += 2 * player.lastActions[i] + !memoryBasic * villan.lastActions[i];
+                heroVillanStory += 2 * player.lastActions[i] + villan.lastActions[i];
             } else {
-                heroVillanStory += player.lastActions[i] + !memoryBasic * villan.lastActions[i];
+                heroVillanStory += player.lastActions[i] + villan.lastActions[i];
             }
         }
         heroVillanStory *= 5;
-        heroVillanStory += (!memoryBasic || round < 1) * player.positionBasic;
+        heroVillanStory += (round == 0 || raiseHistory[0] > 0) * player.positionBasic;
         heroVillanStory *= 5;
-        heroVillanStory += (!memoryBasic || round < 1) * villan.positionBasic;
+        heroVillanStory += (round == 0 || raiseHistory[0] > 0) * villan.positionBasic;
         state |= uint64_t(heroVillanStory & 0x7FF) << shift;
         shift += 11;
-        uint64_t actionPositionState = 0;
-        actionPositionState *= 3;
-        actionPositionState += (actionPosition > 0) + (actionPosition > 2);
-        actionPositionState *= 3;
-        actionPositionState += (raiseActionPosition > 0) + (raiseActionPosition > 2);
-        actionPositionState *= 3;
-        actionPositionState += !memoryBasic * ((hiddenRaiseActionPosition > 0) + (hiddenRaiseActionPosition > 2));
-        state |= uint64_t(actionPositionState & 0x1F) << shift;
-        shift += 5;
-        state |= uint64_t((raiseSize > 0) & 0x1) << shift;
-        state |= uint64_t(std::min(raiseStrength, uint8_t(3)) & 0x3) << (shift + 1);
-        shift += 3;
-        if (!memoryBasic) {
-            state |= uint64_t((hiddenRaiseSize > 0) & 0x1) << shift;
-            state |= uint64_t(std::min(hiddenRaiseStrength, uint8_t(3)) & 0x3) << (shift + 1);
+
+        if (raiseHistory[round] > 0) {
+            uint64_t pointState = 0;
+            pointState += std::min(raiseStrength, uint8_t(2));
+            pointState *= 3;
+            pointState += (raiseActionPosition > 0) + (raiseActionPosition > 2);
+            pointState *= 3;
+            pointState += std::min(hiddenCalls, uint8_t(2));
+            state |= uint64_t(pointState & 0x1F) << shift;
         }
-        shift += 3;
-        state |= uint64_t(std::min(player.raisesFaced, uint8_t(3)) & 0x3) << shift;
-        shift += 2;
+        shift += 5;
+
+        if (raiseHistory[round] > 1) {
+            state |= uint64_t((hiddenRaiseSize > 0) & 0x1) << shift;
+        }
+        shift += 1;
+
+        uint64_t pointState = 0;
+        pointState += (actionPosition > 0) + (actionPosition > 2);
+        pointState *= 3;
+        pointState += std::min(player.raisesFaced, uint8_t(2));
+        pointState *= 3;
+        pointState += std::min(calls, uint8_t(2));
+        state |= uint64_t(pointState & 0x1F) << shift;
+        shift += 5;
+
         state |= uint64_t(player.relativePosition & 0x1) << shift;
         shift += 1;
-        state |= uint64_t((player.calls > 1) & 0x1) << shift;
-        shift += 1;
-        if (!memoryBasic) {
-            if (calls < 2) {
-                state |= uint64_t(calls & 0x3) << shift;
-            } else if (calls < 4) {
-                state |= uint64_t(2 & 0x3) << shift;
-            } else {
-                state |= uint64_t(3 & 0x3) << shift;
-            }
-        }
-        shift += 2;
-        if (!memoryBasic) {
-            actionState = state;
-        } else {
-            actionStateBasic = state;
-        }
+
+        actionState[memoryStage] = state;
+    }
+
+    // A player who has already called twice this street folds to any further bet. The
+    // fold is automatic: the caller plays it without building a key or a node.
+    bool autoFold() const {
+        const Player& player = players[action];
+        const float toCall = bet - player.bet;
+        return player.calls > 1 && toCall / (pot - toCall) >= 0.0005f;
     }
 
     std::array<bool, 5> getOptions() {
@@ -379,17 +380,17 @@ struct Engine {
             if (raises > 4) {
                 options[4] = true;
             } else {
-                if (player.spr < 7.8f) {
+                if (player.spr < 7.5f) {
                     options[4] = true;
                 } 
-                if (player.spr >= 2.6f) {
+                if (player.spr >= 3.5f) {
                     options[3] = true;
                 }
-                if (player.spr >= 0.866f) {
+                if (player.spr >= 1.5f) {
                     options[2] = true;
                 }
             }
-            if (raiseHistory[0] == 0 || player.raisesFaced > 2 || player.calls > 1 || calls > 1) {
+            if (player.raisesFaced > 2) {
                 options[1] = false;
             }
         }
@@ -412,12 +413,12 @@ struct Engine {
         return holePairIndex(players[action].holeCards[0], players[action].holeCards[1]);
     }
 
-    uint64_t getActionState(bool memoryBasic) {
-        return !memoryBasic ? actionState : actionStateBasic;
+    uint64_t getActionState(int memoryStage) {
+        return actionState[memoryStage];
     }
 
-    uint64_t getMetaState(bool metasBasic) {
-        return !metasBasic ? players[action].metaState : players[action].metaStateBasic;
+    uint64_t getMetaState(int metasStage) {
+        return players[action].metaState[metasStage];
     }
 
     bool play(int option) {
@@ -429,22 +430,43 @@ struct Engine {
                 return false;        
             }
             headsBasic = heads > 3 ? 2 + (heads - 4) / 2 : heads - 2;
-        } else if (option == 1 && raiseHistory[round] != 0) {
+            if (round == 0) {
+                preflopHeadsBasic = headsBasic;
+            }
+        } else if (option == 1) {
             player.chips -= (bet - player.bet);
             pot += (bet - player.bet);
             player.bet = bet;
             player.lastActions[round] = 0;
             player.raisesFaced = 0;
-            if (calls == 0) {
-                players[firstAction].villanPosition = player.position;
-                if ((firstAction + PLAYER_COUNT - 1) % PLAYER_COUNT <= (action + PLAYER_COUNT - 1) % PLAYER_COUNT) {
-                    players[firstAction].relativePosition = 0;
-                } else {
-                    players[firstAction].relativePosition = 1;
+            if (opened) {
+                if (calls == 0) {
+                    players[firstAction].villanPosition = player.position;
+                    if ((firstAction + PLAYER_COUNT - 1) % PLAYER_COUNT 
+                        <= (action + PLAYER_COUNT - 1) % PLAYER_COUNT) {
+                        players[firstAction].relativePosition = 0;
+                    } else {
+                        players[firstAction].relativePosition = 1;
+                    }
                 }
+                calls++;
+            } 
+            if (round == 0 && !opened) {
+                for (int i = 0; i < PLAYER_COUNT; i++) {
+                    if (players[i].inHand && i != action) {
+                        players[i].villanPosition = player.position;
+                        if ((i + PLAYER_COUNT - 1) % PLAYER_COUNT 
+                            <= (action + PLAYER_COUNT - 1) % PLAYER_COUNT) {
+                            players[i].relativePosition = 0;
+                        } else {
+                            players[i].relativePosition = 1;
+                        }
+                    }
+                }
+                firstAction = action;
+                opened = true;
             }
             player.calls++;
-            calls++;
         } else if (option == 2 || option == 3 || option == 4) {
             player.chips -= (bet - player.bet);
             pot += (bet - player.bet);
@@ -474,22 +496,29 @@ struct Engine {
                 raiseHistoryCompressed += 1;
             }
             raiseHistory[round]++;
-            hiddenRaiseSize = raiseSize;
+            hiddenRaiseSize = raiseSizeHistory[round];
             hiddenRaiseStrength = raiseStrength;
-            raiseSize = option - 2;
+            raiseSizeHistory[round] = option - 2;
             raiseStrength = player.raisesFaced;
             player.raisesFaced = 0;
             for (int i = 0; i < PLAYER_COUNT; i++) {
                 if (players[i].inHand && i != action) {
                     players[i].raisesFaced++;
                     players[i].villanPosition = player.position;
-                    if ((i + PLAYER_COUNT - 1) % PLAYER_COUNT <= (action + PLAYER_COUNT - 1) % PLAYER_COUNT) {
+                    if ((i + PLAYER_COUNT - 1) % PLAYER_COUNT 
+                        <= (action + PLAYER_COUNT - 1) % PLAYER_COUNT) {
                         players[i].relativePosition = 0;
                     } else {
                         players[i].relativePosition = 1;
                     }
                 }
             }
+            if (round == 0 && !opened) {
+                openedPosition = action;
+                openedLimpers = calls;
+            }
+            opened = true;
+            hiddenCalls = calls;
             calls = 0;
         }
 
@@ -504,25 +533,24 @@ struct Engine {
         }
     }
 
-    void setMetaState(bool needFull, bool needBasic) {
+    // Fills the meta state of every metas stage whose bit is set in stageMask.
+    void setMetaState(uint32_t stageMask) {
         uint32_t boardIndex = getBoardIndex();
-        boardClass = boardClassTable[boardIndex];
-        boardClassBasic = boardClassBasicTable[boardIndex];
+        for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
+            boardClass[stage] = boardClassTables[stage][boardIndex];
+        }
         for (int p = 0; p < PLAYER_COUNT; p++) {
             Player& player = players[p];
             if (!player.inHand) {
                 continue;
             }
             uint32_t handClass = handClusterer.classifyHand(boardCards, player.holeCards, round);
-            if (needFull) {
-                uint64_t key = uint64_t(boardClass) | uint64_t(handClass) << 16;
-                player.metaState = (uint64_t(boardClass + 169)
-                    | uint64_t(handMetas.at(key)) << 16) & 0x3FFFFF;
-            }
-            if (needBasic) {
-                uint64_t key = uint64_t(boardClassBasic) | uint64_t(handClass) << 16;
-                player.metaStateBasic = (uint64_t(boardClassBasic + 169)
-                    | uint64_t(handMetasBasic.at(key)) << 16) & 0x3FFFFF;
+            for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
+                if (stageMask >> stage & 1) {
+                    uint64_t key = uint64_t(boardClass[stage]) | uint64_t(handClass) << 16;
+                    player.metaState[stage] = uint64_t(boardClass[stage] + 169)
+                        | uint64_t(handMetas[stage].at(key)) << BOARD_CLASS_BITS;
+                }
             }
         }
     }
@@ -534,7 +562,10 @@ struct Engine {
         round++;
         if (round == 4) {
             return false;
-        } 
+        }
+        if (heads > 3 && (raiseHistory[round - 1] > 0)) {
+            return false;
+        }
         firstAction = 1;
         action = firstAction;
         while (!players[action].inHand) {
@@ -551,6 +582,7 @@ struct Engine {
                 players[i].calls = 0;
             }
         }
+        opened = false;
         calls = 0;
         return true;
     }

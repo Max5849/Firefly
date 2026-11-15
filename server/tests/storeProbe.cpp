@@ -1,11 +1,11 @@
 // Prints what StrategyStore returns for each hex key on the command line, so an
-// independent reader of strategy_<spec>.bin can be diffed against the mmap path.
+// independent reader of strategy_<spec>.bin can be diffed against the mmap path. Keys
+// are taken exactly as the file stores them, whatever its KeyFormat.
 //
-//   build/storeProbe [--spec 32011] 0x1234... 0xabcd...
+//   build/storeProbe [--spec 740210A] 0x1234... 0xabcd...
 //
-// Without --spec it reads the file config.h names.
+// Without --spec it reads the file solver/singleHand/config.h names.
 
-#include "solver/multiHand/config.h"
 #include "server/strategyStore.h"
 
 #include <cstdlib>
@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
         for (int i = first; i < argc; i++) {
             uint64_t key = std::strtoull(argv[i], nullptr, 0);
             StrategyRecord record;
-            if (!store.lookup(key, record)) {
+            if (!store.lookupFileKey(key, record)) {
                 std::cout << key << " MISS" << std::endl;
                 continue;
             }

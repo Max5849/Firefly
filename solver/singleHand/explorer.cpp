@@ -5,19 +5,20 @@
 #include "solver/singleHand/trace.h"
 #include <numbers>
 
-// Applies w <- scale * w + shift atomically. An EMA step w <- w + s (t - w) is the map
-// with scale 1 - s and shift s * t.
-static inline std::pair<double, double> affineUpdate(std::atomic<uint64_t>& word,
-            double scale, double shift) {
-    uint64_t old = word.load(std::memory_order_relaxed);
-    uint64_t next;
+// Applies w <- scale * w + shift atomically, rounding the result stochastically back to a
+// fixed point code with the uniform u. An EMA step w <- w + s (t - w) is the map with
+// scale 1 - s and shift s * t.
+static inline std::pair<double, double> affineUpdate(std::atomic<uint32_t>& word,
+            double scale, double shift, double u) {
+    uint32_t old = word.load(std::memory_order_relaxed);
+    uint32_t next;
     double value;
     do {
-        value = std::bit_cast<double>(old);
-        next = std::bit_cast<uint64_t>(scale * value + shift);
+        value = decodeFixedWeight(old);
+        next = encodeFixedWeight(scale * value + shift, u);
     } while (!word.compare_exchange_weak(old, next,
         std::memory_order_relaxed, std::memory_order_relaxed));
-    return {value, std::bit_cast<double>(next)};
+    return {value, decodeFixedWeight(next)};
 }
 
 // Applies v <- scale[o] * v + shift[o] to each legal option's variance in one CAS,
@@ -92,8 +93,8 @@ struct Explorer {
         if (inserted) {
             const BaseEntry* base = nullptr;
             if constexpr (USE_BASE) {
-                base = strategyBase.find(engine.getActionState(BASE_MEMORY_BASIC)
-                    | engine.getMetaState(BASE_METAS_BASIC) << 42);
+                base = strategyBase.find(engine.getActionState(BASE_MEMORY_STAGE)
+                    | engine.getMetaState(BASE_METAS_STAGE) << ACTION_STATE_BITS);
             }
             uint8_t legal = 0;
             if (base == nullptr) {
@@ -125,9 +126,11 @@ struct Explorer {
                 }
             }
             // A seeded node starts from the base's weights and variances, and its options
-            // skip the running mean.
+            // skip the running mean. A base weight is a multiple of 1/1024 pot, so it lands
+            // on a code exactly wherever it is in range.
             for (int j = 0; j < 4; j++) {
-                storeDouble(weights.weights[j], base != nullptr ? decodeWeight(base->weights[j]) : 0.0);
+                storeWeight(weights.weights[j],
+                    base != nullptr ? decodeWeight(base->weights[j]) : 0.0, 0.0);
             }
             weights.variances.store(base != nullptr ? base->variances : 0, std::memory_order_relaxed);
             weights.stats.store(legal | (base != nullptr ? SEEDED_BIT : 0), std::memory_order_relaxed);
@@ -144,7 +147,7 @@ struct Explorer {
         for (int j = 0; j < 5; j++) {
             double draw = 0;
             if (legal & (1u << j)) {
-                const double w = j == 0 ? 0.0 : loadDouble(weights.weights[j - 1]);
+                const double w = j == 0 ? 0.0 : loadWeight(weights.weights[j - 1]);
                 draw = std::exp(std::clamp(INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
             }
             probabilities[j] = draw;
@@ -170,12 +173,18 @@ struct Explorer {
         return option;
     }
 
+    // The stages a hand computes, as bit masks: the trained stage, and the base's when
+    // USE_BASE.
+    static constexpr uint32_t MEMORY_STAGE_MASK =
+        1u << MEMORY_STAGE | (USE_BASE ? 1u << BASE_MEMORY_STAGE : 0u);
+    static constexpr uint32_t METAS_STAGE_MASK =
+        1u << METAS_STAGE | (USE_BASE ? 1u << BASE_METAS_STAGE : 0u);
+
     static void setActionStates(Engine& engine) {
-        if (!MEMORY_BASIC || (USE_BASE && !BASE_MEMORY_BASIC)) {
-            engine.setActionState(false);
-        }
-        if (MEMORY_BASIC || (USE_BASE && BASE_MEMORY_BASIC)) {
-            engine.setActionState(true);
+        for (int stage = 0; stage < MEMORY_STAGE_COUNT; stage++) {
+            if (MEMORY_STAGE_MASK >> stage & 1) {
+                engine.setActionState(stage);
+            }
         }
     }
 
@@ -189,8 +198,7 @@ struct Explorer {
             engine.showdown();
             return false;
         }
-        engine.setMetaState(!METAS_BASIC || (USE_BASE && !BASE_METAS_BASIC),
-            METAS_BASIC || (USE_BASE && BASE_METAS_BASIC));
+        engine.setMetaState(METAS_STAGE_MASK);
         return true;
     }
 
@@ -212,11 +220,19 @@ struct Explorer {
 
     double traverse(Worker& worker, Engine& engine, int traverser, double reach) {
         while (true) {
+            // A forced fold is not a decision: no key, no node, no update. The traverser's
+            // fold ends at its current stack, which is the value traverse returns.
+            if (engine.autoFold()) {
+                if (engine.getAction() == traverser || !advance(engine, 0)) {
+                    return engine.players[traverser].chips;
+                }
+                continue;
+            }
             setActionStates(engine);
             // setActionState() wrote spr and cpr, which getOptions() reads.
             const std::array<bool, 5> options = engine.getOptions();
-            const uint64_t key = engine.getActionState(MEMORY_BASIC)
-                | engine.getMetaState(METAS_BASIC) << 42;
+            const uint64_t key = engine.getActionState(MEMORY_STAGE)
+                | engine.getMetaState(METAS_STAGE) << ACTION_STATE_BITS;
             Entry& weights = locateNode(engine, key, options);
             std::array<double, 5> policy;
             nodePolicy(weights, policy);
@@ -307,7 +323,8 @@ struct Explorer {
             // A touch of weight w is w unit steps: it keeps exp(-rate * w).
             const double ema = -std::expm1(-worker.learningRate * touch / variance);
             const double step = seeded ? ema : std::max(share, ema);
-            auto [before, after] = affineUpdate(weights.weights[o], 1.0 - step, step * target);
+            auto [before, after] = affineUpdate(weights.weights[o], 1.0 - step, step * target,
+                worker.unit(worker.gen));
             const double gap = target - before;
             scale[o] = 1.0 - step;
             shift[o] = (1.0 - step) * step * gap * gap;
@@ -415,14 +432,20 @@ struct Explorer {
         std::cout << "Pruned " << pruned << " nodes under " << VISITS_FLOOR << " visits" << std::endl;
     }
 
-    static std::string spec(bool metasBasic, bool memoryBasic) {
-        return std::to_string((int)(10000 * PLAYER_COUNT + 10 * CHIP_COUNT
-            + 10 * metasBasic + 1 * memoryBasic));
+    // Players, chips / 10, the ante, the metas and memory stages, then the tag: 740211A
+    // at 7 players, 400 chips, an ante of 2, both stages 1 and tag A.
+    static_assert(ANTE == int(ANTE) && ANTE >= 0 && ANTE <= 9,
+        "the spec holds the ante as a single digit");
+    static_assert(METAS_STAGE_COUNT <= 10 && MEMORY_STAGE_COUNT <= 10,
+        "the spec holds each stage as a single digit");
+    static std::string spec(int metasStage, int memoryStage, char tag) {
+        return std::to_string((int)(100000 * PLAYER_COUNT + 100 * CHIP_COUNT + 100 * ANTE
+            + 10 * metasStage + 1 * memoryStage)) + tag;
     }
 
     void downloadStrategyBase() {
         std::string path = "solver/strategies/strategy_"
-            + spec(BASE_METAS_BASIC, BASE_MEMORY_BASIC) + ".bin";
+            + spec(BASE_METAS_STAGE, BASE_MEMORY_STAGE, BASE_STRATEGY_TAG) + ".bin";
         uint64_t bytes = fileSize(path);
         std::ifstream file = openRead(path);
         uint64_t size;
@@ -458,14 +481,14 @@ struct Explorer {
 
     void uploadStrategy() {
         CheckedWriter writeFile("solver/strategies/strategy_"
-            + spec(METAS_BASIC, MEMORY_BASIC) + ".bin");
+            + spec(METAS_STAGE, MEMORY_STAGE, STRATEGY_TAG) + ".bin");
         uint64_t size = strategy.count();
         writeFile.write(&size, sizeof(size));
         for (uint64_t i = 0; i < size; i++) {
             Entry& weights = strategy.dense[i];
             std::array<int16_t, 4> out;
             for (int j = 0; j < 4; j++) {
-                out[j] = encodeWeight(loadDouble(weights.weights[j]));
+                out[j] = encodeWeight(loadWeight(weights.weights[j]));
             }
             uint64_t key = weights.key.load(std::memory_order_relaxed);
             uint64_t variances = weights.variances.load(std::memory_order_relaxed);
@@ -500,11 +523,14 @@ int main () {
         std::cout << std::boolalpha << std::setprecision(12)
                   << "PLAYER_COUNT: " << PLAYER_COUNT << "\n"
                   << "CHIP_COUNT: " << CHIP_COUNT << "\n"
-                  << "METAS_BASIC: " << METAS_BASIC << "\n"
-                  << "MEMORY_BASIC: " << MEMORY_BASIC << "\n"
+                  << "ANTE: " << ANTE << "\n"
+                  << "METAS_STAGE: " << METAS_STAGE << "\n"
+                  << "MEMORY_STAGE: " << MEMORY_STAGE << "\n"
+                  << "STRATEGY_TAG: " << STRATEGY_TAG << "\n"
                   << "USE_BASE: " << USE_BASE << "\n"
-                  << "BASE_METAS_BASIC: " << BASE_METAS_BASIC << "\n"
-                  << "BASE_MEMORY_BASIC: " << BASE_MEMORY_BASIC << "\n"
+                  << "BASE_METAS_STAGE: " << BASE_METAS_STAGE << "\n"
+                  << "BASE_MEMORY_STAGE: " << BASE_MEMORY_STAGE << "\n"
+                  << "BASE_STRATEGY_TAG: " << BASE_STRATEGY_TAG << "\n"
                   << "BASE_CONFIDENCE: " << BASE_CONFIDENCE << "\n"
                   << "EPOCHS: " << EPOCHS << "\n"
                   << "INV_TEMP: " << INV_TEMP << "\n"

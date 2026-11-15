@@ -5,8 +5,8 @@
 // Must be run from the repository root: the engine resolves the handAnalysis tables,
 // and the registry the strategy files, through relative paths.
 //
-// POST /strategy  {"config": {"players": 3, "chips": 200, "metasBasic": true,
-//                             "memoryBasic": true},
+// POST /strategy  {"config": {"players": 7, "chips": 400, "ante": 2, "metasStage": 1,
+//                             "memoryStage": 0, "tag": "A"},
 //                  "actions": [2, 1], "board": "As7h2d"}
 //   -> the table (game), the acting seat's key decoded (key), and the strategy, range,
 //      EV and variances of all 1326 hole card combinations at that node (spot).
@@ -168,12 +168,17 @@ struct Request {
     IncludeMask include;
 };
 
-inline constexpr int MAX_CHIPS = 100000;
-
 static json configJson(const StrategyConfig& config) {
-    return {{"players", config.players}, {"chips", config.chips},
-        {"metasBasic", config.metasBasic}, {"memoryBasic", config.memoryBasic},
-        {"spec", config.spec()}};
+    return {{"players", config.players}, {"chips", config.chips}, {"ante", config.ante},
+        {"metasStage", config.metasStage}, {"memoryStage", config.memoryStage},
+        {"tag", std::string(1, config.tag)}, {"spec", config.spec()}};
+}
+
+static std::string describeConfig(const StrategyConfig& config) {
+    return std::to_string(config.players) + " players, " + std::to_string(config.chips)
+        + " chips, ante " + std::to_string(config.ante) + ", metas stage "
+        + char('A' + config.metasStage) + ", memory stage " + char('A' + config.memoryStage)
+        + ", tag " + config.tag;
 }
 
 static json availableJson() {
@@ -193,50 +198,75 @@ static void fail(httplib::Response& response, int status, const std::string& cod
     response.set_content(body.dump(), "application/json");
 }
 
-// Every field optional; a missing one takes the value config.h was compiled with.
+// An integer field of the config, within [low, high].
+static bool configInteger(const json& value, const std::string& name, int low, int high,
+        int& out, std::string& error) {
+    if (!value.is_number() || value.get<double>() != std::floor(value.get<double>())
+            || value.get<double>() < low || value.get<double>() > high) {
+        error = "\"config." + name + "\" must be a whole number from " + std::to_string(low)
+            + " to " + std::to_string(high);
+        return false;
+    }
+    out = int(value.get<double>());
+    return true;
+}
+
+// Every field optional; a missing one takes the value solver/singleHand/config.h was
+// compiled with.
 static bool parseConfig(const json& body, StrategyConfig& config, std::string& error) {
     if (!body.contains("config") || body["config"].is_null()) {
         return true;
     }
     const json& node = body["config"];
     if (!node.is_object()) {
-        error = "\"config\" must be an object like {\"players\": 3, \"chips\": 200, "
-            "\"metasBasic\": true, \"memoryBasic\": true}";
+        error = "\"config\" must be an object like {\"players\": 7, \"chips\": 400, "
+            "\"ante\": 2, \"metasStage\": 1, \"memoryStage\": 0, \"tag\": \"A\"}";
         return false;
     }
     for (auto entry = node.begin(); entry != node.end(); ++entry) {
         const std::string& name = entry.key();
         const json& value = entry.value();
         if (name == "players") {
-            if (!value.is_number_integer() || value.get<int>() < 3 || value.get<int>() > 7) {
-                error = "\"config.players\" must be an integer from 3 to 7";
+            if (!configInteger(value, name, 3, 7, config.players, error)) {
                 return false;
             }
-            config.players = value.get<int>();
         } else if (name == "chips") {
-            if (!value.is_number() || value.get<double>() != std::floor(value.get<double>())
-                    || value.get<double>() <= 0 || value.get<double>() > MAX_CHIPS) {
-                error = "\"config.chips\" must be a positive whole number of chips up to "
-                    + std::to_string(MAX_CHIPS);
+            if (!configInteger(value, name, MIN_CHIPS, MAX_CHIPS, config.chips, error)) {
                 return false;
             }
-            const int chips = int(value.get<double>());
-            if (chips % 2 != 0) {
-                error = "\"config.chips\" must be even: strategy files are named by "
-                    "10 * chips + 10 * metasBasic, so an odd stack shares its name with "
-                    "the next stack up";
+            if (config.chips % CHIPS_STEP != 0) {
+                error = "\"config.chips\" must be a multiple of 10: strategy files are named "
+                    "by 100 * chips + 100 * ante, so any other stack shares its name with "
+                    "another stack and ante";
                 return false;
             }
-            config.chips = chips;
+        } else if (name == "ante") {
+            if (!configInteger(value, name, 0, MAX_ANTE, config.ante, error)) {
+                return false;
+            }
+        } else if (name == "metasStage") {
+            if (!configInteger(value, name, 0, METAS_STAGE_COUNT - 1, config.metasStage, error)) {
+                return false;
+            }
+        } else if (name == "memoryStage") {
+            if (!configInteger(value, name, 0, MEMORY_STAGE_COUNT - 1, config.memoryStage, error)) {
+                return false;
+            }
+        } else if (name == "tag") {
+            if (!value.is_string() || value.get<std::string>().size() != 1
+                    || !validTag(value.get<std::string>()[0])) {
+                error = "\"config.tag\" must be a single letter, like \"A\"";
+                return false;
+            }
+            config.tag = value.get<std::string>()[0];
         } else if (name == "metasBasic" || name == "memoryBasic") {
-            if (!value.is_boolean()) {
-                error = "\"config." + name + "\" must be true or false";
-                return false;
-            }
-            (name == "metasBasic" ? config.metasBasic : config.memoryBasic) = value.get<bool>();
+            error = "\"config." + name + "\" was replaced by the integer \""
+                + (name == "metasBasic" ? "metasStage" : "memoryStage")
+                + "\" (0 = full detail; true was stage 1)";
+            return false;
         } else {
             error = "unknown field \"" + name + "\" in \"config\" "
-                "(valid: players, chips, metasBasic, memoryBasic)";
+                "(valid: players, chips, ante, metasStage, memoryStage, tag)";
             return false;
         }
     }
@@ -278,8 +308,10 @@ static void writeConfig(JsonWriter& w, const StrategyConfig& config) {
     w.beginObject();
     w.field("players", config.players);
     w.field("chips", config.chips);
-    w.field("metasBasic", config.metasBasic);
-    w.field("memoryBasic", config.memoryBasic);
+    w.field("ante", config.ante);
+    w.field("metasStage", config.metasStage);
+    w.field("memoryStage", config.memoryStage);
+    w.field("tag", std::string(1, config.tag));
     w.field("spec", config.spec());
     w.endObject();
 }
@@ -310,6 +342,8 @@ void writeGame(JsonWriter& w, Replay<P>& replay, const std::array<bool, 5>& lega
     w.field("pot", engine.pot);
     w.field("heads", engine.heads);
     w.field("blinds", std::string("1/2"));
+    // A dead ante in the pot from the deal, paid by no seat.
+    w.field("ante", float(replay.config.ante));
 
     w.key("seats");
     w.beginArray();
@@ -374,7 +408,8 @@ void writeGame(JsonWriter& w, Replay<P>& replay, const std::array<bool, 5>& lega
             w.field("street", entry.name);
             w.field("board", entry.board);
         } else {
-            w.field("kind", std::string(entry.kind == HistoryEntry::Post ? "post" : "action"));
+            w.field("kind", std::string(entry.kind == HistoryEntry::Post ? "post"
+                : entry.kind == HistoryEntry::AutoFold ? "autoFold" : "action"));
             w.field("seat", entry.seat);
             w.field("name", entry.name);
             w.field("option", entry.option);
@@ -409,7 +444,8 @@ static void writeKey(JsonWriter& w, const KeyLayout& layout) {
     w.field("villanSeat", layout.villanSeat);
     w.field("spr", layout.spr);
     w.field("cpr", layout.cpr);
-    w.field("sharedBits", 58);
+    w.field("sharedBits", SHARED_KEY_BITS);
+    w.field("actionStateBits", ACTION_STATE_BITS);
     w.key("fields");
     w.beginArray();
     for (const KeyField& field : layout.fields) {
@@ -441,8 +477,10 @@ static void writeKey(JsonWriter& w, const KeyLayout& layout) {
 }
 
 template <int P>
-void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops) {
+void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops, KeyFormat format) {
     w.beginObject();
+    // The strategy file's key layout; rows' keys are always the current layout.
+    w.field("keyFormat", std::string(keyFormatName(format)));
     w.key("legal");
     writeLegal(w, spot.legal);
     w.field("invTemp", spot.invTemp);
@@ -577,7 +615,7 @@ void answer(const Request& request, const StrategyStore& store, httplib::Respons
     }
     if (request.include.spot) {
         w.key("spot");
-        writeSpot<P>(w, computeSpot(*replay, store, result.legal), replay->drops);
+        writeSpot<P>(w, computeSpot(*replay, store, result.legal), replay->drops, store.format);
     }
     w.endObject();
     response.set_content(std::move(w.out), "application/json");
@@ -607,12 +645,18 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Every table but handScores.bin, which only a showdown reads.
+        // The tables every stage shares. Each metas stage's tables load on the first
+        // request for it (ServerTables::requireStage), and handScores.bin never: only a
+        // showdown reads it. --warm loads the default stage's now.
         ServerTables::load();
+        if (options.warm) {
+            ServerTables::requireStage(METAS_STAGE);
+        }
 
         StrategyRegistry registry;
         registry.warm = options.warm;
         registry.log = &std::cout;
+        registry.detectFormat = detectKeyFormatForSpec;
         const StrategyConfig defaults;
         std::cout << "Default spec: " << defaults.spec() << "\n"
                   << "Available:";
@@ -635,8 +679,9 @@ int main(int argc, char** argv) {
             json body;
             body["status"] = "ok";
             json loaded = json::array();
-            for (const auto& [spec, records] : registry.loaded()) {
-                loaded.push_back({{"spec", spec}, {"records", records}});
+            for (const auto& entry : registry.loaded()) {
+                loaded.push_back({{"spec", entry.spec}, {"records", entry.records},
+                    {"keyFormat", keyFormatName(entry.format)}});
             }
             body["loaded"] = loaded;
             response.set_content(body.dump(), "application/json");
@@ -645,12 +690,18 @@ int main(int argc, char** argv) {
         server.Get("/meta", [&](const httplib::Request&, httplib::Response& response) {
             json body;
             body["defaults"] = configJson(defaults);
-            body["limits"] = {{"players", {3, 7}}, {"chipsMax", MAX_CHIPS}, {"chipsEven", true}};
+            body["limits"] = {{"players", {3, 7}}, {"chips", {MIN_CHIPS, MAX_CHIPS}},
+                {"chipsStep", CHIPS_STEP}, {"ante", {0, MAX_ANTE}},
+                {"metasStages", METAS_STAGE_COUNT}, {"memoryStages", MEMORY_STAGE_COUNT}};
+            json stages = json::array();
+            for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
+                stages.push_back(ServerTables::stageLoaded(stage));
+            }
+            body["metasStagesLoaded"] = stages;
             body["available"] = availableJson();
             body["blinds"] = {1, 2};
             body["invTemp"] = DEFAULT_INV_TEMP;
             body["invTempRange"] = {MIN_INV_TEMP, MAX_INV_TEMP};
-            body["rangeFloor"] = RANGE_FLOOR;
             body["comboCount"] = COMBO_COUNT;
             body["options"] = std::vector<std::string>(OPTION_NAMES, OPTION_NAMES + 5);
             json seats = json::object();
@@ -665,9 +716,13 @@ int main(int argc, char** argv) {
                 "after calling";
             body["invTempUnits"] = "per pot: every policy is a softmax over each option's "
                 "weight, its return as a share of the pot after calling";
-            body["replay"] = "ranges are replayed through that same softmax at the request's "
-                "invTemp and this server's RANGE_FLOOR; the default is the singleHand "
-                "trainer's INV_TEMP";
+            body["replay"] = "ranges are each seat's own policy multiplied along the line, "
+                "through that same softmax at the request's invTemp; the default is the "
+                "singleHand trainer's INV_TEMP. A seat that has called twice on a street "
+                "folds to a further bet by itself (history kind autoFold), with no entry in "
+                "the action list";
+            body["streets"] = "hands are played preflop and flop only: the betting ends "
+                "after the flop, or after a raised preflop with more than 3 players left";
             response.set_content(body.dump(2), "application/json");
         });
 
@@ -749,6 +804,27 @@ int main(int argc, char** argv) {
             }
 
             const std::string spec = request.config.spec();
+            auto missing = [&] {
+                fail(response, 404, "strategyMissing",
+                    "no strategy has been trained for " + describeConfig(request.config)
+                        + ": " + strategyPath(spec) + " does not exist",
+                    {{"spec", spec}, {"path", strategyPath(spec)},
+                        {"config", configJson(request.config)}, {"available", availableJson()}});
+            };
+            if (!std::filesystem::exists(strategyPath(spec))) {
+                missing();
+                return;
+            }
+            // Before the store: opening one reads its opening node, which needs the tables.
+            try {
+                ServerTables::requireStage(request.config.metasStage);
+            } catch (const std::exception& e) {
+                fail(response, 500, "tablesMissing", std::string("the hand-analysis tables for "
+                    "metas stage ") + char('A' + request.config.metasStage)
+                    + " cannot be loaded: " + e.what(),
+                    {{"metasStage", request.config.metasStage}});
+                return;
+            }
             std::shared_ptr<const StrategyStore> store;
             try {
                 store = registry.get(spec);
@@ -758,14 +834,7 @@ int main(int argc, char** argv) {
                 return;
             }
             if (store == nullptr) {
-                fail(response, 404, "strategyMissing",
-                    "no strategy has been trained for " + std::to_string(request.config.players)
-                        + " players, " + std::to_string(request.config.chips) + " chips, metasBasic "
-                        + (request.config.metasBasic ? "on" : "off") + ", memoryBasic "
-                        + (request.config.memoryBasic ? "on" : "off")
-                        + ": " + strategyPath(spec) + " does not exist",
-                    {{"spec", spec}, {"path", strategyPath(spec)},
-                        {"config", configJson(request.config)}, {"available", availableJson()}});
+                missing();
                 return;
             }
 

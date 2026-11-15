@@ -12,32 +12,30 @@ inline void cpuRelax() {
 
 // stats: bits 0-4 the legal options, bit 7 seeded from the base, bits 8-63 visits.
 // variances: option j's 16-bit variance code in bits 16 (j - 1) to 16 (j - 1) + 15.
-// weights: options 1..4 as doubles; fold's is the exact 0.
+// weights: options 1..4 as 6.26 fixed point (encodeFixedWeight); fold's is the exact 0.
 struct Entry {
     std::atomic<uint64_t> key;
     std::atomic<uint64_t> stats;
     std::atomic<uint64_t> variances;
-    std::array<std::atomic<uint64_t>, 4> weights;
+    std::array<std::atomic<uint32_t>, 4> weights;
 };
-static_assert(sizeof(Entry) == 56, "Entry must stay packed at 56 bytes");
+static_assert(sizeof(Entry) == 40, "Entry must stay packed at 40 bytes");
 
 inline constexpr double VISITS_ONE = 65536.0;
 inline constexpr int VISITS_SHIFT = 8;
 inline constexpr uint64_t LEGAL_MASK = 0x1F;
 inline constexpr uint64_t SEEDED_BIT = 0x80;
 
-// A variance code is 3072 per octave of variance from 0.25, so 65536 codes span 21.3
-// octaves: [0.25, 6.7e5) pots squared. The scale is fixed rather than tied to
-// VARIANCE_MIN, so a file reads the same whatever VARIANCE_MIN the run reading it has;
-// the step applies VARIANCE_MIN when it reads a variance. A variance below the floor is
-// stored as the floor. A return is at most PLAYER_COUNT * CHIP_COUNT over the smallest
-// pot after calling, 4 chips, so its variance is at most that squared. Strategy files
-// carry the codes, so these must match between a run, the base it reads and the server.
-inline constexpr double VARIANCE_CODE_FLOOR = 0.25;
-inline constexpr double VARIANCE_CODES_PER_OCTAVE = 3072.0;
-static_assert(VARIANCE_CODE_FLOOR * double(1ULL << int(65535 / VARIANCE_CODES_PER_OCTAVE))
-    >= (PLAYER_COUNT * CHIP_COUNT / 4.0) * (PLAYER_COUNT * CHIP_COUNT / 4.0),
-    "the largest variance code is below the largest variance a return can have");
+// A variance code is log-spaced from 1/16 to 90000 pots squared: code 0 is the floor,
+// code 65535 the max, so there are 65535 / log2(90000 * 16) = 3203.45 codes per octave.
+// The scale is fixed rather than tied to VARIANCE_MIN, so a file reads the same whatever
+// VARIANCE_MIN the run reading it has; the step applies VARIANCE_MIN when it reads a
+// variance. A variance below the floor is stored as the floor, and one above the max as
+// the max. Strategy files carry the codes, so these must match between a run, the base
+// it reads and the server (server/strategyStore.h).
+inline constexpr double VARIANCE_CODE_FLOOR = 1.0 / 16.0;
+inline constexpr double VARIANCE_CODE_MAX = 90000.0;
+inline constexpr double VARIANCE_CODES_PER_OCTAVE = 3203.4490972497106;
 static_assert(VARIANCE_MIN >= VARIANCE_CODE_FLOOR,
     "VARIANCE_MIN is below the smallest variance a code can record");
 
@@ -70,10 +68,9 @@ inline uint64_t encodeVariance(double variance, double u) {
     return low + (u * (varianceCodes[low + 1] - below) < variance - below);
 }
 
-// A strategy file's weight, in pots: a 16-bit code of 1/256 pot steps, so it spans
-// [-128, 127.996]. A trained weight outside that is all but unheard of, so it is clamped
-// rather than given more bits.
-inline constexpr double WEIGHT_CODES_PER_POT = 256.0;
+// A strategy file's weight, in pots: a 16-bit code of 1/1024 pot steps, so it spans
+// [-32, 31.999], the run's fixed point range.
+inline constexpr double WEIGHT_CODES_PER_POT = 1024.0;
 
 inline int16_t encodeWeight(double weight) {
     return int16_t(std::clamp(std::lround(weight * WEIGHT_CODES_PER_POT),
@@ -84,12 +81,39 @@ inline double decodeWeight(int16_t code) {
     return double(code) / WEIGHT_CODES_PER_POT;
 }
 
-inline double loadDouble(const std::atomic<uint64_t>& word) {
-    return std::bit_cast<double>(word.load(std::memory_order_relaxed));
+// A run's weight, in pots: a two's complement int32 held in a uint32, 6 integer bits and
+// 26 fraction bits, so it spans [-32, 32) in steps of 2^-26. A weight outside that is
+// clamped. Each write rounds to one of the two neighbouring codes, the upper with
+// probability equal to how far up the gap the exact value lies, so small steps are kept
+// on average rather than lost to rounding.
+inline constexpr int FIXED_WEIGHT_FRACTION_BITS = 26;
+inline constexpr double FIXED_WEIGHT_ONE = double(1ULL << FIXED_WEIGHT_FRACTION_BITS);
+inline constexpr double FIXED_WEIGHT_MIN = double(INT32_MIN) / FIXED_WEIGHT_ONE;
+inline constexpr double FIXED_WEIGHT_MAX = double(INT32_MAX) / FIXED_WEIGHT_ONE;
+
+inline double decodeFixedWeight(uint32_t code) {
+    return double(int32_t(code)) / FIXED_WEIGHT_ONE;
 }
 
-inline void storeDouble(std::atomic<uint64_t>& word, double value) {
-    word.store(std::bit_cast<uint64_t>(value), std::memory_order_relaxed);
+// u is uniform on [0, 1).
+inline uint32_t encodeFixedWeight(double weight, double u) {
+    const double exact = weight * FIXED_WEIGHT_ONE;
+    if (!(exact > double(INT32_MIN))) {
+        return uint32_t(INT32_MIN);
+    }
+    if (exact >= double(INT32_MAX)) {
+        return uint32_t(INT32_MAX);
+    }
+    const double low = std::floor(exact);
+    return uint32_t(int32_t(low) + int32_t(u < exact - low));
+}
+
+inline double loadWeight(const std::atomic<uint32_t>& word) {
+    return decodeFixedWeight(word.load(std::memory_order_relaxed));
+}
+
+inline void storeWeight(std::atomic<uint32_t>& word, double value, double u) {
+    word.store(encodeFixedWeight(value, u), std::memory_order_relaxed);
 }
 
 inline uint8_t entryLegal(const Entry& entry) {

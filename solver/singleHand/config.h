@@ -1,15 +1,17 @@
 #pragma once
-//shift to odds floor
+
 #include "solver/include/library.h"
-#include <cmath>
 
 constexpr int PLAYER_COUNT = 7;
 constexpr float CHIP_COUNT = 400.0;
-constexpr bool METAS_BASIC = true;
-constexpr bool MEMORY_BASIC = true;
+constexpr float ANTE = 2.0;
+constexpr int METAS_STAGE = 2;
+constexpr int MEMORY_STAGE = 0;
+constexpr char STRATEGY_TAG = 'A';
 constexpr bool USE_BASE = false;
-constexpr bool BASE_METAS_BASIC = true;
-constexpr bool BASE_MEMORY_BASIC = true;
+constexpr int BASE_METAS_STAGE = 1;
+constexpr int BASE_MEMORY_STAGE = 1;
+constexpr char BASE_STRATEGY_TAG = 'A';
 constexpr double BASE_CONFIDENCE = 0.0;
 
 constexpr uint64_t EPOCHS = uint64_t(48) * 131072000;
@@ -29,17 +31,32 @@ constexpr double VISITS_FLOOR = 0.0;
 
 
 // Prints every decision that reaches TRACE_KEY, and its update. The key is on the
-// current layout: action state in bits 0-41, meta state in bits 42-63.
+// current layout: action state in bits 0-42, meta state in bits 43-63.
 constexpr bool TRACE_KEY_ENABLED = false;
-constexpr uint64_t TRACE_KEY = 0xfc0012000021;
+constexpr uint64_t TRACE_KEY = 0x0000000000000000;
 // Prints one in every TRACE_EVERY traces: a hand that reaches TRACE_KEY is one trace,
 // counted across all threads. 1 prints them all.
 constexpr uint64_t TRACE_EVERY = 10000;
 
 // A strategy_<spec>.bin record: uint64 key, int16 weights[4] for options 1..4 as
-// encodeWeight's 1/256 pot codes, and uint64 variances, the four 16-bit codes packed as
-// in Entry::variances. Weights are doubles only while the run holds them. Neither visits
-// nor the legal options are stored.
+// encodeWeight's 1/1024 pot codes, and uint64 variances, the four 16-bit codes packed as
+// in Entry::variances. The run holds weights as 6.26 fixed point (Entry::weights).
+// Neither visits nor the legal options are stored.
+
+// Fixed: the engine reads stage C (index 2) by name, for its preflop clusters.
+constexpr int METAS_STAGE_COUNT = 3;
+constexpr int MEMORY_STAGE_COUNT = 3;
+
+constexpr int ACTION_STATE_BITS = 43;
+// The meta state above it: board class + 169 in the low BOARD_CLASS_BITS, then the hand's
+// equity cluster within that board class in HAND_META_BITS, so at most 64 per class.
+constexpr int BOARD_CLASS_BITS = 15;
+constexpr int HAND_META_BITS = 6;
+constexpr uint64_t BOARD_CLASS_MASK = (1ULL << BOARD_CLASS_BITS) - 1;
+constexpr uint64_t HAND_META_MASK = (1ULL << HAND_META_BITS) - 1;
+static_assert(ACTION_STATE_BITS + BOARD_CLASS_BITS + HAND_META_BITS == 64,
+    "the action and meta states must fill the 64-bit key");
+
 constexpr uint64_t STRATEGY_RECORD_BYTES = 24;
 constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
 
@@ -50,7 +67,7 @@ constexpr double MAX_LOAD = 0.95;
 constexpr double BASE_MAX_LOAD = 0.5;
 
 constexpr uint64_t CHUNK_HANDS = 1ULL << 16;
-constexpr uint64_t PRINT_CHUNKS = 1ULL << 8;
+constexpr uint64_t PRINT_CHUNKS = 1ULL << 4;
 
 // Clamp on INV_TEMP * w before exp, so a runaway weight cannot turn the option total
 // into inf or zero.

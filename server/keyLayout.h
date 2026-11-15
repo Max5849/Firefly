@@ -4,21 +4,24 @@
 
 // The shared part of the state key, decoded field by field from the key's own bits.
 //
-// The node's key is actionState | metaState[combo] << 42. Bits 0..41 (the action
-// state) and, postflop, bits 42..57 (the board field) are the same for every combo at
-// a node; bits 58..63 are the combo's hand cluster and are left to the per-combo rows.
-// Preflop bits 42..57 hold the combo's 169 class instead of a board, so there is no
-// shared board field.
+// The node's key is actionState | metaState[combo] << ACTION_STATE_BITS (43). Bits 0..42
+// (the action state) and, postflop, bits 43..57 (the board field) are the same for every
+// combo at a node; bits 58..63 are the combo's hand cluster and are left to the
+// per-combo rows. Preflop bits 43..57 hold the combo's 169 class (stage C: its preflop
+// cluster) instead of a board, so there is no shared board field.
 //
 // Everything here reads the key, not the engine, so a field shows exactly what the key
-// holds - bucketed, clamped, and zeroed where MEMORY_BASIC drops it. keyEquivalence
-// checks each decoded value against the engine quantity it encodes.
+// holds - bucketed, clamped, and zeroed where Engine::setActionState leaves it 0.
+// keyEquivalence checks each decoded value against the engine quantity it encodes.
+//
+// Every memory stage currently builds the same action state, so the layout does not
+// depend on the stage.
 
 struct KeyPart {
     std::string name;
     int value = 0;
     std::string meaning;
-    // MEMORY_BASIC forces this part to 0.
+    // The key holds this part at 0 here, whatever the hand did.
     bool zeroed = false;
 };
 
@@ -30,7 +33,7 @@ struct KeyField {
     // Raw bits, in [0, 2^width).
     uint64_t value = 0;
     std::string meaning;
-    // MEMORY_BASIC forces the whole field to 0.
+    // The key holds the whole field at 0 here, whatever the hand did.
     bool zeroed = false;
     // For a field that packs several values: its digits, most significant first.
     std::vector<KeyPart> parts;
@@ -39,8 +42,8 @@ struct KeyField {
 };
 
 struct KeyLayout {
-    // actionState | boardField << 42, with the cluster bits clear. Preflop the board
-    // field is 0.
+    // actionState | boardField << ACTION_STATE_BITS, with the cluster bits clear.
+    // Preflop the board field is 0.
     uint64_t sharedKey = 0;
     uint64_t actionState = 0;
     int heroSeat = 0;
@@ -50,7 +53,12 @@ struct KeyLayout {
     std::vector<KeyField> fields;
 };
 
-inline constexpr float SPR_THRESHOLDS[8] = {0.289f, 0.5f, 0.866f, 1.5f, 2.6f, 4.5f, 7.8f, 13.5f};
+// The bits every combo at a node shares: the action state and the board field.
+inline constexpr int SHARED_KEY_BITS = ACTION_STATE_BITS + BOARD_CLASS_BITS;
+
+// setActionState's cuts: SPR buckets 0..5, and with no chips behind, CPR buckets 6..9.
+inline constexpr float SPR_THRESHOLDS[5] = {0.5f, 1.5f, 3.5f, 7.5f, 15.5f};
+inline constexpr float CPR_THRESHOLDS[3] = {0.5f, 1.5f, 3.5f};
 
 inline std::string formatThreshold(float value) {
     std::ostringstream out;
@@ -58,23 +66,22 @@ inline std::string formatThreshold(float value) {
     return out.str();
 }
 
-// The ratio interval one SPR (0..8) or CPR (9..15) bucket covers. Under MEMORY_BASIC
-// only every other threshold is cut, so a bucket spans two of the full intervals.
-inline std::string sprCprInterval(int bucket, bool memoryBasic) {
-    const bool isCpr = bucket >= 9;
-    const int index = isCpr ? bucket - 9 : bucket;
-    const int last = isCpr ? 6 : 8;
-    const int step = memoryBasic ? 2 : 1;
-    const std::string ratio = isCpr ? "CPR" : "SPR";
-    const int low = index - step;
+inline std::string ratioInterval(const char* ratio, const float* cuts, int count, int index) {
     if (index == 0) {
-        return ratio + " < " + formatThreshold(SPR_THRESHOLDS[0]);
+        return std::string(ratio) + " < " + formatThreshold(cuts[0]);
     }
-    if (index >= last) {
-        return ratio + " >= " + formatThreshold(SPR_THRESHOLDS[std::max(0, low)]);
+    if (index >= count) {
+        return std::string(ratio) + " >= " + formatThreshold(cuts[count - 1]);
     }
-    return formatThreshold(SPR_THRESHOLDS[std::max(0, low)]) + " <= " + ratio + " < "
-        + formatThreshold(SPR_THRESHOLDS[index]);
+    return formatThreshold(cuts[index - 1]) + " <= " + ratio + " < " + formatThreshold(cuts[index]);
+}
+
+// The ratio interval one bucket covers: SPR for 0..5, CPR for 6..9.
+inline std::string sprCprInterval(int bucket) {
+    if (bucket >= 6) {
+        return "calling is all in: " + ratioInterval("CPR", CPR_THRESHOLDS, 3, bucket - 6);
+    }
+    return "chips behind: " + ratioInterval("SPR", SPR_THRESHOLDS, 5, bucket);
 }
 
 // raiseHistoryCompressed -> the per street raise counts it ranks. Built by playing
@@ -124,12 +131,18 @@ inline std::string positionBasicSeats(int value, int players) {
     return out.empty() ? "no seat" : out;
 }
 
+// bucket(x) = (x > 0) + (x > 2), for seats left to act.
 inline std::string positionBucket(int value) {
     return value == 0 ? "0" : value == 1 ? "1-2" : "3+";
 }
 
 inline std::string countClamped(int value, const char* noun) {
-    return (value >= 3 ? std::string("3+") : std::to_string(value)) + " " + noun;
+    return (value >= 2 ? std::string("2+") : std::to_string(value)) + " " + noun;
+}
+
+inline std::string headsBucket(int value) {
+    static const char* HEADS[4] = {"2 players", "3 players", "4-5 players", "6-7 players"};
+    return HEADS[value & 3];
 }
 
 inline uint64_t keyBits(uint64_t key, int shift, int width) {
@@ -137,35 +150,33 @@ inline uint64_t keyBits(uint64_t key, int shift, int width) {
 }
 
 // Decodes the acting seat's key at the node the replay reached. Must follow
-// setActionState(config.memoryBasic).
+// setActionState(config.memoryStage).
 template <int P>
 KeyLayout decodeKey(const Replay<P>& replay) {
     const auto& engine = replay.engine;
     const StrategyConfig& config = replay.config;
-    const bool memoryBasic = config.memoryBasic;
     const int round = engine.round;
     const auto& hero = engine.players[engine.action];
 
     KeyLayout out;
-    out.actionState = memoryBasic ? engine.actionStateBasic : engine.actionState;
+    out.actionState = engine.getActionState(config.memoryStage);
     out.heroSeat = engine.action;
     out.villanSeat = hero.villanPosition;
     out.spr = hero.spr;
     out.cpr = hero.cpr;
     uint64_t boardField = 0;
     if (round > 0) {
-        // Any live combo carries the board half; every valid combo was classified.
-        const auto& meta = config.metasBasic ? engine.metaStateBasic : engine.metaState;
+        // Any combo off the board carries the board half; every one was classified.
+        const auto& meta = engine.getMetaState(config.metasStage);
         for (int combo = 0; combo < COMBO_COUNT; combo++) {
             if (engine.commonRange[combo]) {
-                boardField = meta[combo] & 0xFFFF;
+                boardField = meta[combo] & BOARD_CLASS_MASK;
                 break;
             }
         }
     }
-    out.sharedKey = out.actionState | boardField << 42;
+    out.sharedKey = out.actionState | boardField << ACTION_STATE_BITS;
     const uint64_t key = out.sharedKey;
-    const std::vector<std::string> names = seatNames(P);
 
     auto add = [&](const char* name, const char* label, int shift, int width) -> KeyField& {
         KeyField field;
@@ -180,28 +191,45 @@ KeyLayout decodeKey(const Replay<P>& replay) {
 
     {
         KeyField& field = add("headsBasic", "players in the hand", 0, 2);
-        static const char* HEADS[4] = {"2 players", "3 players", "4-5 players", "6-7 players"};
-        field.meaning = HEADS[field.value];
+        field.meaning = headsBucket(int(field.value));
     }
     {
-        KeyField& field = add("sprCpr", "stack or call to pot", 2, 4);
-        field.meaning = (field.value >= 9 ? "calling is all in: " : "chips behind: ")
-            + sprCprInterval(int(field.value), memoryBasic);
+        KeyField& field = add("preflopHeadsBasic", "players who saw the flop", 2, 2);
+        field.meaning = (round == 0 ? "preflop, so the players in the hand: "
+            : "players left when preflop ended: ") + headsBucket(int(field.value));
     }
     {
-        KeyField& field = add("raiseHistory", "raises per street", 6, 8);
-        const std::array<int, 4>& counts = raiseHistoryTable()[field.value];
+        KeyField& field = add("sprCpr", "stack or call to pot", 4, 4);
+        field.meaning = sprCprInterval(int(field.value));
+    }
+    std::array<int, 4> raiseCounts;
+    {
+        KeyField& field = add("raiseHistory", "raises per street", 8, 8);
+        raiseCounts = raiseHistoryTable()[field.value];
         field.meaning = "colex rank of the raise counts";
         for (int street = 0; street < 4; street++) {
             KeyPart part;
             part.name = STREET_NAMES[street];
-            part.value = counts[street];
-            part.meaning = std::to_string(counts[street]) + " raise" + (counts[street] == 1 ? "" : "s");
+            part.value = raiseCounts[street];
+            part.meaning = std::to_string(raiseCounts[street]) + " raise"
+                + (raiseCounts[street] == 1 ? "" : "s");
             field.parts.push_back(part);
         }
     }
     {
-        KeyField& field = add("story", "hero / villain story", 14, 11);
+        KeyField& field = add("raiseSizes", "last raise was big, per street", 16, 4);
+        field.meaning = "one bit per street: its last raise was 1.5x pot or all in";
+        for (int street = 0; street < 4; street++) {
+            KeyPart part;
+            part.name = STREET_NAMES[street];
+            part.value = int(field.value >> street & 1);
+            part.meaning = raiseCounts[street] <= 0 ? "no raise"
+                : part.value ? "1.5x pot or all in" : "0.5x pot";
+            field.parts.push_back(part);
+        }
+    }
+    {
+        KeyField& field = add("story", "hero / villain story", 20, 11);
         uint64_t value = field.value;
         const int villanPos = int(value % 5);
         value /= 5;
@@ -220,86 +248,80 @@ KeyLayout decodeKey(const Replay<P>& replay) {
             const int d = digits[street];
             if (street > round) {
                 part.meaning = "not reached";
+                part.zeroed = true;
             } else if (street < round) {
                 part.meaning = d == 0 ? "neither raised last"
                     : d == 1 ? "villain raised last" : "hero raised last";
-            } else if (memoryBasic) {
-                part.meaning = d == 0 ? "hero has not raised" : "hero has raised";
             } else {
-                part.meaning = d == 0 ? "neither has raised" : d == 1 ? "villain has raised"
-                    : "hero raised and villain re-raised";
+                part.meaning = d == 0 ? "neither has raised"
+                    : d == 1 ? "one of hero and villain raised last" : "both raised last";
             }
             field.parts.push_back(part);
         }
-        const bool positionsZeroed = memoryBasic && round >= 1;
+        // Positions are kept preflop and in raised pots, and zeroed after a limped preflop.
+        const bool positionsZeroed = round > 0 && raiseCounts[0] == 0;
         KeyPart heroPart{"hero position", heroPos,
-            positionsZeroed ? "dropped postflop" : positionBasicSeats(heroPos, P), positionsZeroed};
+            positionsZeroed ? "dropped after a limped preflop" : positionBasicSeats(heroPos, P),
+            positionsZeroed};
         KeyPart villanPart{"villain position", villanPos,
-            positionsZeroed ? "dropped postflop" : positionBasicSeats(villanPos, P), positionsZeroed};
+            positionsZeroed ? "dropped after a limped preflop" : positionBasicSeats(villanPos, P),
+            positionsZeroed};
         field.parts.push_back(heroPart);
         field.parts.push_back(villanPart);
     }
+    const bool streetRaised = round < 4 && raiseCounts[round] > 0;
     {
-        KeyField& field = add("actionPositions", "action positions", 25, 5);
+        KeyField& field = add("lastRaise", "the street's last raise", 31, 5);
         const int value = int(field.value);
-        field.meaning = "three base 3 digits: 0, 1-2, 3+ players";
-        field.parts.push_back({"to act behind", value / 9, positionBucket(value / 9) + " still to act"});
-        field.parts.push_back({"behind last raiser", value / 3 % 3,
-            positionBucket(value / 3 % 3) + " left to act when the last raise was made"});
-        field.parts.push_back({"behind raise before", value % 3,
-            memoryBasic ? "dropped" : positionBucket(value % 3) + " left to act at the raise before",
-            memoryBasic});
+        field.zeroed = !streetRaised;
+        field.meaning = streetRaised ? "three base 3 digits: what the last raiser faced, "
+            "seats behind it, callers before it" : "no raise on this street";
+        field.parts.push_back({"raiser faced", value / 9,
+            streetRaised ? countClamped(value / 9, "raises") + " since the raiser last acted"
+                : "no raise", !streetRaised});
+        field.parts.push_back({"behind raiser", value / 3 % 3,
+            streetRaised ? positionBucket(value / 3 % 3) + " left to act when it was made"
+                : "no raise", !streetRaised});
+        field.parts.push_back({"callers before", value % 3,
+            streetRaised ? countClamped(value % 3, "calls") + " between the pot opening (or the raise before) and it"
+                : "no raise", !streetRaised});
     }
     {
-        KeyField& field = add("raiseSize", "last raise was big", 30, 1);
-        field.meaning = field.value ? "last raise was 1.5x pot or all in" : "last raise was 0.5x pot, or none";
+        KeyField& field = add("hiddenRaiseSize", "raise before was big", 36, 1);
+        const bool reraised = round < 4 && raiseCounts[round] > 1;
+        field.zeroed = !reraised;
+        field.meaning = !reraised ? "fewer than two raises on this street"
+            : field.value ? "the raise before was 1.5x pot or all in" : "the raise before was 0.5x pot";
     }
     {
-        KeyField& field = add("raiseStrength", "last raiser was facing", 31, 2);
-        field.meaning = "the last raiser faced " + countClamped(int(field.value), "raises");
+        KeyField& field = add("hero", "hero's spot", 37, 5);
+        const int value = int(field.value);
+        field.meaning = "three base 3 digits: seats behind hero, raises hero faces, "
+            "callers since the last raise";
+        field.parts.push_back({"behind hero", value / 9, positionBucket(value / 9) + " still to act"});
+        field.parts.push_back({"raises faced", value / 3 % 3,
+            countClamped(value / 3 % 3, "raises") + " since hero last acted"});
+        // Engine::play counts a call only once the pot is open, so the opening limp is
+        // not one, and an unopened postflop street has none.
+        field.parts.push_back({"callers", value % 3, countClamped(value % 3, "calls")
+            + " since the pot was opened or last raised"});
     }
     {
-        KeyField& field = add("hiddenRaiseSize", "raise before was big", 33, 1);
-        field.zeroed = memoryBasic;
-        field.meaning = memoryBasic ? "dropped"
-            : field.value ? "the raise before was 1.5x pot or all in" : "the raise before was 0.5x pot, or none";
-    }
-    {
-        KeyField& field = add("hiddenRaiseStrength", "raise before was facing", 34, 2);
-        field.zeroed = memoryBasic;
-        field.meaning = memoryBasic ? "dropped"
-            : "the raiser before faced " + countClamped(int(field.value), "raises");
-    }
-    {
-        KeyField& field = add("raisesFaced", "raises hero faces", 36, 2);
-        field.meaning = "hero faces " + countClamped(int(field.value), "raises") + " since acting";
-    }
-    {
-        KeyField& field = add("relativePosition", "hero vs villain", 38, 1);
+        KeyField& field = add("relativePosition", "hero vs villain", 42, 1);
         field.meaning = field.value ? "hero acts after the villain postflop (in position)"
             : "hero acts at or before the villain postflop (out of position)";
     }
     {
-        KeyField& field = add("heroCalls", "hero called twice", 39, 1);
-        field.meaning = field.value ? "hero has called more than once this street"
-            : "hero has called at most once this street";
-    }
-    {
-        KeyField& field = add("tableCalls", "callers since the raise", 40, 2);
-        field.zeroed = memoryBasic;
-        static const char* CALLS[4] = {"0 callers", "1 caller", "2-3 callers", "4+ callers"};
-        field.meaning = memoryBasic ? "dropped" : std::string(CALLS[field.value]) + " since the last raise";
-    }
-    {
-        KeyField& field = add("boardField", "board class + 169", 42, 16);
+        KeyField& field = add("boardField", "board class + 169", ACTION_STATE_BITS, BOARD_CLASS_BITS);
         if (round == 0) {
             field.shared = false;
-            field.meaning = "preflop: holds each combo's 169 class, so it is per combo";
+            field.meaning = config.metasStage == 2
+                ? "preflop: holds each combo's preflop cluster, so it is per combo"
+                : "preflop: holds each combo's 169 class, so it is per combo";
         } else {
-            field.meaning = std::string(config.metasBasic ? "basic" : "full") + " board class "
-                + std::to_string(int(field.value) - 169);
+            field.meaning = std::string("stage ") + char('A' + config.metasStage)
+                + " board class " + std::to_string(int(field.value) - 169);
         }
     }
-    (void)names;
     return out;
 }

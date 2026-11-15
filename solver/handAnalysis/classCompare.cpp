@@ -4,16 +4,17 @@
 #include <map>
 
 // Prints example hands for every hand cluster of a board class: enter a flop, turn or
-// river, and it finds the boards that share its board class (normal or basic tables) and
+// river, and it finds the boards that share its board class (in one stage's tables) and
 // lists up to EXAMPLES (board, hole cards) pairs per hand cluster, spread across boards.
 // Each cluster also gets its showdown distribution, rebuilt from sampled runouts, drawn
 // as a histogram from the nuts (bucket 0) on the left to the weakest bucket on the right.
 //
 // Build and run from the repo root (the tables are read from solver/handAnalysis/):
 //   clang++ -std=c++20 -O2 -I. solver/handAnalysis/classCompare.cpp -o build/classCompare
-//   build/classCompare Ks7h2d            normal tables
-//   build/classCompare Ks7h2d4c basic    basic tables
-// With no arguments it prompts for lines of "board [basic]".
+//   build/classCompare Ks7h2d            stage A (0) tables
+//   build/classCompare Ks7h2d4c B        stage B (1) tables
+// The stage is its letter or its number. With no arguments it prompts for lines of
+// "board [stage]".
 // Cards are rank AKQJT98765432 + suit cdhs; boards are 3, 4 or 5 cards.
 
 const int EXAMPLES = 40;
@@ -32,10 +33,10 @@ struct Board {
     uint16_t boardClass;
 };
 
-std::vector<uint16_t> boardClasses;
-std::vector<uint16_t> boardClassesBasic;
-ankerl::unordered_dense::map<uint64_t, uint8_t> handMetas;
-ankerl::unordered_dense::map<uint64_t, uint8_t> handMetasBasic;
+// The metas stages with tables (see stagePath); each array is indexed by stage.
+const int STAGE_COUNT = 3;
+std::array<std::vector<uint16_t>, STAGE_COUNT> boardClasses;
+std::array<ankerl::unordered_dense::map<uint64_t, uint8_t>, STAGE_COUNT> handMetas;
 std::vector<uint32_t> handScores;
 
 void loadHandScores(const std::string& path) {
@@ -200,10 +201,10 @@ std::string boardString(const std::array<int, 5>& cards, int street) {
 
 // Every board of the street whose class in the chosen tables matches the input's, tagged
 // with that class. Full classes are cumulative, so only flops and turns that share the
-// input's flop and turn classes need to be walked. Basic classes need not be, so every
-// earlier street is walked for them.
-std::vector<Board> matchingBoards(const std::array<int, 5>& input, int street, bool basic) {
-    const std::vector<uint16_t>& table = basic ? boardClassesBasic : boardClasses;
+// input's flop and turn classes need to be walked. The classes of later stages need not
+// be, so every earlier street is walked for them.
+std::vector<Board> matchingBoards(const std::array<int, 5>& input, int street, int stage) {
+    const std::vector<uint16_t>& table = boardClasses[stage];
     Dealer dealer;
     dealer.boardCards = input;
     std::array<uint16_t, 4> targets;
@@ -211,7 +212,7 @@ std::vector<Board> matchingBoards(const std::array<int, 5>& input, int street, b
         targets[s] = table[dealer.getBoardIndex(s)];
     }
     auto matches = [&](int s) {
-        return (basic && s < street) || table[dealer.getBoardIndex(s)] == targets[s];
+        return (stage != 0 && s < street) || table[dealer.getBoardIndex(s)] == targets[s];
     };
     std::vector<Board> boards;
     auto add = [&]() {
@@ -243,7 +244,7 @@ std::vector<Board> matchingBoards(const std::array<int, 5>& input, int street, b
     return boards;
 }
 
-void showClusters(const std::string& boardText, bool basic) {
+void showClusters(const std::string& boardText, int stage) {
     std::vector<int> cards = parseCards(boardText);
     if (cards.size() < 3 || cards.size() > 5) {
         throw std::runtime_error("board '" + boardText + "' must have 3, 4 or 5 cards");
@@ -257,11 +258,11 @@ void showClusters(const std::string& boardText, bool basic) {
     std::sort(input.begin(), input.begin() + 3);
     int street = int(cards.size()) - 2;
 
-    const auto& metas = basic ? handMetasBasic : handMetas;
-    if (metas.empty()) {
-        throw std::runtime_error(std::string(basic ? "handMetasBasic.bin" : "handMetas.bin") + " is not loaded");
+    const auto& metas = handMetas[stage];
+    if (boardClasses[stage].empty() || metas.empty()) {
+        throw std::runtime_error("the stage " + std::string(1, char('A' + stage)) + " tables are not loaded");
     }
-    std::vector<Board> boards = matchingBoards(input, street, basic);
+    std::vector<Board> boards = matchingBoards(input, street, stage);
     // Every cluster any of these boards can produce, so the scan can stop once all are full.
     std::set<uint16_t> classes;
     for (const Board& board : boards) {
@@ -363,8 +364,7 @@ void showClusters(const std::string& boardText, bool basic) {
     dealer.boardCards = input;
     uint32_t boardIndex = dealer.getBoardIndex(street);
     std::cout << "\n" << boardString(input, street) << " (" << streets[street] << "), "
-        << (basic ? "basic board class " + std::to_string(boardClassesBasic[boardIndex])
-            : "normal board class " + std::to_string(boardClasses[boardIndex]))
+        << "stage " << char('A' + stage) << " board class " << boardClasses[stage][boardIndex]
         << ": " << boards.size() << " boards";
     if (sampled < boards.size()) {
         std::cout << " (" << sampled << " sampled)";
@@ -399,36 +399,45 @@ void showClusters(const std::string& boardText, bool basic) {
     std::cout << "\n";
 }
 
-bool parseMode(const std::string& word) {
-    if (word == "basic" || word == "b") return true;
-    if (word == "normal" || word == "n") return false;
-    throw std::runtime_error("mode '" + word + "' must be basic or normal");
+// A stage as its letter (A, B, ...) or its number (0, 1, ...).
+int parseStage(const std::string& word) {
+    if (word.size() == 1) {
+        char c = char(std::toupper(static_cast<unsigned char>(word[0])));
+        if (c >= 'A' && c < 'A' + STAGE_COUNT) return c - 'A';
+        if (c >= '0' && c < '0' + STAGE_COUNT) return c - '0';
+    }
+    throw std::runtime_error("stage '" + word + "' must be A to " + std::string(1, char('A' + STAGE_COUNT - 1))
+        + ", or 0 to " + std::to_string(STAGE_COUNT - 1));
 }
 
 int main(int argc, char** argv) {
     if (argc > 3) {
-        std::cerr << "usage: " << argv[0] << " [board [basic|normal]]\n";
+        std::cerr << "usage: " << argv[0] << " [board [stage]]\n";
         return 1;
     }
     try {
-        loadBoardClasses("solver/handAnalysis/boardClasses.bin", boardClasses);
-        loadBoardClasses("solver/handAnalysis/boardClassesBasic.bin", boardClassesBasic);
-        loadHandMetas("solver/handAnalysis/handMetas.bin", handMetas);
+        loadBoardClasses(stagePath("boardClasses", 0), boardClasses[0]);
+        loadHandMetas(stagePath("handMetas", 0), handMetas[0]);
         loadHandScores("solver/handAnalysis/handScores.bin");
     } catch (const std::exception& e) {
         std::cerr << e.what() << " (run from the repo root)\n";
         return 1;
     }
-    // The basic tables are only needed for basic queries, so a missing file is not fatal.
-    try {
-        loadHandMetas("solver/handAnalysis/handMetasBasic.bin", handMetasBasic);
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << "; basic queries are unavailable\n";
+    // Later stages' tables are only needed for their own queries, so a missing file is not fatal.
+    for (int stage = 1; stage < STAGE_COUNT; stage++) {
+        try {
+            loadBoardClasses(stagePath("boardClasses", stage), boardClasses[stage]);
+            loadHandMetas(stagePath("handMetas", stage), handMetas[stage]);
+        } catch (const std::exception& e) {
+            boardClasses[stage].clear();
+            handMetas[stage].clear();
+            std::cerr << e.what() << "; stage " << char('A' + stage) << " queries are unavailable\n";
+        }
     }
 
     if (argc > 1) {
         try {
-            showClusters(argv[1], argc == 3 && parseMode(argv[2]));
+            showClusters(argv[1], argc == 3 ? parseStage(argv[2]) : 0);
         } catch (const std::exception& e) {
             std::cerr << e.what() << "\n";
             return 1;
@@ -437,18 +446,18 @@ int main(int argc, char** argv) {
     }
 
     std::string line;
-    while (std::cout << "board [basic]> " << std::flush && std::getline(std::cin, line)) {
+    while (std::cout << "board [stage]> " << std::flush && std::getline(std::cin, line)) {
         std::istringstream words(line);
         std::string board, mode, extra;
         if (!(words >> board)) continue;
         if (board == "q" || board == "quit") break;
         words >> mode;
         if (words >> extra) {
-            std::cerr << "expected: board [basic], e.g. Ks7h2d or Ks7h2d4c basic\n";
+            std::cerr << "expected: board [stage], e.g. Ks7h2d or Ks7h2d4c B\n";
             continue;
         }
         try {
-            showClusters(board, !mode.empty() && parseMode(mode));
+            showClusters(board, mode.empty() ? 0 : parseStage(mode));
         } catch (const std::exception& e) {
             std::cerr << e.what() << "\n";
         }

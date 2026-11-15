@@ -13,12 +13,18 @@ export const SHOVE = 4;
 
 export type OptionIndex = 0 | 1 | 2 | 3 | 4;
 
-/** The four settings a strategy file was trained at; the spec names the file. */
+/** The settings a strategy file was trained at; the spec names the file. */
 export interface Config {
   players: number;
+  /** Starting stack in chips (blinds 1/2), a multiple of 10. */
   chips: number;
-  metasBasic: boolean;
-  memoryBasic: boolean;
+  /** A dead ante in the pot from the deal, 0..9. */
+  ante: number;
+  /** 0 = A (full detail), 1 = B, 2 = C. */
+  metasStage: number;
+  memoryStage: number;
+  /** One letter, so test runs at the same settings get separate files. */
+  tag: string;
 }
 
 export interface ConfigWithSpec extends Config {
@@ -27,20 +33,29 @@ export interface ConfigWithSpec extends Config {
 
 export interface MetaResponse {
   defaults: ConfigWithSpec;
-  limits: { players: [number, number]; chipsMax: number; chipsEven: boolean };
+  limits: {
+    players: [number, number];
+    chips: [number, number];
+    chipsStep: number;
+    ante: [number, number];
+    metasStages: number;
+    memoryStages: number;
+  };
+  /** Per metas stage: whether the server has its hand-analysis tables loaded yet. */
+  metasStagesLoaded: boolean[];
   available: ConfigWithSpec[];
   blinds: [number, number];
   /** The inverse temperature training ran at, ln(2^20). */
   invTemp: number;
   /** What a request may ask for: [ln(2^5), ln(2^80)]. */
   invTempRange: [number, number];
-  rangeFloor: number;
   comboCount: number;
   options: string[];
   /** Seat names by player count, keyed "3".."7". */
   seats: Record<string, string[]>;
   evUnits: string;
   replay: string;
+  streets: string;
 }
 
 export interface Seat {
@@ -79,9 +94,14 @@ export interface OptionView {
   reason: string;
 }
 
+/**
+ * autoFold: a seat that has called twice on the street folds to a further bet by
+ * itself. It takes no entry in the action list, so it belongs to the frame of the
+ * action before it.
+ */
 export type HistoryEntry =
   | {
-      kind: 'post' | 'action';
+      kind: 'post' | 'action' | 'autoFold';
       seat: number;
       name: string;
       option: number;
@@ -94,6 +114,7 @@ export type HistoryEntry =
 
 export interface GameSection {
   config: ConfigWithSpec;
+  /** The trainer plays preflop and flop only, so a node is never past the flop. */
   round: 0 | 1 | 2 | 3;
   street: 'preflop' | 'flop' | 'turn' | 'river';
   board: string;
@@ -101,6 +122,8 @@ export interface GameSection {
   pot: number;
   heads: number;
   blinds: string;
+  /** The dead ante, already in the pot. */
+  ante: number;
   seats: Seat[];
   actor: Actor;
   legal: boolean[];
@@ -124,15 +147,15 @@ export interface KeyField {
   /** The field's bits, most significant first. */
   bits: string;
   meaning: string;
-  /** memoryBasic forces this field to 0. */
+  /** The key holds this field at 0 at this node, whatever the hand did. */
   zeroed: boolean;
-  /** False for the preflop board field, which holds each combo's own 169 class. */
+  /** False for the preflop board field, which holds each combo's own 169 class (or stage C cluster). */
   shared: boolean;
   parts: KeyPart[];
 }
 
 export interface KeySection {
-  /** actionState | boardField << 42 - every bit but the hand cluster. Hex. */
+  /** actionState | boardField << actionStateBits - every bit but the hand cluster. Hex. */
   sharedKey: string;
   actionState: string;
   heroSeat: number;
@@ -140,6 +163,7 @@ export interface KeySection {
   spr: number;
   cpr: number;
   sharedBits: number;
+  actionStateBits: number;
   fields: KeyField[];
 }
 
@@ -151,7 +175,7 @@ export interface SpotRow {
   combo: string;
   /** The acting seat's reach: its own policy multiplied along the line. */
   reach: number;
-  /** The 169 class preflop, the hand cluster postflop. */
+  /** The 169 class (stage C: its cluster) preflop, the hand cluster postflop. */
   cluster: number;
   key: string;
   found: boolean;

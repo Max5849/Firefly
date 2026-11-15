@@ -1,16 +1,20 @@
 import { useEffect, useState } from 'react';
 import type { Config, MetaResponse } from '../api/types';
 
+/** Explorer::spec: players, chips / 10, ante, metas stage, memory stage, then the tag. */
 function specOf(config: Config): string {
-  return String(
-    Math.trunc(
-      10000 * config.players +
-        10 * config.chips +
-        10 * Number(config.metasBasic) +
-        Number(config.memoryBasic),
-    ),
+  return (
+    String(
+      100000 * config.players +
+        100 * config.chips +
+        100 * config.ante +
+        10 * config.metasStage +
+        config.memoryStage,
+    ) + config.tag
   );
 }
+
+const stageLetter = (stage: number) => String.fromCharCode(65 + stage);
 
 function Label({ children }: { children: React.ReactNode }) {
   return (
@@ -28,28 +32,39 @@ function release(event: { currentTarget: HTMLElement }) {
   event.currentTarget.blur();
 }
 
-function Toggle({ label, on, onChange }: { label: string; on: boolean; onChange: (on: boolean) => void }) {
+/** Steps through a stage axis: A (full detail), B, C, then back to A. */
+function Stage({
+  label,
+  stage,
+  count,
+  onChange,
+}: {
+  label: string;
+  stage: number;
+  count: number;
+  onChange: (stage: number) => void;
+}) {
   return (
     <button
       type="button"
       onMouseDown={(event) => event.preventDefault()}
       onClick={(event) => {
         release(event);
-        onChange(!on);
+        onChange((stage + 1) % count);
       }}
       className="rounded-[3px] border px-2 py-[3px] text-[10px] tracking-[0.1em] uppercase"
       style={{
-        borderColor: on ? 'var(--color-chalk)' : 'var(--color-rule)',
-        color: on ? 'var(--color-chalk)' : 'var(--color-ash)',
+        borderColor: stage > 0 ? 'var(--color-chalk)' : 'var(--color-rule)',
+        color: stage > 0 ? 'var(--color-chalk)' : 'var(--color-ash)',
       }}
-      title={`${label} ${on ? 'on' : 'off'}`}
+      title={`${label} stage ${stageLetter(stage)} (A is full detail); click for the next`}
     >
-      {label} {on ? 'basic' : 'full'}
+      {label} {stageLetter(stage)}
     </button>
   );
 }
 
-/** Which strategy file the page reads: the four settings its spec encodes. */
+/** Which strategy file the page reads: the settings its spec encodes. */
 export function ConfigBar({
   meta,
   config,
@@ -59,7 +74,7 @@ export function ConfigBar({
   config: Config | null;
   onChange: (config: Config) => void;
 }) {
-  // Typed chips are only committed on Enter or blur, and only when even.
+  // Typed chips are only committed on Enter or blur, and only on a multiple of 10.
   const [chips, setChips] = useState('');
   useEffect(() => {
     if (config) setChips(String(config.chips));
@@ -67,6 +82,8 @@ export function ConfigBar({
 
   if (!meta || !config) return null;
   const [minPlayers, maxPlayers] = meta.limits.players;
+  const [minChips, maxChips] = meta.limits.chips;
+  const [minAnte, maxAnte] = meta.limits.ante;
   const available = new Set(meta.available.map((entry) => entry.spec));
   const spec = specOf(config);
   const exists = available.has(spec);
@@ -76,9 +93,9 @@ export function ConfigBar({
     if (
       config &&
       Number.isInteger(value) &&
-      value > 0 &&
-      value % 2 === 0 &&
-      value <= meta!.limits.chipsMax &&
+      value >= minChips &&
+      value % meta!.limits.chipsStep === 0 &&
+      value <= maxChips &&
       value !== config.chips
     ) {
       onChange({ ...config, chips: value });
@@ -129,11 +146,40 @@ export function ConfigBar({
           onBlur={commitChips}
           className="w-16 rounded-[3px] border px-1 py-[2px]"
           style={fieldStyle}
-          title="starting stack in chips (blinds 1/2); must be even"
+          title={`starting stack in chips (blinds 1/2): a multiple of ${meta.limits.chipsStep} from ${minChips} to ${maxChips}`}
         />
       </label>
-      <Toggle label="metas" on={config.metasBasic} onChange={(on) => onChange({ ...config, metasBasic: on })} />
-      <Toggle label="memory" on={config.memoryBasic} onChange={(on) => onChange({ ...config, memoryBasic: on })} />
+      <label className="flex items-center gap-2">
+        <Label>ante</Label>
+        <select
+          value={config.ante}
+          onChange={(event) => {
+            onChange({ ...config, ante: Number(event.target.value) });
+            event.currentTarget.blur();
+          }}
+          className="rounded-[3px] border px-1 py-[2px]"
+          style={fieldStyle}
+          title="a dead ante in the pot from the deal, paid by no seat"
+        >
+          {Array.from({ length: maxAnte - minAnte + 1 }, (_, i) => minAnte + i).map((n) => (
+            <option key={n} value={n}>
+              {n}
+            </option>
+          ))}
+        </select>
+      </label>
+      <Stage
+        label="metas"
+        stage={config.metasStage}
+        count={meta.limits.metasStages}
+        onChange={(stage) => onChange({ ...config, metasStage: stage })}
+      />
+      <Stage
+        label="memory"
+        stage={config.memoryStage}
+        count={meta.limits.memoryStages}
+        onChange={(stage) => onChange({ ...config, memoryStage: stage })}
+      />
       <span className="flex items-center gap-2">
         <Label>spec</Label>
         <span style={{ color: exists ? 'var(--color-chalk)' : 'var(--color-act-big)' }}>
@@ -160,8 +206,8 @@ export function ConfigBar({
             {exists ? null : <option value="">—</option>}
             {meta.available.map((entry) => (
               <option key={entry.spec} value={entry.spec}>
-                {entry.spec} · {entry.players} players · {entry.chips} chips · metas{' '}
-                {entry.metasBasic ? 'basic' : 'full'} · memory {entry.memoryBasic ? 'basic' : 'full'}
+                {entry.spec} · {entry.players} players · {entry.chips} chips · ante {entry.ante} · metas{' '}
+                {stageLetter(entry.metasStage)} · memory {stageLetter(entry.memoryStage)} · tag {entry.tag}
               </option>
             ))}
           </select>
