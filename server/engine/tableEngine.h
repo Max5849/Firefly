@@ -506,7 +506,7 @@ struct TableEngine {
             return false;
         }
         round++;
-        if (round == 2) {
+        if (round == 4) {
             return false;
         }
         if (heads > 3 && (raiseHistory[round - 1] > 0)) {

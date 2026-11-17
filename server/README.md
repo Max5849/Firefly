@@ -102,7 +102,8 @@ in both layouts and keeps the one that finds it (`detectKeyFormat` in replay.h):
 
 Every lookup takes a current-layout key and translates it. The rules are otherwise
 the same, so a `bit44` file serves exactly: `strategy_740210A.bin` holds the key at
-100% of on-policy preflop and flop decisions. The startup log, `/health` and
+100% of on-policy preflop and flop decisions (it was trained before hands went to the
+river, so it has no turn or river records). The startup log, `/health` and
 `spot.keyFormat` name each file's layout. Rows' `key`s are always the current layout.
 
 ## Endpoints
@@ -123,7 +124,7 @@ the same, so a `bit44` file serves exactly: `strategy_740210A.bin` holds the key
 | --- | --- |
 | `config` | Which strategy to read. Each field is optional and defaults to solver/singleHand/config.h. `players` 3–7. `chips` a multiple of 10 from 10 to 990. `ante` 0–9, a dead ante in the pot from the deal. `metasStage` and `memoryStage` 0–2 (0 = A, the full detail). `tag` one letter. The old `metasBasic` / `memoryBasic` booleans are rejected with a pointer to the stages (`true` was stage 1). |
 | `actions` | Decisions in order: 0 fold, 1 call/check, 2 raise to half pot, 3 raise to one and a half pot, 4 all in. Forced folds are not listed. Empty means the first preflop decision (seat `3 % players`). |
-| `board` | `"As7h2d"`, `"As 7h 2d"` or `"As,7h,2d"`. It must hold exactly the cards for the street the actions reach: 0 or 3. |
+| `board` | `"As7h2d"`, `"As 7h 2d"` or `"As,7h,2d"`. It must hold exactly the cards for the street the actions reach: 0, 3, 4 or 5. |
 | `invTemp` | Optional inverse temperature **per pot**, from ln(2^5) ≈ 3.466 to ln(2^80) ≈ 55.45. Defaults to ln(2^20), singleHand's `INV_TEMP`. It sets **both** the policy each past decision narrows its range with and the policy shown at the spot, so ranges, frequencies, EV and the range mix all belong to one temperature. Echoed as `spot.invTemp`. |
 | `include` | Optional. Leaving it out means all three sections. When present, only the sections set to `true` are returned. |
 
@@ -277,8 +278,8 @@ Every error body has a machine-readable `code` and an `error` message:
 - No flat call when facing three or more raises since you last acted.
 - Limping is allowed: the first preflop call opens the pot.
 
-**Hands are preflop and flop only.** `beginNewRound()` ends the betting after the
-flop, and after a raised preflop with more than three players left, so those lines
+**Hands are played to the river.** `beginNewRound()` ends the betting after the
+river, and after any raised street that leaves more than three players, so those lines
 answer `handEnded` / `showdown`. An off-tree action is not projected onto the nearest
 legal one.
 
@@ -311,7 +312,9 @@ The test runs in two parts.
    - every raise lands on its `betTo`.
 
 At 4000 hands: 40k lockstep decisions, 183k replay nodes, 3k auto folds, 0 failures,
-and `strategy_740210A.bin` (`bit44`) holds 100% of on-policy preflop and flop keys.
+and the default `strategy_740220A.bin` (`current`) holds 100% of on-policy keys on
+every street (`strategy_740210A.bin`, `bit44`, likewise on preflop and flop, the
+streets it was trained on).
 A metas stage whose tables are not built is skipped, and the test names it.
 
 `build/storeProbe [--spec 740210A] <hex keys...>` prints what the mmap path returns

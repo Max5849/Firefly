@@ -114,7 +114,6 @@ export type HistoryEntry =
 
 export interface GameSection {
   config: ConfigWithSpec;
-  /** The trainer plays preflop and flop only, so a node is never past the flop. */
   round: 0 | 1 | 2 | 3;
   street: 'preflop' | 'flop' | 'turn' | 'river';
   board: string;

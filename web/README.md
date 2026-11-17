@@ -60,7 +60,7 @@ red when nothing has been trained for it, and a banner lists what has. The `trai
 menu jumps straight to any file the server has. Changing the config starts a new
 hand.
 
-Hands are played preflop and flop only, as the trainer plays them. A seat that has
+Hands are played to the river, as the trainer plays them. A seat that has
 called twice on a street folds to a further bet by itself: the ledger shows it as
 `fold · auto`, and it is not a point to jump back to.
 

@@ -14,7 +14,7 @@
 // reported: a server key that drifted from the trainer's would find almost nothing.
 //
 // Part 2, every table size the server dispatches on (3..7). TableEngine self plays
-// under random stages, stacks and antes, calls weighted up so the walk reaches the flop,
+// under random stages, stacks and antes, calls weighted up so the walk reaches the river,
 // and at every decision:
 //   - Replay, given nothing but the action list and the revealed board, reaches the
 //     same action state, options and meta state, auto folds included;
@@ -467,14 +467,17 @@ int main(int argc, char** argv) {
         std::cout << "Lockstep with Engine (" << PLAYER_COUNT << " seats, " << CHIP_COUNT
                   << " chips, ante " << ANTE << "): " << lock.nodes << " decisions, "
                   << lock.autoFolds << " auto folds\n"
-                  << "  preflop " << lock.perRound[0] << ", flop " << lock.perRound[1] << "\n";
+                  << "  preflop " << lock.perRound[0] << ", flop " << lock.perRound[1]
+                  << ", turn " << lock.perRound[2] << ", river " << lock.perRound[3] << "\n";
         if (store != nullptr) {
-            std::cout << std::fixed << std::setprecision(2)
-                      << "  strategy_" << spec << ".bin holds the key at "
-                      << 100.0 * double(lock.found[0]) / double(std::max<uint64_t>(lock.perRound[0], 1))
-                      << "% of preflop and "
-                      << 100.0 * double(lock.found[1]) / double(std::max<uint64_t>(lock.perRound[1], 1))
-                      << "% of flop decisions (play follows its policy where it does)\n";
+            std::cout << std::fixed << std::setprecision(2) << "  strategy_" << spec
+                      << ".bin holds the key at";
+            for (int street = 0; street < 4; street++) {
+                std::cout << (street ? ", " : " ") << 100.0 * double(lock.found[street])
+                    / double(std::max<uint64_t>(lock.perRound[street], 1)) << "% "
+                    << STREET_NAMES[street];
+            }
+            std::cout << " (play follows its policy where it does)\n";
         } else {
             std::cout << "  no strategy_" << spec << ".bin: random play, no coverage check\n";
         }
@@ -488,7 +491,8 @@ int main(int argc, char** argv) {
         run<7>(hands, stageMask, tally);
         std::cout << "Replay and key decode, 3..7 seats: " << tally.nodes << " nodes, "
                   << tally.autoFolds << " auto folds\n"
-                  << "  preflop " << tally.perRound[0] << ", flop " << tally.perRound[1] << "\n"
+                  << "  preflop " << tally.perRound[0] << ", flop " << tally.perRound[1]
+                  << ", turn " << tally.perRound[2] << ", river " << tally.perRound[3] << "\n"
                   << "  failures: " << tally.failures << "\n"
                   << (lock.failures + tally.failures == 0 ? "PASSED" : "FAILED") << std::endl;
         return lock.failures + tally.failures == 0 ? 0 : 1;

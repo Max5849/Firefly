@@ -113,6 +113,11 @@ inline std::string actionName(int option, float toCall, int round, int streetRai
 // INV_TEMP, ln(2^20), which the strategy files are trained at.
 inline const double DEFAULT_INV_TEMP = INV_TEMP;
 
+// The clamp on invTemp * w before exp, so a runaway weight cannot make the option total
+// inf or zero: Explorer::nodePolicy's, which explorer.cpp writes inline (main() lives
+// there, so it cannot be included). Keep the two equal.
+inline constexpr double POLICY_EXP_CLAMP = 443.0;
+
 // The policy over the legal options, from a record's four weights, at inverse
 // temperature invTemp per pot.
 //
@@ -126,7 +131,7 @@ inline std::array<double, 5> policyFromWeights(const std::array<float, 4>& weigh
     for (int j = 0; j < 5; j++) {
         if (legal[j]) {
             double ev = j == 0 ? 0.0 : double(weights[j - 1]);
-            draws[j] = std::exp(std::clamp(invTemp * ev, -MAX_EXP_ARG, MAX_EXP_ARG));
+            draws[j] = std::exp(std::clamp(invTemp * ev, -POLICY_EXP_CLAMP, POLICY_EXP_CLAMP));
         }
         sum += draws[j];
     }

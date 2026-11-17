@@ -53,13 +53,18 @@ static inline double learningRate(double progress) {
 
 struct Worker {
     Engine engine;
+    // Copies of engine carry a pointer to these, so every branch of a hand shares them.
+    Engine::Runouts runouts;
     std::mt19937 gen;
     std::uniform_real_distribution<double> unit{0.0, 1.0};
     std::vector<TraceNode> tracePath;
     // The learning rate for the hand being played.
     double learningRate = LEARNING_RATE;
 
-    explicit Worker(unsigned t) : gen(15 + t) {}
+    explicit Worker(unsigned t) : gen(15 + t) {
+        runouts.gen.seed(1015 + t);
+        engine.runouts = &runouts;
+    }
 };
 
 struct Explorer {
@@ -112,8 +117,7 @@ struct Explorer {
                 for (int j = 1; j < 5; j++) {
                     if (options[j]) {
                         draw[j] = std::exp(std::clamp(
-                            INV_TEMP * decodeWeight(base->weights[j - 1]),
-                            -MAX_EXP_ARG, MAX_EXP_ARG));
+                            INV_TEMP * decodeWeight(base->weights[j - 1]), -443.0, 443.0));
                     }
                 }
                 for (int j = 0; j < 5; j++) {
@@ -148,7 +152,7 @@ struct Explorer {
             double draw = 0;
             if (legal & (1u << j)) {
                 const double w = j == 0 ? 0.0 : loadWeight(weights.weights[j - 1]);
-                draw = std::exp(std::clamp(INV_TEMP * w, -MAX_EXP_ARG, MAX_EXP_ARG));
+                draw = std::exp(std::clamp(INV_TEMP * w, -443.0, 443.0));
             }
             probabilities[j] = draw;
             sum += draw;
@@ -355,6 +359,7 @@ struct Explorer {
         Engine& engine = worker.engine;
         engine.shuffle(worker.gen);
         engine.deal();
+        worker.runouts.reset();
         for (int traverser = 0; traverser < PLAYER_COUNT; traverser++) {
             Engine hand = engine;
             traverse(worker, hand, traverser, 1.0);
@@ -535,6 +540,7 @@ int main () {
                   << "EPOCHS: " << EPOCHS << "\n"
                   << "INV_TEMP: " << INV_TEMP << "\n"
                   << "LEARNING_RATE: " << LEARNING_RATE << "\n"
+                  << "VARIANCE_MIN: " << VARIANCE_MIN << "\n"
                   << "COOLDOWN_START: " << COOLDOWN_START << "\n"
                   << "VISITS_FLOOR: " << VISITS_FLOOR << std::endl;
 

@@ -721,8 +721,8 @@ int main(int argc, char** argv) {
                 "singleHand trainer's INV_TEMP. A seat that has called twice on a street "
                 "folds to a further bet by itself (history kind autoFold), with no entry in "
                 "the action list";
-            body["streets"] = "hands are played preflop and flop only: the betting ends "
-                "after the flop, or after a raised preflop with more than 3 players left";
+            body["streets"] = "hands are played to the river: the betting ends after the "
+                "river, or after any raised street that leaves more than 3 players";
             response.set_content(body.dump(2), "application/json");
         });
 

@@ -9,76 +9,44 @@ constexpr int METAS_STAGE = 2;
 constexpr int MEMORY_STAGE = 0;
 constexpr char STRATEGY_TAG = 'A';
 constexpr bool USE_BASE = false;
-constexpr int BASE_METAS_STAGE = 1;
-constexpr int BASE_MEMORY_STAGE = 1;
+constexpr int BASE_METAS_STAGE = 0;
+constexpr int BASE_MEMORY_STAGE = 0;
 constexpr char BASE_STRATEGY_TAG = 'A';
 constexpr double BASE_CONFIDENCE = 0.0;
 
-constexpr uint64_t EPOCHS = uint64_t(48) * 131072000;
-// The policy's temperature, per pot: every seat plays P(j) ∝ exp(INV_TEMP * w_j), and an
-// opponent's option is drawn from it, so external sampling needs no reweighting.
+constexpr uint64_t EPOCHS = uint64_t(24) * 131072000;
 constexpr double INV_TEMP = 20 * 0.69314718056;
-// (E / z)^2: an option's weight is the running mean of its returns until its node has
-// variance / LEARNING_RATE visits, the sample size that puts it within E pots at
-// confidence z, then an EMA that holds that margin.
 constexpr double LEARNING_RATE = 1.0 / 1537.0;
-// The share of the run after which the learning rate cools along a half cosine, from
-// LEARNING_RATE to 0 at the end. Before it the rate is LEARNING_RATE. The cooled rate
-// applies wherever LEARNING_RATE does, so the running mean's handover moves out with it.
+constexpr double VARIANCE_MIN = 0.0625;
 constexpr double COOLDOWN_START = 0.8;
-// A node with fewer visits at the end of the run is not saved.
 constexpr double VISITS_FLOOR = 0.0;
 
 
-// Prints every decision that reaches TRACE_KEY, and its update. The key is on the
-// current layout: action state in bits 0-42, meta state in bits 43-63.
 constexpr bool TRACE_KEY_ENABLED = false;
 constexpr uint64_t TRACE_KEY = 0x0000000000000000;
-// Prints one in every TRACE_EVERY traces: a hand that reaches TRACE_KEY is one trace,
-// counted across all threads. 1 prints them all.
 constexpr uint64_t TRACE_EVERY = 10000;
 
-// A strategy_<spec>.bin record: uint64 key, int16 weights[4] for options 1..4 as
-// encodeWeight's 1/1024 pot codes, and uint64 variances, the four 16-bit codes packed as
-// in Entry::variances. The run holds weights as 6.26 fixed point (Entry::weights).
-// Neither visits nor the legal options are stored.
-
-// Fixed: the engine reads stage C (index 2) by name, for its preflop clusters.
 constexpr int METAS_STAGE_COUNT = 3;
 constexpr int MEMORY_STAGE_COUNT = 3;
 
 constexpr int ACTION_STATE_BITS = 43;
-// The meta state above it: board class + 169 in the low BOARD_CLASS_BITS, then the hand's
-// equity cluster within that board class in HAND_META_BITS, so at most 64 per class.
 constexpr int BOARD_CLASS_BITS = 15;
 constexpr int HAND_META_BITS = 6;
 constexpr uint64_t BOARD_CLASS_MASK = (1ULL << BOARD_CLASS_BITS) - 1;
 constexpr uint64_t HAND_META_MASK = (1ULL << HAND_META_BITS) - 1;
-static_assert(ACTION_STATE_BITS + BOARD_CLASS_BITS + HAND_META_BITS == 64,
-    "the action and meta states must fill the 64-bit key");
-
-constexpr uint64_t STRATEGY_RECORD_BYTES = 24;
-constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
+static_assert(ACTION_STATE_BITS + BOARD_CLASS_BITS + HAND_META_BITS == 64);
 
 constexpr uint64_t STRATEGY_CAP_LOG2 = 28;
 constexpr double MAX_LOAD = 0.95;
-// The base table carries no fingerprint array, so a miss walks the whole cluster and
-// touches a 24 byte record at every step. Half the load is worth twice the slots.
+
+constexpr uint64_t STRATEGY_RECORD_BYTES = 24;
+constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
 constexpr double BASE_MAX_LOAD = 0.5;
 
 constexpr uint64_t CHUNK_HANDS = 1ULL << 16;
 constexpr uint64_t PRINT_CHUNKS = 1ULL << 4;
 
-// Clamp on INV_TEMP * w before exp, so a runaway weight cannot turn the option total
-// into inf or zero.
-inline constexpr double MAX_EXP_ARG = 700.0;
-// The least variance of pot-relative return, in pots squared, the step reads for an
-// option, so an option with only a few samples, whose variance can read near 0, cannot
-// take a near-full step.
-constexpr double VARIANCE_MIN = 1.0;
-
-// Every two card holding. For cards i < j the combo index is
-// i * (101 - i) / 2 + j - 1, the addressing used throughout handAnalysis.
+constexpr int RUNOUTS = 16;
 inline constexpr int COMBO_COUNT = 1326;
 
 inline int holePairIndex(int i, int j) {
