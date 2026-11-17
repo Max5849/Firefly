@@ -101,6 +101,22 @@ export function RangeGrid({
 
     const bound = (i: number) => Math.round((i * pixels) / 13);
 
+    // Columns are drawn relative to the most-reached combination, which fills
+    // its column. Late in a line every reach is small - a river range can top
+    // out at a few percent - and drawn at absolute height it is a row of
+    // slivers. Dividing by the peak keeps every column's height in the same
+    // proportion to every other, so the range's shape is unchanged; the true
+    // reach is still in the readout.
+    let peak = 0;
+    if (combos) {
+      for (let combo = 0; combo < combos.length; combo++) {
+        if (eliminated(combo)) continue;
+        const reach = combos[combo]!.reach;
+        if (reach > peak) peak = reach;
+      }
+    }
+    const scale = peak > 0 ? 1 / Math.min(1, peak) : 1;
+
     for (let row = 0; row < 13; row++) {
       for (let column = 0; column < 13; column++) {
         const cell = CELLS[row * 13 + column];
@@ -130,11 +146,12 @@ export function RangeGrid({
           }
 
           // The column fills to its reach - how much of the hand is still in the
-          // acting range - and the bands stack inside that from the bottom: fold,
-          // call, raise, raise, all in. A hand the line has ruled out is empty.
+          // acting range, scaled by the peak above - and the bands stack inside
+          // that from the bottom: fold, call, raise, raise, all in. A hand the
+          // line has ruled out is empty.
           const row = combos![combo]!;
           const frequencies = row.frequencies!;
-          const reach = Math.min(1, Math.max(0, row.reach));
+          const reach = Math.min(1, Math.max(0, row.reach * scale));
           let filled = 0;
           for (let option = 0; option < 5; option++) {
             const share = frequencies[option];

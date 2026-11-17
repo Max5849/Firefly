@@ -81,9 +81,11 @@ a ledger jump re-asks for any node fetched at another temperature.
 Each of the 169 cells is one row of columns, one per combination — 6 for a pair, 4
 suited, 12 offsuit. **A column's height is the combination's reach**: how much of
 it is still in the acting seat's range, the product of that seat's own policy along
-the line. A full column is a hand that always plays this way to here; an empty one
-is a hand the line has ruled out. Inside that height the column fills from the
-bottom in action order:
+the line. Heights are scaled so the most-reached combination fills its column:
+every column keeps its proportion to every other, but a thin river range is as
+tall as a preflop one. The readout on the right shows the true, unscaled reach. An
+empty column is a hand the line has ruled out. Inside that height the column fills
+from the bottom in action order:
 
 | | fold | call | raise | raise | all in |
 | --- | --- | --- | --- | --- | --- |

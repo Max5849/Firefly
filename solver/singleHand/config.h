@@ -5,14 +5,14 @@
 constexpr int PLAYER_COUNT = 7;
 constexpr float CHIP_COUNT = 400.0;
 constexpr float ANTE = 2.0;
-constexpr int METAS_STAGE = 2;
+constexpr int METAS_STAGE = 1;
 constexpr int MEMORY_STAGE = 0;
 constexpr char STRATEGY_TAG = 'A';
-constexpr bool USE_BASE = false;
-constexpr int BASE_METAS_STAGE = 0;
+constexpr bool USE_BASE = true;
+constexpr int BASE_METAS_STAGE = 2;
 constexpr int BASE_MEMORY_STAGE = 0;
 constexpr char BASE_STRATEGY_TAG = 'A';
-constexpr double BASE_CONFIDENCE = 0.0;
+constexpr double BASE_CONFIDENCE = 16.0;
 
 constexpr uint64_t EPOCHS = uint64_t(24) * 131072000;
 constexpr double INV_TEMP = 20 * 0.69314718056;
