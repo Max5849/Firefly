@@ -476,10 +476,8 @@ static void writeKey(JsonWriter& w, const KeyLayout& layout) {
 }
 
 template <int P>
-void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops, KeyFormat format) {
+void writeSpot(JsonWriter& w, const SpotResult& spot, const ReplayDrops& drops) {
     w.beginObject();
-    // The strategy file's key layout; rows' keys are always the current layout.
-    w.field("keyFormat", std::string(keyFormatName(format)));
     w.key("legal");
     writeLegal(w, spot.legal);
     w.field("invTemp", spot.invTemp);
@@ -614,7 +612,7 @@ void answer(const Request& request, const StrategyStore& store, httplib::Respons
     }
     if (request.include.spot) {
         w.key("spot");
-        writeSpot<P>(w, computeSpot(*replay, store, result.legal), replay->drops, store.format);
+        writeSpot<P>(w, computeSpot(*replay, store, result.legal), replay->drops);
     }
     w.endObject();
     response.set_content(std::move(w.out), "application/json");
@@ -655,7 +653,6 @@ int main(int argc, char** argv) {
         StrategyRegistry registry;
         registry.warm = options.warm;
         registry.log = &std::cout;
-        registry.detectFormat = detectKeyFormatForSpec;
         const StrategyConfig defaults;
         std::cout << "Default spec: " << defaults.spec() << "\n"
                   << "Available:";
@@ -679,8 +676,7 @@ int main(int argc, char** argv) {
             body["status"] = "ok";
             json loaded = json::array();
             for (const auto& entry : registry.loaded()) {
-                loaded.push_back({{"spec", entry.spec}, {"records", entry.records},
-                    {"keyFormat", keyFormatName(entry.format)}});
+                loaded.push_back({{"spec", entry.spec}, {"records", entry.records}});
             }
             body["loaded"] = loaded;
             response.set_content(body.dump(), "application/json");

@@ -104,7 +104,7 @@ SpotResult computeSpot(const Replay<P>& replay, const StrategyStore& store,
             Group& group = groups[g];
             if (!group.looked) {
                 group.looked = true;
-                group.found = store.lookup(row.key, actor.calls > 1, group.record);
+                group.found = store.lookup(row.key, group.record);
             }
             group.combos++;
             row.found = group.found;

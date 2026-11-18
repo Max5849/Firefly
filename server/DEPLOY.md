@@ -849,9 +849,9 @@ sudo systemctl restart firefly-api      # an open file stays mapped until restar
 
 The index is rebuilt on first use, because the old one no longer matches. A file for
 a new config (players, chips, ante, stages, tag) has a new spec and needs no server
-rebuild: the UI can pick it as soon as it is in `solver/strategies/`. Its key layout
-(`current`, or `bit44` for a file written before 2026-11-15) is detected when it is
-opened. A change to `INV_TEMP` (the default temperature), the game rules or the key
+rebuild: the UI can pick it as soon as it is in `solver/strategies/`. It must use the key
+layout the server's solver/trainer has; a file from an older layout opens but finds
+nothing. A change to `INV_TEMP` (the default temperature), the game rules or the key
 layout in solver/trainer does need a rebuild — and the rules or layout a port to
 `server/engine/tableEngine.h` and `server/keyLayout.h` first, checked by
 `build/keyEquivalence`.
@@ -878,7 +878,7 @@ API serves.
 | `cannot find -lz` at link time | zlib headers missing | `sudo apt install zlib1g-dev` |
 | `solver/handAnalysis/boardClassesB.bin has an unexpected size` | copy truncated or missing | re-run the rsync; compare against the byte table in §5 |
 | `tablesMissing` from the API | that metas stage's `boardClasses<L>.bin` / `handMetas<L>.bin` (or `preflopMetas.bin`) not copied | copy them (§5); the next request loads them |
-| `spot.found` near 0 on every node | a strategy file whose key layout is neither `current` nor `bit44` | retrain with the current solver; `/health` shows the layout each open file was read as |
+| `spot.found` near 0 on every node | a strategy file trained on a different key layout than the server was built with | retrain with the current solver, or port the trainer's key changes to `server/engine/tableEngine.h` and `server/keyLayout.h` |
 | `... is not in the 24 byte record format` | strategy file in an old layout, or a partial copy | re-copy `strategy_<spec>.bin` from a run of the current solver |
 | `strategyUnreadable` from the API | the index could not be rebuilt, or the file is corrupt | check write access to `solver/strategies/`; run `./build/indexBuilder <path>` to see the error |
 | `failed to open ... for reading` | wrong working directory | run from `/opt/firefly`; check `WorkingDirectory` in the unit |

@@ -165,51 +165,19 @@ struct MappedFile {
     ~MappedFile() { close(); }
 };
 
-// How a strategy file lays out its keys. Nothing in the file says, so the registry
-// works it out when it opens one (detectKeyFormat in replay.h).
-//
-// Current: actionState (43 bits) | boardField (15) << 43 | cluster (6) << 58, the
-//   layout solver/trainer/config.h names.
-// Bit44: the layout before 2026-11-15: the same 43-bit action state, then the acting
-//   seat's calls > 1 at bit 43, boardField << 44 and a 5-bit cluster << 59. Those files
-//   were trained with a seat that had called twice limited to folding to a further bet,
-//   so they hold that node with fold as its only option.
-enum class KeyFormat { Current, Bit44 };
-
-inline const char* keyFormatName(KeyFormat format) {
-    return format == KeyFormat::Current ? "current" : "bit44";
-}
-
-// A current-layout key in a file's layout. heroCalledTwice is the acting seat's
-// calls > 1, which only Bit44 keeps. False when the layout cannot hold the key: a
-// Bit44 cluster has 5 bits.
-inline bool fileKeyFor(KeyFormat format, uint64_t key, bool heroCalledTwice, uint64_t& out) {
-    if (format == KeyFormat::Current) {
-        out = key;
-        return true;
-    }
-    const uint64_t actionState = key & ((1ULL << ACTION_STATE_BITS) - 1);
-    const uint64_t meta = key >> ACTION_STATE_BITS;
-    const uint64_t boardField = meta & BOARD_CLASS_MASK;
-    const uint64_t cluster = meta >> BOARD_CLASS_BITS;
-    if (cluster > 31) {
-        return false;
-    }
-    out = actionState | uint64_t(heroCalledTwice) << 43 | boardField << 44 | cluster << 59;
-    return true;
-}
-
 // Open addressed lookup over the mapped strategy file. Both mappings grow with
 // the strategy and cost page cache rather than resident memory, so a much larger
 // strategy file changes nothing here but the numbers.
+//
+// Keys are the trainer's: actionState (43 bits) | boardField (15) << 43 | cluster (6)
+// << 58. Nothing in a file names its layout, so a file trained on an older key layout
+// opens fine and finds nothing (spot.found near 0 on every node).
 struct StrategyStore {
     MappedFile strategyMap;
     MappedFile indexMap;
     const uint64_t* slots = nullptr;
     uint64_t slotMask = 0;
     uint64_t records = 0;
-    // Set by the registry once the store is open, before it is shared.
-    KeyFormat format = KeyFormat::Current;
 
     void open(const std::string& strategyPath, const std::string& indexPath) {
         records = strategyRecordCount(strategyPath);
@@ -255,19 +223,12 @@ struct StrategyStore {
         std::memcpy(&out.variances, cursor + 16, sizeof(out.variances));
     }
 
-    // Looks up a key in the server's (current) layout, translated to the file's.
-    // heroCalledTwice is the acting seat's calls > 1 at the node.
-    bool lookup(uint64_t key, bool heroCalledTwice, StrategyRecord& out) const {
-        uint64_t fileKey;
-        return fileKeyFor(format, key, heroCalledTwice, fileKey) && lookupFileKey(fileKey, out);
-    }
-
     // Looks up a key exactly as the file stores it.
     //
     // The 32 bit tag in the slot resolves almost every miss without touching the
     // record mapping at all, which is what keeps a 1326 combo sweep cheap when
     // most of its keys are states self play never reached.
-    bool lookupFileKey(uint64_t key, StrategyRecord& out) const {
+    bool lookup(uint64_t key, StrategyRecord& out) const {
         uint64_t hash = mix64(key);
         uint32_t tag = strategySlotTag(hash);
         uint64_t index = hash & slotMask;
@@ -366,7 +327,7 @@ inline void buildIndex(const std::string& strategyPath, const std::string& index
     StrategyRecord record;
     for (uint64_t i = 0; i < records; i++) {
         uint64_t key = keyAt(i);
-        if (!store.lookupFileKey(key, record) || record.key != key) {
+        if (!store.lookup(key, record) || record.key != key) {
             throw std::runtime_error("record " + std::to_string(i)
                 + " is not reachable through the index it was just written to");
         }
@@ -454,9 +415,6 @@ struct StrategyRegistry {
     std::map<std::string, std::shared_ptr<const StrategyStore>> stores;
     bool warm = false;
     std::ostream* log = nullptr;
-    // Works out a newly opened store's KeyFormat, before it is shared. Throws when it
-    // cannot (the request then fails as strategyUnreadable).
-    std::function<KeyFormat(const StrategyStore&, const std::string& spec)> detectFormat;
 
     // nullptr when strategy_<spec>.bin does not exist. Throws when it exists but cannot
     // be read.
@@ -483,15 +441,11 @@ struct StrategyRegistry {
             buildIndex(path, index, log);
             store->open(path, index);
         }
-        if (detectFormat) {
-            store->format = detectFormat(*store, spec);
-        }
         if (warm) {
             store->warm();
         }
         if (log != nullptr) {
-            *log << "Opened " << path << " (" << store->records << " records, "
-                 << keyFormatName(store->format) << " key layout)" << std::endl;
+            *log << "Opened " << path << " (" << store->records << " records)" << std::endl;
         }
         stores.emplace(spec, store);
         return store;
@@ -500,14 +454,13 @@ struct StrategyRegistry {
     struct Loaded {
         std::string spec;
         uint64_t records;
-        KeyFormat format;
     };
 
     std::vector<Loaded> loaded() {
         std::lock_guard<std::mutex> lock(mutex);
         std::vector<Loaded> out;
         for (const auto& [spec, store] : stores) {
-            out.push_back({spec, store->records, store->format});
+            out.push_back({spec, store->records});
         }
         return out;
     }

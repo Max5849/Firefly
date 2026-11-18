@@ -166,11 +166,23 @@ std::string illegalReason(const TableEngine<P>& engine, int option) {
     }
 
     if (option == 1) {
-        // The call clause only applies inside this guard; outside it, calling is
+        // The call clauses only apply inside this guard; outside it, calling is
         // always legal.
-        if (player.spr >= 0.0005f && raises < 6 && player.raisesFaced > 2) {
+        if (player.spr < 0.0005f || raises >= 6) {
+            return "";
+        }
+        if (player.raisesFaced > 2) {
             return "you are facing three or more raises since you last acted: fold or "
                 "re-raise, no flat call";
+        }
+        if (player.calls > 1) {
+            return "you have already called twice on this street: fold or re-raise";
+        }
+        if (engine.round == 0 && player.raisesFaced > 1) {
+            return "preflop, a seat facing two raises since it last acted cannot flat call";
+        }
+        if (engine.round == 0 && engine.raiseHistory[0] < 2 && engine.action > 2) {
+            return "preflop, UTG to CO cannot limp or flat call a single raise: fold or raise";
         }
         return "";
     }
@@ -302,7 +314,6 @@ struct Replay {
         const auto& range = engine.players[seat].range;
         const uint64_t actionState = engine.getActionState(config.memoryStage);
         const auto& meta = engine.getMetaState(config.metasStage);
-        const bool calledTwice = engine.players[seat].calls > 1;
         std::array<int8_t, GROUP_COUNT> seen;
         seen.fill(-1);
         groups.fill(NO_GROUP);
@@ -316,7 +327,7 @@ struct Replay {
             groups[combo] = group;
             if (seen[group] < 0) {
                 const uint64_t key = actionState | meta[combo] << ACTION_STATE_BITS;
-                seen[group] = store.lookup(key, calledTwice, record) ? 1 : 0;
+                seen[group] = store.lookup(key, record) ? 1 : 0;
                 if (seen[group] == 1) {
                     policy[group] = policyFromWeights(record.weights, legal, invTemp);
                 } else {
@@ -469,53 +480,3 @@ struct Replay {
         return std::vector<int>(board.begin(), board.begin() + roundBoardCards(engine.round));
     }
 };
-
-// Which key layout a strategy file uses, read off the opening node. Every hand passes
-// the first decision (seat 3 % P, nothing played), and self-play deals every 169 class
-// there, so a file holds that node for nearly every group in its own layout and for
-// none in another. Runs the config's opening node through TableEngine<P> and counts
-// the groups each layout finds. The config's metas stage must be loadable.
-template <int P>
-KeyFormat detectKeyFormat(const StrategyStore& store, const StrategyConfig& config) {
-    ServerTables::requireStage(config.metasStage);
-    auto engine = std::make_unique<TableEngine<P>>();
-    engine->startingChips = float(config.chips);
-    engine->ante = float(config.ante);
-    engine->metasStageMask = 1u << config.metasStage;
-    engine->deal({0, 1, 2, 3, 4});
-    engine->setActionState(config.memoryStage);
-    const uint64_t actionState = engine->getActionState(config.memoryStage);
-    const auto& meta = engine->getMetaState(config.metasStage);
-    std::array<bool, GROUP_COUNT> seen = {};
-    int current = 0;
-    int bit44 = 0;
-    StrategyRecord record;
-    for (int combo = 0; combo < COMBO_COUNT; combo++) {
-        const uint8_t group = engine->getGroup(config.metasStage, combo);
-        if (seen[group]) {
-            continue;
-        }
-        seen[group] = true;
-        const uint64_t key = actionState | meta[combo] << ACTION_STATE_BITS;
-        uint64_t fileKey;
-        current += fileKeyFor(KeyFormat::Current, key, false, fileKey) && store.lookupFileKey(fileKey, record);
-        bit44 += fileKeyFor(KeyFormat::Bit44, key, false, fileKey) && store.lookupFileKey(fileKey, record);
-    }
-    return bit44 > current ? KeyFormat::Bit44 : KeyFormat::Current;
-}
-
-// detectKeyFormat for the table size a spec names. Current for a spec that does not
-// decode.
-inline KeyFormat detectKeyFormatForSpec(const StrategyStore& store, const std::string& spec) {
-    StrategyConfig config;
-    if (!decodeSpec(spec, config)) {
-        return KeyFormat::Current;
-    }
-    switch (config.players) {
-        case 3: return detectKeyFormat<3>(store, config);
-        case 4: return detectKeyFormat<4>(store, config);
-        case 5: return detectKeyFormat<5>(store, config);
-        case 6: return detectKeyFormat<6>(store, config);
-        default: return detectKeyFormat<7>(store, config);
-    }
-}

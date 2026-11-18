@@ -86,20 +86,11 @@ tag letter: 7 players, 400 chips, ante 2, metas stage B (1), memory stage A (0),
 is `740210A`. The chips and ante terms overlap unless the stack is a multiple of 10,
 so the server only accepts such stacks, from 10 to 990.
 
-Nothing in a file says which key layout it was written with, so when the registry
-opens one it looks up the config's opening node (seat `3 % players`, nothing played)
-in both layouts and keeps the one that finds it (`detectKeyFormat` in replay.h):
-
-| `keyFormat` | Layout |
-| --- | --- |
-| `current` | action state in bits 0–42, board field 43–57, 6-bit hand cluster 58–63 (solver/trainer/config.h today) |
-| `bit44` | the layout before 2026-11-15: the same action state, the acting seat's `calls > 1` at bit 43, board field 44–58, 5-bit cluster 59–63 |
-
-Every lookup takes a current-layout key and translates it. The rules are otherwise
-the same, so a `bit44` file serves exactly: `strategy_740210A.bin` holds the key at
-100% of on-policy preflop and flop decisions (it was trained before hands went to the
-river, so it has no turn or river records). The startup log, `/health` and
-`spot.keyFormat` name each file's layout. Rows' `key`s are always the current layout.
+Keys are the trainer's: action state in bits 0–42, board field 43–57, 6-bit hand
+cluster 58–63 (solver/trainer/config.h). Nothing in a file says which key layout it
+was written with, and the server reads only this one: a file trained on an older
+layout (`strategy_740220A.bin`, `strategy_740210A.bin`, both from before 2026-11-18)
+opens fine and finds nothing, so `spot.found` is 0 on every node.
 
 ## Endpoints
 
@@ -165,15 +156,16 @@ is given in each `spot` row. Fields, in order:
 | Field | Bits | Holds |
 | --- | --- | --- |
 | `headsBasic` | 0–1 | players in the hand: 2, 3, 4–5, 6–7 |
-| `preflopHeadsBasic` | 2–3 | the same bucket, frozen when preflop ends |
-| `sprCpr` | 4–7 | SPR 0–5 (cuts 0.5, 1.5, 3.5, 7.5, 15.5), or with no chips behind CPR 6–9 (cuts 0.5, 1.5, 3.5) |
-| `raiseHistory` | 8–15 | colex rank of the four per-street raise counts (parts: the counts) |
-| `raiseSizes` | 16–19 | per street, whether its last raise was 1.5x pot or all in |
-| `story` | 20–30 | one base-3 digit per street, then hero and villain position (base 5); positions are zeroed after a limped preflop |
-| `lastRaise` | 31–35 | only on a raised street: what the raiser faced, seats behind it, calls before it |
-| `hiddenRaiseSize` | 36 | only from the street's second raise: whether the raise before was big |
-| `hero` | 37–41 | seats behind hero, raises hero faces, calls since the pot opened or was raised |
-| `relativePosition` | 42 | whether hero acts after the villain postflop |
+| `preflopHeadsBasic` | 2 | the low bit of the same bucket, frozen when preflop ends (0: 2 or 4–5 players, 1: 3 or 6–7) |
+| `sprCpr` | 3–6 | SPR 0–5 (cuts 0.5, 1.5, 3.5, 7.5, 15.5), or with no chips behind CPR 6–9 (cuts 0.5, 1.5, 3.5) |
+| `raiseHistory` | 7–14 | colex rank of the four per-street raise counts (parts: the counts) |
+| `raiseSizes` | 15–18 | per street, whether its last raise was 1.5x pot or all in |
+| `story` | 19–29 | one base-3 digit per street, then hero and villain position (base 5) |
+| `lastRaise` | 30–34 | only on a raised street: what the raiser faced, seats behind it, calls before it |
+| `hiddenRaiseSize` | 35 | only from the street's second raise: whether the raise before was big |
+| `hero` | 36–40 | seats behind hero, raises hero faces, calls since the pot opened or was raised |
+| `relativePosition` | 41 | whether hero acts after the villain postflop |
+| `calledTwice` | 42 | hero has called twice on this street (so cannot call again) |
 | `boardField` | 43–57 | board class + 169 postflop; preflop each combo's 169 class (stage C: its cluster), so `"shared": false` |
 
 For each field the section lists `shift`, `width`, `bits` (most significant first),
@@ -189,7 +181,7 @@ digits, but not stored in the key), the exact `spr` and `cpr`, and `actionStateB
 #### `spot`
 
 ```json
-{ "keyFormat": "bit44", "legal": [...], "invTemp": 13.86, "potAfterCall": 8,
+{ "legal": [...], "invTemp": 13.86, "potAfterCall": 8,
   "records": 18, "found": 1176, "missing": 0, "invalid": 150,
   "rangeCombos": 1176, "rangeWeight": 615.26, "rangeFoundWeight": 615.26,
   "rangeMix": [0, 0.757, 0.221, 0.022, 0], "rangeEv": 0.31,
@@ -268,12 +260,15 @@ Every error body has a machine-readable `code` and an `error` message:
   offered depends on the SPR at that node: half pot needs SPR ≥ 1.5, one and a half
   pot SPR ≥ 3.5, and all in is offered only below SPR 7.5.
 - **At most six raises** per hand, and the sixth can only be all in.
-- No flat call when facing three or more raises since you last acted.
-- Limping is allowed: the first preflop call opens the pot.
+- No flat call when facing three or more raises since you last acted, or after
+  calling twice on the street.
+- Preflop, no flat call when facing two raises since you last acted, and UTG to CO
+  (seats after the big blind) cannot limp or call a single raise. The button and
+  blinds can limp; the first preflop call opens the pot.
 
-**Hands are played to the river.** `beginNewRound()` ends the betting after the
-river, and after any raised street that leaves more than three players, so those lines
-answer `handEnded` / `showdown`. An off-tree action is not projected onto the nearest
+**Hands end after preflop.** `beginNewRound()` ends the betting when preflop finishes
+(the trainer scores it over runout boards), so any line that closes preflop answers
+`handEnded` / `showdown`, and the flop is never reached. An off-tree action is not projected onto the nearest
 legal one.
 
 ## Tests
@@ -303,10 +298,8 @@ The test runs in two parts.
    - every illegal option has a reason and no legal one does;
    - every raise lands on its `betTo`.
 
-At 4000 hands (before auto folds were removed): 40k lockstep decisions, 183k replay nodes, 0 failures,
-and the default `strategy_740220A.bin` (`current`) holds 100% of on-policy keys on
-every street (`strategy_740210A.bin`, `bit44`, likewise on preflop and flop, the
-streets it was trained on).
+At 4000 hands (2026-11-18): 29k lockstep decisions, 133k replay nodes, all preflop,
+0 failures, and the default `strategy_740010P.bin` holds 100% of on-policy keys.
 A metas stage whose tables are not built is skipped, and the test names it.
 
 `build/storeProbe [--spec 740210A] <hex keys...>` prints what the mmap path returns

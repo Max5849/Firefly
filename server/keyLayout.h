@@ -145,6 +145,11 @@ inline std::string headsBucket(int value) {
     return HEADS[value & 3];
 }
 
+// preflopHeadsBasic keeps only the low bit of the heads bucket.
+inline std::string headsBucketLowBit(int value) {
+    return value & 1 ? "3 or 6-7 players" : "2 or 4-5 players";
+}
+
 inline uint64_t keyBits(uint64_t key, int shift, int width) {
     return (key >> shift) & ((1ULL << width) - 1);
 }
@@ -194,17 +199,17 @@ KeyLayout decodeKey(const Replay<P>& replay) {
         field.meaning = headsBucket(int(field.value));
     }
     {
-        KeyField& field = add("preflopHeadsBasic", "players who saw the flop", 2, 2);
+        KeyField& field = add("preflopHeadsBasic", "players who saw the flop (low bit)", 2, 1);
         field.meaning = (round == 0 ? "preflop, so the players in the hand: "
-            : "players left when preflop ended: ") + headsBucket(int(field.value));
+            : "players left when preflop ended: ") + headsBucketLowBit(int(field.value));
     }
     {
-        KeyField& field = add("sprCpr", "stack or call to pot", 4, 4);
+        KeyField& field = add("sprCpr", "stack or call to pot", 3, 4);
         field.meaning = sprCprInterval(int(field.value));
     }
     std::array<int, 4> raiseCounts;
     {
-        KeyField& field = add("raiseHistory", "raises per street", 8, 8);
+        KeyField& field = add("raiseHistory", "raises per street", 7, 8);
         raiseCounts = raiseHistoryTable()[field.value];
         field.meaning = "colex rank of the raise counts";
         for (int street = 0; street < 4; street++) {
@@ -217,7 +222,7 @@ KeyLayout decodeKey(const Replay<P>& replay) {
         }
     }
     {
-        KeyField& field = add("raiseSizes", "last raise was big, per street", 16, 4);
+        KeyField& field = add("raiseSizes", "last raise was big, per street", 15, 4);
         field.meaning = "one bit per street: its last raise was 1.5x pot or all in";
         for (int street = 0; street < 4; street++) {
             KeyPart part;
@@ -229,7 +234,7 @@ KeyLayout decodeKey(const Replay<P>& replay) {
         }
     }
     {
-        KeyField& field = add("story", "hero / villain story", 20, 11);
+        KeyField& field = add("story", "hero / villain story", 19, 11);
         uint64_t value = field.value;
         const int villanPos = int(value % 5);
         value /= 5;
@@ -258,20 +263,12 @@ KeyLayout decodeKey(const Replay<P>& replay) {
             }
             field.parts.push_back(part);
         }
-        // Positions are kept preflop and in raised pots, and zeroed after a limped preflop.
-        const bool positionsZeroed = round > 0 && raiseCounts[0] == 0;
-        KeyPart heroPart{"hero position", heroPos,
-            positionsZeroed ? "dropped after a limped preflop" : positionBasicSeats(heroPos, P),
-            positionsZeroed};
-        KeyPart villanPart{"villain position", villanPos,
-            positionsZeroed ? "dropped after a limped preflop" : positionBasicSeats(villanPos, P),
-            positionsZeroed};
-        field.parts.push_back(heroPart);
-        field.parts.push_back(villanPart);
+        field.parts.push_back({"hero position", heroPos, positionBasicSeats(heroPos, P)});
+        field.parts.push_back({"villain position", villanPos, positionBasicSeats(villanPos, P)});
     }
     const bool streetRaised = round < 4 && raiseCounts[round] > 0;
     {
-        KeyField& field = add("lastRaise", "the street's last raise", 31, 5);
+        KeyField& field = add("lastRaise", "the street's last raise", 30, 5);
         const int value = int(field.value);
         field.zeroed = !streetRaised;
         field.meaning = streetRaised ? "three base 3 digits: what the last raiser faced, "
@@ -287,14 +284,14 @@ KeyLayout decodeKey(const Replay<P>& replay) {
                 : "no raise", !streetRaised});
     }
     {
-        KeyField& field = add("hiddenRaiseSize", "raise before was big", 36, 1);
+        KeyField& field = add("hiddenRaiseSize", "raise before was big", 35, 1);
         const bool reraised = round < 4 && raiseCounts[round] > 1;
         field.zeroed = !reraised;
         field.meaning = !reraised ? "fewer than two raises on this street"
             : field.value ? "the raise before was 1.5x pot or all in" : "the raise before was 0.5x pot";
     }
     {
-        KeyField& field = add("hero", "hero's spot", 37, 5);
+        KeyField& field = add("hero", "hero's spot", 36, 5);
         const int value = int(field.value);
         field.meaning = "three base 3 digits: seats behind hero, raises hero faces, "
             "callers since the last raise";
@@ -307,9 +304,14 @@ KeyLayout decodeKey(const Replay<P>& replay) {
             + " since the pot was opened or last raised"});
     }
     {
-        KeyField& field = add("relativePosition", "hero vs villain", 42, 1);
+        KeyField& field = add("relativePosition", "hero vs villain", 41, 1);
         field.meaning = field.value ? "hero acts after the villain postflop (in position)"
             : "hero acts at or before the villain postflop (out of position)";
+    }
+    {
+        KeyField& field = add("calledTwice", "hero called twice", 42, 1);
+        field.meaning = field.value ? "hero has called twice this street, so cannot call again"
+            : "hero has called at most once this street";
     }
     {
         KeyField& field = add("boardField", "board class + 169", ACTION_STATE_BITS, BOARD_CLASS_BITS);

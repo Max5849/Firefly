@@ -178,8 +178,8 @@ struct TableEngine {
         int shift = 0;
         state |= uint64_t(headsBasic & 0x3) << shift;
         shift += 2;
-        state |= uint64_t(preflopHeadsBasic & 0x3) << shift;
-        shift += 2;
+        state |= uint64_t(preflopHeadsBasic & 0x1) << shift;
+        shift += 1;
 
         player.spr = float(player.chips - (bet - player.bet)) / (pot + (bet - player.bet));
         player.cpr = float(bet - player.bet) / (pot - (bet - player.bet));
@@ -225,9 +225,9 @@ struct TableEngine {
             }
         }
         heroVillanStory *= 5;
-        heroVillanStory += (round == 0 || raiseHistory[0] > 0) * player.positionBasic;
+        heroVillanStory += player.positionBasic;
         heroVillanStory *= 5;
-        heroVillanStory += (round == 0 || raiseHistory[0] > 0) * villan.positionBasic;
+        heroVillanStory += villan.positionBasic;
         state |= uint64_t(heroVillanStory & 0x7FF) << shift;
         shift += 11;
 
@@ -258,6 +258,8 @@ struct TableEngine {
 
         state |= uint64_t(player.relativePosition & 0x1) << shift;
         shift += 1;
+        state |= uint64_t((player.calls > 1) & 0x1) << shift;
+        shift += 1;
 
         actionState[memoryStage] = state;
     }
@@ -283,7 +285,10 @@ struct TableEngine {
                     options[2] = true;
                 }
             }
-            if (player.raisesFaced > 2) {
+            if (player.raisesFaced > 2 || player.calls > 1) {
+                options[1] = false;
+            }
+            if (round == 0 && ((raiseHistory[0] < 2 && action > 2) || (player.raisesFaced > 1))) {
                 options[1] = false;
             }
         }
@@ -498,10 +503,10 @@ struct TableEngine {
             return false;
         }
         round++;
-        if (round == 4) {
+        if (round == 1) {
             return false;
         }
-        if (heads > 3 && (raiseHistory[round - 1] > 0)) {
+        if (heads > 3) {
             return false;
         }
         firstAction = 1;

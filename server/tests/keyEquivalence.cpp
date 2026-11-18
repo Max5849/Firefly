@@ -134,7 +134,7 @@ static void checkDecode(const Replay<P>& replay, Tally& tally, const std::string
         return *at->second;
     };
     expect("headsBasic", int(field("headsBasic").value), engine.headsBasic);
-    expect("preflopHeadsBasic", int(field("preflopHeadsBasic").value), engine.preflopHeadsBasic);
+    expect("preflopHeadsBasic", int(field("preflopHeadsBasic").value), engine.preflopHeadsBasic & 1);
     expect("sprCpr", int(field("sprCpr").value), expectedSprCpr(hero.spr, hero.cpr));
     for (int street = 0; street < 4; street++) {
         expect("raiseHistory", field("raiseHistory").parts[street].value, engine.raiseHistory[street]);
@@ -154,19 +154,15 @@ static void checkDecode(const Replay<P>& replay, Tally& tally, const std::string
         fits &= digits[street] <= 2;
         story = story * 3 + digits[street];
     }
-    const bool keepPositions = round == 0 || engine.raiseHistory[0] > 0;
-    story = (story * 5 + keepPositions * hero.positionBasic) * 5 + keepPositions * villan.positionBasic;
+    story = (story * 5 + hero.positionBasic) * 5 + villan.positionBasic;
     fits &= story <= 0x7FF;
     expect("story", int(field("story").value), int(story & 0x7FF));
     if (fits) {
         for (int street = 0; street < 4; street++) {
             expect("story digit", field("story").parts[street].value, digits[street]);
         }
-        expect("hero position", field("story").parts[4].value, keepPositions * hero.positionBasic);
-        expect("villain position", field("story").parts[5].value, keepPositions * villan.positionBasic);
-        if (field("story").parts[4].zeroed != !keepPositions) {
-            report(tally, where + ": story positions zeroed flag is wrong");
-        }
+        expect("hero position", field("story").parts[4].value, hero.positionBasic);
+        expect("villain position", field("story").parts[5].value, villan.positionBasic);
     }
 
     const bool raised = engine.raiseHistory[round] > 0;
@@ -184,6 +180,7 @@ static void checkDecode(const Replay<P>& replay, Tally& tally, const std::string
     expect("hero raises faced", spot.parts[1].value, std::min<int>(hero.raisesFaced, 2));
     expect("hero callers", spot.parts[2].value, std::min<int>(engine.calls, 2));
     expect("relativePosition", int(field("relativePosition").value), hero.relativePosition);
+    expect("calledTwice", int(field("calledTwice").value), hero.calls > 1);
     if (round > 0) {
         expect("boardField", int(field("boardField").value),
             engine.boardClass[replay.config.metasStage] + 169);
@@ -291,7 +288,7 @@ static void lockstep(uint64_t hands, uint32_t stageMask, const StrategyStore* st
                 StrategyRecord record;
                 const uint64_t key = trainer->getActionState(MEMORY_STAGE)
                     | trainer->getMetaState(METAS_STAGE) << ACTION_STATE_BITS;
-                if (store != nullptr && store->lookup(key, trainer->players[trainer->action].calls > 1, record)) {
+                if (store != nullptr && store->lookup(key, record)) {
                     tally.found[trainer->round]++;
                     option = drawOption(record, legal, gen);
                 } else {
@@ -446,9 +443,6 @@ int main(int argc, char** argv) {
                 buildIndex(strategyPath(spec), index, &std::cout);
                 store->open(strategyPath(spec), index);
             }
-            store->format = detectKeyFormatForSpec(*store, spec);
-            std::cout << "strategy_" << spec << ".bin: " << keyFormatName(store->format)
-                      << " key layout" << std::endl;
         }
 
         Tally lock;
