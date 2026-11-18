@@ -1,7 +1,24 @@
 #pragma once
 
-#include "solver/singleHand/config.h"
+#include "solver/trainer/config.h"
 #include "solver/handAnalysis/handClusterer.h"
+
+// The worker owns it, since engine copies would lose it.
+struct Runouts {
+    std::mt19937 gen;
+    // Indexed by the street the hand stopped after: 0 preflop, 1 flop, 2 turn.
+    std::array<std::array<std::array<int, 5>, RUNOUTS>, 3> boards;
+    std::array<std::array<std::array<uint32_t, PLAYER_COUNT>, RUNOUTS>, 3> scores;
+    std::array<bool, 3> drawn = {false, false, false};
+    // Bit p: seat p's scores on the street's boards are read.
+    std::array<uint8_t, 3> scored = {0, 0, 0};
+
+    // Starts a new hand.
+    void reset() {
+        drawn.fill(false);
+        scored.fill(0);
+    }
+};
 
 struct Engine {
     struct Player {
@@ -95,100 +112,6 @@ struct Engine {
         return handIndex;
     }
 
-    // RUNOUTS boards for each street a showdown can come before the river on, for the
-    // hand being played, and every live seat's score on them. A street's boards are
-    // drawn, and a seat's scores read, on first use, then shared by every branch and
-    // traversal of the hand. reset() starts a new hand.
-    struct Runouts {
-        static_assert(PLAYER_COUNT <= 8, "scored holds a seat per bit");
-        static_assert(RUNOUTS >= 1, "a showdown needs at least one runout");
-        std::mt19937 gen;
-        // Indexed by the street the hand stopped after: 0 preflop, 1 flop, 2 turn.
-        std::array<std::array<std::array<int, 5>, RUNOUTS>, 3> boards;
-        std::array<std::array<std::array<uint32_t, PLAYER_COUNT>, RUNOUTS>, 3> scores;
-        std::array<bool, 3> drawn = {false, false, false};
-        // Bit p: seat p's scores on the street's boards are read.
-        std::array<uint8_t, 3> scored = {0, 0, 0};
-
-        void reset() {
-            drawn.fill(false);
-            scored.fill(0);
-        }
-
-        // Each board keeps the seen cards and fills the rest from the unseen board cards
-        // and the undealt deck, so no seat's hole cards, folded or not, can land on it.
-        void draw(const Engine& engine, int street) {
-            using param = std::uniform_int_distribution<int>::param_type;
-            std::uniform_int_distribution<int> pick;
-            const int seen = street == 0 ? 0 : street + 2;
-            std::array<int, 52 - 2 * PLAYER_COUNT> pool;
-            int size = 0;
-            for (int i = seen; i < 5; i++) {
-                pool[size++] = engine.deck[i];
-            }
-            for (int i = 5 + 2 * PLAYER_COUNT; i < 52; i++) {
-                pool[size++] = engine.deck[i];
-            }
-            for (std::array<int, 5>& board : boards[street]) {
-                for (int i = 0; i < seen; i++) {
-                    board[i] = engine.boardCards[i];
-                }
-                for (int i = seen; i < 5; i++) {
-                    std::swap(pool[i - seen], pool[pick(gen, param(i - seen, size - 1))]);
-                    board[i] = pool[i - seen];
-                }
-            }
-            drawn[street] = true;
-        }
-
-        // Pays each live seat its share of the pot, averaged over the street's boards.
-        void split(Engine& engine, int street) {
-            if (!drawn[street]) {
-                draw(engine, street);
-            }
-            for (int p = 0; p < PLAYER_COUNT; p++) {
-                if (!engine.players[p].inHand || (scored[street] >> p & 1)) {
-                    continue;
-                }
-                // Every index first, so the table's cache misses overlap.
-                std::array<uint32_t, RUNOUTS> indexes;
-                for (int k = 0; k < RUNOUTS; k++) {
-                    indexes[k] = handIndex(boards[street][k], engine.players[p].holeCards);
-                    __builtin_prefetch(&handScoreTable[indexes[k]]);
-                }
-                for (int k = 0; k < RUNOUTS; k++) {
-                    scores[street][k][p] = handScoreTable[indexes[k]];
-                }
-                scored[street] |= uint8_t(1u << p);
-            }
-            std::array<double, PLAYER_COUNT> share = {0};
-            for (int k = 0; k < RUNOUTS; k++) {
-                uint32_t best = 0;
-                int count = 0;
-                for (int p = 0; p < PLAYER_COUNT; p++) {
-                    if (engine.players[p].inHand) {
-                        const uint32_t score = scores[street][k][p];
-                        if (score > best) {
-                            best = score;
-                            count = 1;
-                        } else if (score == best) {
-                            count++;
-                        }
-                    }
-                }
-                for (int p = 0; p < PLAYER_COUNT; p++) {
-                    if (engine.players[p].inHand && scores[street][k][p] == best) {
-                        share[p] += 1.0 / count;
-                    }
-                }
-            }
-            for (int p = 0; p < PLAYER_COUNT; p++) {
-                if (engine.players[p].inHand) {
-                    engine.players[p].chips += float(double(engine.pot) * share[p] / RUNOUTS);
-                }
-            }
-        }
-    };
     // The worker's runouts; null pays every showdown on the dealt board.
     Runouts* runouts = nullptr;
 
@@ -372,8 +295,8 @@ struct Engine {
         int shift = 0;
         state |= uint64_t(headsBasic & 0x3) << shift;
         shift += 2;
-        state |= uint64_t(preflopHeadsBasic & 0x3) << shift;
-        shift += 2;
+        state |= uint64_t(preflopHeadsBasic & 0x1) << shift;
+        shift += 1;
 
         player.spr = float(player.chips - (bet - player.bet)) / (pot + (bet - player.bet));
         player.cpr = float(bet - player.bet) / (pot - (bet - player.bet));
@@ -419,9 +342,9 @@ struct Engine {
             }
         }
         heroVillanStory *= 5;
-        heroVillanStory += (round == 0 || raiseHistory[0] > 0) * player.positionBasic;
+        heroVillanStory += player.positionBasic;
         heroVillanStory *= 5;
-        heroVillanStory += (round == 0 || raiseHistory[0] > 0) * villan.positionBasic;
+        heroVillanStory += villan.positionBasic;
         state |= uint64_t(heroVillanStory & 0x7FF) << shift;
         shift += 11;
 
@@ -452,16 +375,10 @@ struct Engine {
 
         state |= uint64_t(player.relativePosition & 0x1) << shift;
         shift += 1;
+        state |= uint64_t((player.calls > 1) & 0x1) << shift;
+        shift += 1;
 
         actionState[memoryStage] = state;
-    }
-
-    // A player who has already called twice this street folds to any further bet. The
-    // fold is automatic: the caller plays it without building a key or a node.
-    bool autoFold() const {
-        const Player& player = players[action];
-        const float toCall = bet - player.bet;
-        return player.calls > 1 && toCall / (pot - toCall) >= 0.0005f;
     }
 
     std::array<bool, 5> getOptions() {
@@ -485,7 +402,10 @@ struct Engine {
                     options[2] = true;
                 }
             }
-            if (player.raisesFaced > 2) {
+            if (player.raisesFaced > 2 || player.calls > 1) {
+                options[1] = false;
+            }
+            if (round == 0 && ((raiseHistory[0] < 2 && action > 2) || (player.raisesFaced > 1))) {
                 options[1] = false;
             }
         }
@@ -655,10 +575,10 @@ struct Engine {
             return false;
         }
         round++;
-        if (round == 4) {
+        if (round == 1) {
             return false;
         }
-        if (heads > 3 && (raiseHistory[round - 1] > 0)) {
+        if (heads > 3) {
             return false;
         }
         firstAction = 1;
@@ -692,7 +612,7 @@ struct Engine {
             return;
         }
         if (round < 4 && runouts != nullptr) {
-            runouts->split(*this, round - 1);
+            runoutShowdown(round - 1);
             return;
         }
         uint32_t handMax = 0;
@@ -711,6 +631,82 @@ struct Engine {
         for (int i = 0; i < PLAYER_COUNT; i++) {
             if (players[i].inHand && players[i].handScore == handMax) {
                 players[i].chips += pot / handMaxCount;
+            }
+        }
+    }
+
+    // Fills the street's runout boards. Each keeps the seen cards and fills the rest from
+    // the unseen board cards and the undealt deck, so no seat's hole cards, folded or not,
+    // can land on it.
+    void drawRunouts(int street) {
+        using param = std::uniform_int_distribution<int>::param_type;
+        std::uniform_int_distribution<int> pick;
+        const int seen = street == 0 ? 0 : street + 2;
+        std::array<int, 52 - 2 * PLAYER_COUNT> pool;
+        int size = 0;
+        for (int i = seen; i < 5; i++) {
+            pool[size++] = deck[i];
+        }
+        for (int i = 5 + 2 * PLAYER_COUNT; i < 52; i++) {
+            pool[size++] = deck[i];
+        }
+        for (std::array<int, 5>& board : runouts->boards[street]) {
+            for (int i = 0; i < seen; i++) {
+                board[i] = boardCards[i];
+            }
+            for (int i = seen; i < 5; i++) {
+                std::swap(pool[i - seen], pool[pick(runouts->gen, param(i - seen, size - 1))]);
+                board[i] = pool[i - seen];
+            }
+        }
+        runouts->drawn[street] = true;
+    }
+
+    // Pays each live seat its share of the pot, averaged over the street's runouts.
+    void runoutShowdown(int street) {
+        Runouts& r = *runouts;
+        if (!r.drawn[street]) {
+            drawRunouts(street);
+        }
+        for (int p = 0; p < PLAYER_COUNT; p++) {
+            if (!players[p].inHand || (r.scored[street] >> p & 1)) {
+                continue;
+            }
+            // Every index first, so the table's cache misses overlap.
+            std::array<uint32_t, RUNOUTS> indexes;
+            for (int k = 0; k < RUNOUTS; k++) {
+                indexes[k] = handIndex(r.boards[street][k], players[p].holeCards);
+                __builtin_prefetch(&handScoreTable[indexes[k]]);
+            }
+            for (int k = 0; k < RUNOUTS; k++) {
+                r.scores[street][k][p] = handScoreTable[indexes[k]];
+            }
+            r.scored[street] |= uint8_t(1u << p);
+        }
+        std::array<double, PLAYER_COUNT> share = {0};
+        for (int k = 0; k < RUNOUTS; k++) {
+            uint32_t best = 0;
+            int count = 0;
+            for (int p = 0; p < PLAYER_COUNT; p++) {
+                if (players[p].inHand) {
+                    const uint32_t score = r.scores[street][k][p];
+                    if (score > best) {
+                        best = score;
+                        count = 1;
+                    } else if (score == best) {
+                        count++;
+                    }
+                }
+            }
+            for (int p = 0; p < PLAYER_COUNT; p++) {
+                if (players[p].inHand && r.scores[street][k][p] == best) {
+                    share[p] += 1.0 / count;
+                }
+            }
+        }
+        for (int p = 0; p < PLAYER_COUNT; p++) {
+            if (players[p].inHand) {
+                players[p].chips += float(double(pot) * share[p] / RUNOUTS);
             }
         }
     }

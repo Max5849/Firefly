@@ -1,8 +1,8 @@
-#include "solver/singleHand/config.h"
-#include "solver/singleHand/engine.h"
-#include "solver/singleHand/strategyTable.h"
-#include "solver/singleHand/baseTable.h"
-#include "solver/singleHand/trace.h"
+#include "solver/trainer/config.h"
+#include "solver/trainer/engine.h"
+#include "solver/trainer/strategyTable.h"
+#include "solver/trainer/baseTable.h"
+#include "solver/trainer/trace.h"
 #include <numbers>
 
 // Applies w <- scale * w + shift atomically, rounding the result stochastically back to a
@@ -42,24 +42,35 @@ static inline uint64_t affineUpdateVariances(std::atomic<uint64_t>& word, uint8_
     return next;
 }
 
-// LEARNING_RATE until COOLDOWN_START of the run, then a half cosine down to 0 at its end.
-static inline double learningRate(double progress) {
+// The inverse temperature and base learning rate for a decision on the given round:
+// the PREFLOP_ ones on round 0, else INV_TEMP and LEARNING_RATE.
+static inline double invTemp(int round) {
+    return round == 0 ? PREFLOP_INV_TEMP : INV_TEMP;
+}
+
+static inline double baseLearningRate(int round) {
+    return round == 0 ? PREFLOP_LEARNING_RATE : LEARNING_RATE;
+}
+
+// The factor on the learning rate: 1 until COOLDOWN_START of the run, then a half cosine
+// down to 0 at its end.
+static inline double cooldown(double progress) {
     if (progress <= COOLDOWN_START) {
-        return LEARNING_RATE;
+        return 1.0;
     }
     const double cooled = std::min((progress - COOLDOWN_START) / (1.0 - COOLDOWN_START), 1.0);
-    return LEARNING_RATE * 0.5 * (1.0 + std::cos(std::numbers::pi * cooled));
+    return 0.5 * (1.0 + std::cos(std::numbers::pi * cooled));
 }
 
 struct Worker {
     Engine engine;
     // Copies of engine carry a pointer to these, so every branch of a hand shares them.
-    Engine::Runouts runouts;
+    Runouts runouts;
     std::mt19937 gen;
     std::uniform_real_distribution<double> unit{0.0, 1.0};
     std::vector<TraceNode> tracePath;
-    // The learning rate for the hand being played.
-    double learningRate = LEARNING_RATE;
+    // The cooldown factor on the learning rate for the hand being played.
+    double cooldown = 1.0;
 
     explicit Worker(unsigned t) : gen(15 + t) {
         runouts.gen.seed(1015 + t);
@@ -111,13 +122,14 @@ struct Explorer {
             } else {
                 std::array<double, 5> draw = {0};
                 double sum = 0;
+                const double temperature = invTemp(engine.round);
                 if (options[0]) {
                     draw[0] = 1.0;
                 }
                 for (int j = 1; j < 5; j++) {
                     if (options[j]) {
                         draw[j] = std::exp(std::clamp(
-                            INV_TEMP * decodeWeight(base->weights[j - 1]), -443.0, 443.0));
+                            temperature * decodeWeight(base->weights[j - 1]), -443.0, 443.0));
                     }
                 }
                 for (int j = 0; j < 5; j++) {
@@ -143,16 +155,17 @@ struct Explorer {
         return weights;
     }
 
-    // The node's policy at INV_TEMP over its legal options. Fold's weight is the exact 0,
+    // The node's policy at temperature over its legal options. Fold's weight is the exact 0,
     // so it draws exp(0) = 1.
-    static void nodePolicy(const Entry& weights, std::array<double, 5>& probabilities) {
+    static void nodePolicy(const Entry& weights, double temperature,
+            std::array<double, 5>& probabilities) {
         const uint8_t legal = entryLegal(weights);
         double sum = 0;
         for (int j = 0; j < 5; j++) {
             double draw = 0;
             if (legal & (1u << j)) {
                 const double w = j == 0 ? 0.0 : loadWeight(weights.weights[j - 1]);
-                draw = std::exp(std::clamp(INV_TEMP * w, -443.0, 443.0));
+                draw = std::exp(std::clamp(temperature * w, -443.0, 443.0));
             }
             probabilities[j] = draw;
             sum += draw;
@@ -224,14 +237,6 @@ struct Explorer {
 
     double traverse(Worker& worker, Engine& engine, int traverser, double reach) {
         while (true) {
-            // A forced fold is not a decision: no key, no node, no update. The traverser's
-            // fold ends at its current stack, which is the value traverse returns.
-            if (engine.autoFold()) {
-                if (engine.getAction() == traverser || !advance(engine, 0)) {
-                    return engine.players[traverser].chips;
-                }
-                continue;
-            }
             setActionStates(engine);
             // setActionState() wrote spr and cpr, which getOptions() reads.
             const std::array<bool, 5> options = engine.getOptions();
@@ -239,7 +244,7 @@ struct Explorer {
                 | engine.getMetaState(METAS_STAGE) << ACTION_STATE_BITS;
             Entry& weights = locateNode(engine, key, options);
             std::array<double, 5> policy;
-            nodePolicy(weights, policy);
+            nodePolicy(weights, invTemp(engine.round), policy);
             if (engine.getAction() == traverser) {
                 return explore(worker, engine, traverser, reach, weights, key, policy);
             }
@@ -283,6 +288,7 @@ struct Explorer {
         const double share = double(add) / double(addVisits(weights, add));
         const bool seeded = entrySeeded(weights);
         const uint64_t packed = weights.variances.load(std::memory_order_relaxed);
+        const double rate = baseLearningRate(engine.round) * worker.cooldown;
 
         TraceNode* node = nullptr;
         if constexpr (TRACE_KEY_ENABLED) {
@@ -291,6 +297,7 @@ struct Explorer {
                 node->key = key;
                 node->combo = engine.getHoleCombo(traverser);
                 node->seat = traverser;
+                node->invTemp = invTemp(engine.round);
                 node->legal = legal;
                 node->seeded = seeded;
                 node->visits = double(entryVisitUnits(weights)) / VISITS_ONE;
@@ -325,7 +332,7 @@ struct Explorer {
             const double target = (ends[j] - chips) / pot;
             const double variance = std::max(decodeVariance(packed, o), VARIANCE_MIN);
             // A touch of weight w is w unit steps: it keeps exp(-rate * w).
-            const double ema = -std::expm1(-worker.learningRate * touch / variance);
+            const double ema = -std::expm1(-rate * touch / variance);
             const double step = seeded ? ema : std::max(share, ema);
             auto [before, after] = affineUpdate(weights.weights[o], 1.0 - step, step * target,
                 worker.unit(worker.gen));
@@ -379,7 +386,7 @@ struct Explorer {
             const uint64_t base = chunk * CHUNK_HANDS;
             uint64_t hands = std::min(CHUNK_HANDS, EPOCHS - base);
             for (uint64_t j = 0; j < hands; j++) {
-                worker.learningRate = learningRate(double(base + j) / double(EPOCHS));
+                worker.cooldown = cooldown(double(base + j) / double(EPOCHS));
                 playHand(worker);
                 // Counted per hand, not per chunk, so a report's rate is not quantised to chunks.
                 totalHands.fetch_add(1, std::memory_order_relaxed);
@@ -536,13 +543,11 @@ int main () {
                   << "BASE_METAS_STAGE: " << BASE_METAS_STAGE << "\n"
                   << "BASE_MEMORY_STAGE: " << BASE_MEMORY_STAGE << "\n"
                   << "BASE_STRATEGY_TAG: " << BASE_STRATEGY_TAG << "\n"
-                  << "BASE_CONFIDENCE: " << BASE_CONFIDENCE << "\n"
                   << "EPOCHS: " << EPOCHS << "\n"
                   << "INV_TEMP: " << INV_TEMP << "\n"
                   << "LEARNING_RATE: " << LEARNING_RATE << "\n"
-                  << "VARIANCE_MIN: " << VARIANCE_MIN << "\n"
-                  << "COOLDOWN_START: " << COOLDOWN_START << "\n"
-                  << "VISITS_FLOOR: " << VISITS_FLOOR << std::endl;
+                  << "PREFLOP_INV_TEMP: " << PREFLOP_INV_TEMP << "\n"
+                  << "PREFLOP_LEARNING_RATE: " << PREFLOP_LEARNING_RATE << std::endl;
 
         Engine::loadTables();
 

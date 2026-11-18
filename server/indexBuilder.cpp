@@ -3,7 +3,7 @@
 //   build/indexBuilder [strategy.bin]
 //   build/indexBuilder --players 7 --chips 400 --ante 2 --metas 1 --memory 0 --tag A
 //
-// With no arguments it indexes the file solver/singleHand/config.h names. The server builds a missing or
+// With no arguments it indexes the file solver/trainer/config.h names. The server builds a missing or
 // stale index itself on first use; this does it ahead of time, and checks the result.
 
 #include "server/strategyStore.h"

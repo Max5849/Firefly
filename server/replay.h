@@ -109,7 +109,7 @@ inline std::string actionName(int option, float toCall, int round, int streetRai
     return (round > 0 && streetRaises == 0) ? "bet" : "raise";
 }
 
-// The inverse temperature a request gets when it names none: solver/singleHand's
+// The inverse temperature a request gets when it names none: solver/trainer's
 // INV_TEMP, ln(2^20), which the strategy files are trained at.
 inline const double DEFAULT_INV_TEMP = INV_TEMP;
 
@@ -205,15 +205,13 @@ std::string illegalReason(const TableEngine<P>& engine, int option) {
 
 // One line of the hand as the table saw it.
 struct HistoryEntry {
-    // AutoFold: a seat that had called twice this street folding to a bet, which the
-    // engine plays itself (Engine::autoFold) - it takes no entry in the action list.
-    enum Kind { Post, Action, AutoFold, Street };
+    enum Kind { Post, Action, Street };
     Kind kind = Action;
     int seat = -1;
     int option = -1;
     std::string name;
     int round = 0;
-    // Post, Action and AutoFold: the seat's total in front on the street afterwards, the
+    // Post and Action: the seat's total in front on the street afterwards, the
     // chips the action put in, and the stack left.
     float betTo = 0;
     float adds = 0;
@@ -257,10 +255,6 @@ struct ReplayDrops {
 // decision's policy a softmax over the stored pot-relative weights at the request's
 // inverse temperature (policyFromWeights) - at INV_TEMP, the policy self-play drew
 // from. A node the strategy has no record of drops the combos that reach it.
-//
-// Forced folds (TableEngine::autoFold) are played as the trainer plays them, with no
-// key and no entry in the action list, so the action list holds decisions only and a
-// replay always stops at a decision.
 template <int P>
 struct Replay {
     TableEngine<P> engine;
@@ -394,19 +388,6 @@ struct Replay {
         return true;
     }
 
-    // Plays every forced fold up to the next decision, as Explorer::traverse does.
-    // actionIndex is the action the folds follow (-1 before the first). False with
-    // result filled when they end the hand or reach a street with no board.
-    bool settle(const std::vector<int>& boardCards, int actionIndex, ReplayResult& result) {
-        while (engine.autoFold()) {
-            if (!playAndRecord(0, HistoryEntry::AutoFold)
-                    && !nextStreet(boardCards, actionIndex, result)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     // Replays the option indices in order. Each is checked against getOptions() before
     // it is played. store == nullptr replays the action state alone and leaves every
     // range at 1. Throws when the config's metas stage has no tables.
@@ -464,12 +445,6 @@ struct Replay {
                     && !nextStreet(boardCards, int(i), result)) {
                 return result;
             }
-            if (!settle(boardCards, int(i), result)) {
-                return result;
-            }
-        }
-        if (actions.empty() && !settle(boardCards, -1, result)) {
-            return result;
         }
 
         const int expected = roundBoardCards(engine.round);

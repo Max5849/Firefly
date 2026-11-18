@@ -270,7 +270,7 @@ g++ -std=c++2b -O2 -I. -o build/keyEquivalence server/tests/keyEquivalence.cpp
 Two things about that command line, both load-bearing:
 
 - `-I.` plus running from `/opt/firefly` — every `#include` in this project is
-  written from the repository root, as `"solver/singleHand/engine.h"`.
+  written from the repository root, as `"solver/trainer/engine.h"`.
 - `-lz` on the server only — that is zlib, for gzipping responses.
 
 ---
@@ -852,7 +852,7 @@ a new config (players, chips, ante, stages, tag) has a new spec and needs no ser
 rebuild: the UI can pick it as soon as it is in `solver/strategies/`. Its key layout
 (`current`, or `bit44` for a file written before 2026-11-15) is detected when it is
 opened. A change to `INV_TEMP` (the default temperature), the game rules or the key
-layout in solver/singleHand does need a rebuild — and the rules or layout a port to
+layout in solver/trainer does need a rebuild — and the rules or layout a port to
 `server/engine/tableEngine.h` and `server/keyLayout.h` first, checked by
 `build/keyEquivalence`.
 

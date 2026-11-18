@@ -1,6 +1,6 @@
 # server — the strategy API
 
-Serves the strategies solver/singleHand trains over HTTP. Given a config, an action
+Serves the strategies solver/trainer trains over HTTP. Given a config, an action
 sequence and a board, it returns three things at the node that sequence reaches:
 
 - **`game`**: the table as a player sees it. Seats, stacks, bets, pot, board, whose
@@ -18,15 +18,15 @@ descriptors, both heads buckets) exist nowhere but in that accumulation. So the 
 replays the action list through an engine rather than reconstructing a node.
 
 That engine is `TableEngine<P>` in [engine/tableEngine.h](engine/tableEngine.h). It
-holds the game rules of [solver/singleHand/engine.h](../solver/singleHand/engine.h)
-(deal, play, autoFold, setActionState, getOptions, beginNewRound, the meta state) for
+holds the game rules of [solver/trainer/engine.h](../solver/trainer/engine.h)
+(deal, play, setActionState, getOptions, beginNewRound, the meta state) for
 any table size from 3 to 7 and any stack and ante. It leaves out hole cards, showdown
 and rewards. The trainer's engine fixes `PLAYER_COUNT`, `CHIP_COUNT` and `ANTE` at
 compile time and is left untouched.
 
 Because the rules are a copy, `build/keyEquivalence` plays `TableEngine<PLAYER_COUNT>`
 in lockstep with the trainer's `Engine` and fails on any difference. **A rule or key
-change in solver/singleHand/engine.h has to be copied into tableEngine.h, and a key
+change in solver/trainer/engine.h has to be copied into tableEngine.h, and a key
 layout change into keyLayout.h.** [engine/tables.h](engine/tables.h) loads the lookup
 tables through `Engine`'s own loaders, minus `handScores.bin`, one metas stage at a
 time on first use.
@@ -41,13 +41,8 @@ combos that reach it**, and the response counts those drops (`spot.replayDrops`)
 **Weights are pot-relative.** The trainer stores each option's return as a share of
 the pot after calling, relative to folding. Every policy here is `P(j) ∝ exp(invTemp ×
 w_j)` over those shares, both at each past decision and at the spot, so `invTemp` is per
-pot. The default is ln(2^20), singleHand's `INV_TEMP`, the policy self-play draws from.
+pot. The default is ln(2^20), the trainer's `INV_TEMP`, the policy self-play draws from.
 EVs are reported in chips: `weight × potAfterCall`.
-
-**Forced folds.** A seat that has already called twice on a street folds to any
-further bet by itself (`Engine::autoFold`): no key, no decision. The replay plays these
-folds as the trainer does. They appear in `game.history` as `autoFold` entries, and
-they take **no slot in `actions`**, which holds decisions only.
 
 ## Building
 
@@ -97,7 +92,7 @@ in both layouts and keeps the one that finds it (`detectKeyFormat` in replay.h):
 
 | `keyFormat` | Layout |
 | --- | --- |
-| `current` | action state in bits 0–42, board field 43–57, 6-bit hand cluster 58–63 (solver/singleHand/config.h today) |
+| `current` | action state in bits 0–42, board field 43–57, 6-bit hand cluster 58–63 (solver/trainer/config.h today) |
 | `bit44` | the layout before 2026-11-15: the same action state, the acting seat's `calls > 1` at bit 43, board field 44–58, 5-bit cluster 59–63 |
 
 Every lookup takes a current-layout key and translates it. The rules are otherwise
@@ -122,10 +117,10 @@ river, so it has no turn or river records). The startup log, `/health` and
 
 | Field | Meaning |
 | --- | --- |
-| `config` | Which strategy to read. Each field is optional and defaults to solver/singleHand/config.h. `players` 3–7. `chips` a multiple of 10 from 10 to 990. `ante` 0–9, a dead ante in the pot from the deal. `metasStage` and `memoryStage` 0–2 (0 = A, the full detail). `tag` one letter. The old `metasBasic` / `memoryBasic` booleans are rejected with a pointer to the stages (`true` was stage 1). |
+| `config` | Which strategy to read. Each field is optional and defaults to solver/trainer/config.h. `players` 3–7. `chips` a multiple of 10 from 10 to 990. `ante` 0–9, a dead ante in the pot from the deal. `metasStage` and `memoryStage` 0–2 (0 = A, the full detail). `tag` one letter. The old `metasBasic` / `memoryBasic` booleans are rejected with a pointer to the stages (`true` was stage 1). |
 | `actions` | Decisions in order: 0 fold, 1 call/check, 2 raise to half pot, 3 raise to one and a half pot, 4 all in. Forced folds are not listed. Empty means the first preflop decision (seat `3 % players`). |
 | `board` | `"As7h2d"`, `"As 7h 2d"` or `"As,7h,2d"`. It must hold exactly the cards for the street the actions reach: 0, 3, 4 or 5. |
-| `invTemp` | Optional inverse temperature **per pot**, from ln(2^5) ≈ 3.466 to ln(2^80) ≈ 55.45. Defaults to ln(2^20), singleHand's `INV_TEMP`. It sets **both** the policy each past decision narrows its range with and the policy shown at the spot, so ranges, frequencies, EV and the range mix all belong to one temperature. Echoed as `spot.invTemp`. |
+| `invTemp` | Optional inverse temperature **per pot**, from ln(2^5) ≈ 3.466 to ln(2^80) ≈ 55.45. Defaults to ln(2^20), the trainer's `INV_TEMP`. It sets **both** the policy each past decision narrows its range with and the policy shown at the spot, so ranges, frequencies, EV and the range mix all belong to one temperature. Echoed as `spot.invTemp`. |
 | `include` | Optional. Leaving it out means all three sections. When present, only the sections set to `true` are returned. |
 
 An unknown field or section is a 400 that names it.
@@ -147,7 +142,6 @@ An unknown field or section is a 400 that names it.
   "history": [{"kind": "post", "seat": 1, "name": "small blind", "betTo": 1, ...},
               {"kind": "action", "seat": 3, "name": "call", "option": 1, "round": 0,
                "betTo": 2, "adds": 2, "stack": 398},
-              {"kind": "autoFold", "seat": 3, "name": "fold", "option": 0, ...},
               {"kind": "street", "round": 1, "street": "flop", "board": "As7h2d"}] }
 ```
 
@@ -157,9 +151,8 @@ An unknown field or section is a 400 that names it.
 - `betTo` comes from `TableEngine::betTo`, which repeats `play()`'s float
   operations; the test asserts every raise lands on it.
 - Illegal options carry the `reason` `getOptions()` turned them off for.
-- `history` holds `post`, `action`, `autoFold` and `street` entries. The k-th
-  `action` entry is decision k; an `autoFold` follows the action that left the
-  seat facing a bet.
+- `history` holds `post`, `action` and `street` entries. The k-th `action` entry is
+  decision k.
 - Seat names follow the player count: BTN, SB, BB, then the last `P − 3` of UTG, LJ,
   HJ, CO.
 
@@ -236,7 +229,7 @@ digits, but not stored in the key), the exact `spr` and `cpr`, and `actionStateB
 - **`emptySeats`** lists seats whose range the line has emptied: every combo they
   could hold passed a node with no record.
 
-The weight and variance codecs are solver/singleHand/strategyTable.h's own
+The weight and variance codecs are solver/trainer/strategyTable.h's own
 (`decodeWeight`, `decodeVariance`), included rather than copied.
 
 #### Errors
@@ -257,7 +250,7 @@ Every error body has a machine-readable `code` and an `error` message:
 ### `GET /meta`, `GET /health`
 
 `/meta` returns:
-- the default config (solver/singleHand/config.h's)
+- the default config (solver/trainer/config.h's)
 - the limits: players, chips and their step, ante, the stage counts
 - `metasStagesLoaded`: which stages' tables are in memory so far
 - the `available` strategies, decoded from `solver/strategies/strategy_*.bin`
@@ -291,9 +284,9 @@ legal one.
 
 The test runs in two parts.
 
-1. **Lockstep.** The trainer's `Engine` (singleHand, `PLAYER_COUNT` seats,
+1. **Lockstep.** The trainer's `Engine` (solver/trainer, `PLAYER_COUNT` seats,
    `CHIP_COUNT`, `ANTE`) and `TableEngine<PLAYER_COUNT>` play the same hands the way
-   `Explorer::traverse` does. They must agree on `autoFold`, every memory stage's
+   `Explorer::traverse` does. They must agree on every memory stage's
    action state, the options, every seat's chips, bets, villain and calls, what
    `play()` and `beginNewRound()` return, and every built metas stage's meta for each
    seat's own two cards. The trainer's table statics are copied from the server's, so
@@ -304,14 +297,13 @@ The test runs in two parts.
    memory stages, stacks and antes, with calls weighted up so the walk reaches the
    flop. At every decision the test asserts that:
    - `Replay`, given only the action list and the revealed board, reaches the same
-     action state, acting seat, legal set and per-combo meta state, auto folds
-     included;
+     action state, acting seat, legal set and per-combo meta state;
    - every `key` field equals the engine quantity it encodes, and the fields repack
      into the shared key;
    - every illegal option has a reason and no legal one does;
    - every raise lands on its `betTo`.
 
-At 4000 hands: 40k lockstep decisions, 183k replay nodes, 3k auto folds, 0 failures,
+At 4000 hands (before auto folds were removed): 40k lockstep decisions, 183k replay nodes, 0 failures,
 and the default `strategy_740220A.bin` (`current`) holds 100% of on-policy keys on
 every street (`strategy_740210A.bin`, `bit44`, likewise on preflop and flop, the
 streets it was trained on).
@@ -329,7 +321,7 @@ repository root:
   stage served (`A`, `B`, `C`), plus `preflopMetas.bin` for stage C
 - every `solver/strategies/strategy_<spec>.bin` to serve (8 + 24 bytes per record:
   uint64 key, int16 weights[4] in 1/1024 pot steps, uint64 packed variance codes —
-  singleHand's format; any other record size is rejected), and its `.idx` if built
+  the trainer's format; any other record size is rejected), and its `.idx` if built
 
 **Not** `handScores.bin` (535 MB). Only `showdown()` reads it, and the API never
 reaches a showdown.

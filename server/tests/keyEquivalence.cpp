@@ -2,11 +2,11 @@
 //
 //   build/keyEquivalence [hands]
 //
-// Part 1, lockstep. The trainer's own Engine (solver/singleHand: PLAYER_COUNT seats,
+// Part 1, lockstep. The trainer's own Engine (solver/trainer: PLAYER_COUNT seats,
 // CHIP_COUNT chips, ANTE) and the server's TableEngine<PLAYER_COUNT> play the same hands
-// side by side, the way Explorer::traverse plays them: forced folds without a key, then
-// setActionState / getOptions / play / beginNewRound / setMetaState. The two must agree
-// on autoFold, every memory stage's action state, the options, every seat's chips and
+// side by side, the way Explorer::traverse plays them: setActionState / getOptions /
+// play / beginNewRound / setMetaState. The two must agree on every memory stage's
+// action state, the options, every seat's chips and
 // bets, the pot, what play() and beginNewRound() return, and, for each seat's own two
 // cards, the meta state of every metas stage whose tables are built. When the default
 // strategy file (strategy_<config.h's spec>.bin) exists, the hands follow its policy at
@@ -17,7 +17,7 @@
 // under random stages, stacks and antes, calls weighted up so the walk reaches the river,
 // and at every decision:
 //   - Replay, given nothing but the action list and the revealed board, reaches the
-//     same action state, options and meta state, auto folds included;
+//     same action state, options and meta state;
 //   - every field decodeKey reports equals the engine quantity it encodes, and the
 //     fields repack into the shared key;
 //   - every option getOptions() turns off has a reason, and no legal one does;
@@ -35,7 +35,6 @@
 
 struct Tally {
     uint64_t nodes = 0;
-    uint64_t autoFolds = 0;
     std::array<uint64_t, 4> perRound = {};
     std::array<uint64_t, 4> found = {};
     uint64_t failures = 0;
@@ -273,15 +272,8 @@ static void lockstep(uint64_t hands, uint32_t stageMask, const StrategyStore* st
         while (true) {
             const std::string where = "lockstep hand " + std::to_string(hand)
                 + " step " + std::to_string(decisions++);
-            const bool forced = trainer->autoFold();
-            if (table->autoFold() != forced) {
-                report(tally, where + ": autoFold differs");
-            }
             int option;
-            if (forced) {
-                tally.autoFolds++;
-                option = 0;
-            } else {
+            {
                 for (int stage = 0; stage < MEMORY_STAGE_COUNT; stage++) {
                     trainer->setActionState(stage);
                     table->setActionState(stage);
@@ -365,10 +357,7 @@ static void run(uint64_t hands, uint32_t stageMask, Tally& tally) {
         std::vector<int> actions;
         while (true) {
             bool more = true;
-            if (engine->autoFold()) {
-                tally.autoFolds++;
-                more = engine->play(0);
-            } else {
+            {
                 engine->setActionState(config.memoryStage);
                 const std::array<bool, 5> legal = engine->getOptions();
 
@@ -466,8 +455,7 @@ int main(int argc, char** argv) {
         lockstep(hands, stageMask, store.get(), lock);
         std::cout << "Lockstep with Engine (" << PLAYER_COUNT << " seats, " << CHIP_COUNT
                   << " chips, ante " << ANTE << "): " << lock.nodes << " decisions, "
-                  << lock.autoFolds << " auto folds\n"
-                  << "  preflop " << lock.perRound[0] << ", flop " << lock.perRound[1]
+                  << "\n  preflop " << lock.perRound[0] << ", flop " << lock.perRound[1]
                   << ", turn " << lock.perRound[2] << ", river " << lock.perRound[3] << "\n";
         if (store != nullptr) {
             std::cout << std::fixed << std::setprecision(2) << "  strategy_" << spec
@@ -489,8 +477,7 @@ int main(int argc, char** argv) {
         run<5>(hands, stageMask, tally);
         run<6>(hands, stageMask, tally);
         run<7>(hands, stageMask, tally);
-        std::cout << "Replay and key decode, 3..7 seats: " << tally.nodes << " nodes, "
-                  << tally.autoFolds << " auto folds\n"
+        std::cout << "Replay and key decode, 3..7 seats: " << tally.nodes << " nodes\n"
                   << "  preflop " << tally.perRound[0] << ", flop " << tally.perRound[1]
                   << ", turn " << tally.perRound[2] << ", river " << tally.perRound[3] << "\n"
                   << "  failures: " << tally.failures << "\n"

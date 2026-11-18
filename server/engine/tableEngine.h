@@ -1,6 +1,6 @@
 #pragma once
 
-// HandClusterer comes through tables.h -> solver/singleHand/engine.h; handClusterer.h
+// HandClusterer comes through tables.h -> solver/trainer/engine.h; handClusterer.h
 // has no include guard, so it must not be included a second time.
 #include "server/engine/tables.h"
 
@@ -10,12 +10,12 @@
 inline constexpr int GROUP_COUNT = 256;
 inline constexpr uint8_t NO_GROUP = 0xFF;
 
-// The game rules of solver/singleHand/engine.h, for any table size, stack and ante, with
+// The game rules of solver/trainer/engine.h, for any table size, stack and ante, with
 // nothing the trainer needs only to learn: no hole cards, no showdown, no rewards. The
 // server builds one per request's player count, replays an action list through it, and
 // reads the state key and every seat's range.
 //
-// setActionState, autoFold, getOptions, play, beginNewRound and getBoardIndex are the
+// setActionState, getOptions, play, beginNewRound and getBoardIndex are the
 // trainer's own code with PLAYER_COUNT as P, CHIP_COUNT as startingChips and ANTE as
 // ante. deal and setMetaState do what the trainer does for the server's case: the board
 // is given rather than shuffled, and every combo off the board is classified rather than
@@ -260,14 +260,6 @@ struct TableEngine {
         shift += 1;
 
         actionState[memoryStage] = state;
-    }
-
-    // A player who has already called twice this street folds to any further bet, with
-    // no key and no decision.
-    bool autoFold() const {
-        const Player& player = players[action];
-        const float toCall = bet - player.bet;
-        return player.calls > 1 && toCall / (pot - toCall) >= 0.0005f;
     }
 
     std::array<bool, 5> getOptions() {

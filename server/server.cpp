@@ -156,7 +156,7 @@ struct IncludeMask {
 };
 
 // The inverse temperatures per pot a request may ask for: ln(2^5) to ln(2^80). The
-// singleHand trainer runs at ln(2^20).
+// trainer runs at ln(2^20).
 inline const double MIN_INV_TEMP = 5 * std::log(2.0);
 inline const double MAX_INV_TEMP = 80 * std::log(2.0);
 
@@ -211,7 +211,7 @@ static bool configInteger(const json& value, const std::string& name, int low, i
     return true;
 }
 
-// Every field optional; a missing one takes the value solver/singleHand/config.h was
+// Every field optional; a missing one takes the value solver/trainer/config.h was
 // compiled with.
 static bool parseConfig(const json& body, StrategyConfig& config, std::string& error) {
     if (!body.contains("config") || body["config"].is_null()) {
@@ -408,8 +408,7 @@ void writeGame(JsonWriter& w, Replay<P>& replay, const std::array<bool, 5>& lega
             w.field("street", entry.name);
             w.field("board", entry.board);
         } else {
-            w.field("kind", std::string(entry.kind == HistoryEntry::Post ? "post"
-                : entry.kind == HistoryEntry::AutoFold ? "autoFold" : "action"));
+            w.field("kind", std::string(entry.kind == HistoryEntry::Post ? "post" : "action"));
             w.field("seat", entry.seat);
             w.field("name", entry.name);
             w.field("option", entry.option);
@@ -718,9 +717,7 @@ int main(int argc, char** argv) {
                 "weight, its return as a share of the pot after calling";
             body["replay"] = "ranges are each seat's own policy multiplied along the line, "
                 "through that same softmax at the request's invTemp; the default is the "
-                "singleHand trainer's INV_TEMP. A seat that has called twice on a street "
-                "folds to a further bet by itself (history kind autoFold), with no entry in "
-                "the action list";
+                "trainer's INV_TEMP";
             body["streets"] = "hands are played to the river: the betting ends after the "
                 "river, or after any raised street that leaves more than 3 players";
             response.set_content(body.dump(2), "application/json");

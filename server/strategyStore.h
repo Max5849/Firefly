@@ -1,7 +1,7 @@
 #pragma once
 
-#include "solver/singleHand/config.h"
-#include "solver/singleHand/strategyTable.h"
+#include "solver/trainer/config.h"
+#include "solver/trainer/strategyTable.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -19,10 +19,10 @@
 // option 0, because folding's pot normalised return is analytically exactly zero.
 // The file holds no visits and no legal options; legality is recomputed.
 //
-// The file carries each weight as a 16-bit code of 1/1024 pot steps (solver/singleHand's
+// The file carries each weight as a 16-bit code of 1/1024 pot steps (solver/trainer's
 // encodeWeight); readRecord decodes it with decodeWeight. Every code is exact as a float.
 // Variances stay as the packed codes; decodeVariance (strategyTable.h) reads them. Both
-// codecs are singleHand's own, so the server cannot drift from the trainer's format.
+// codecs are the trainer's own, so the server cannot drift from its format.
 //
 // The file packs these at STRATEGY_RECORD_BYTES with no padding. Never point a
 // StrategyRecord* into the mapping; copy the fields out with memcpy.
@@ -30,7 +30,7 @@ struct StrategyRecord {
     uint64_t key;
     std::array<float, 4> weights;
     // Option j's 16-bit variance code in bits 16 (j - 1) to 16 (j - 1) + 15, as
-    // solver/singleHand/strategyTable.h packs Entry::variances.
+    // solver/trainer/strategyTable.h packs Entry::variances.
     uint64_t variances;
 };
 
@@ -169,11 +169,11 @@ struct MappedFile {
 // works it out when it opens one (detectKeyFormat in replay.h).
 //
 // Current: actionState (43 bits) | boardField (15) << 43 | cluster (6) << 58, the
-//   layout solver/singleHand/config.h names.
+//   layout solver/trainer/config.h names.
 // Bit44: the layout before 2026-11-15: the same 43-bit action state, then the acting
-//   seat's calls > 1 at bit 43, boardField << 44 and a 5-bit cluster << 59. The rules
-//   are otherwise today's: a seat with calls > 1 facing a bet never reaches a key now
-//   (Engine::autoFold), and one checking keeps its bit.
+//   seat's calls > 1 at bit 43, boardField << 44 and a 5-bit cluster << 59. Those files
+//   were trained with a seat that had called twice limited to folding to a further bet,
+//   so they hold that node with fold as its only option.
 enum class KeyFormat { Current, Bit44 };
 
 inline const char* keyFormatName(KeyFormat format) {
@@ -383,7 +383,7 @@ inline constexpr int CHIPS_STEP = 10;
 inline constexpr int MAX_ANTE = 9;
 
 // What a strategy file was trained at: the settings its spec encodes. The defaults are
-// solver/singleHand/config.h's.
+// solver/trainer/config.h's.
 struct StrategyConfig {
     int players = PLAYER_COUNT;
     int chips = int(CHIP_COUNT);

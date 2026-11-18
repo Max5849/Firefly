@@ -1,6 +1,6 @@
 #pragma once
 
-#include "solver/singleHand/config.h"
+#include "solver/trainer/config.h"
 
 struct BaseEntry {
     uint64_t key;

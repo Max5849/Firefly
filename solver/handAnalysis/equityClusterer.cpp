@@ -22,7 +22,7 @@ double TURN_MAX_DISTANCE = 1.0;
 double RIVER_MAX_DISTANCE = 1.0;
 // The same, for the one division of 169 preflop classes.
 double PREFLOP_MAX_DISTANCE = 30.0;
-// solver/singleHand's hand cluster field is 6 bits, so no board class may keep more clusters.
+// solver/trainer's hand cluster field is 6 bits, so no board class may keep more clusters.
 const int MAX_CLUSTERS = 64;
 
 // Showdown histograms keyed by boardClass | handClass << 16, where boardClass is the

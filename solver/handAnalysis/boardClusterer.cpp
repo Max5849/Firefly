@@ -438,7 +438,7 @@ int main() {
     }
     int maxClass = *std::max_element(boardClasses.begin(), boardClasses.end());
     std::cout << (STAGE == 2 ? 3 : boardClassIndex) << " board classes, largest id " << maxClass << "\n";
-    // solver/singleHand stores class + 169 in a 15-bit field.
+    // solver/trainer stores class + 169 in a 15-bit field.
     if (maxClass + 169 > 0x7FFF) {
         std::cout << "too many board classes for the 15-bit board field; nothing written\n";
         return 1;

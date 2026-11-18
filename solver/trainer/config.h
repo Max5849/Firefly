@@ -4,23 +4,26 @@
 
 constexpr int PLAYER_COUNT = 7;
 constexpr float CHIP_COUNT = 400.0;
-constexpr float ANTE = 2.0;
+constexpr float ANTE = 0.0;
 constexpr int METAS_STAGE = 1;
 constexpr int MEMORY_STAGE = 0;
-constexpr char STRATEGY_TAG = 'A';
-constexpr bool USE_BASE = true;
-constexpr int BASE_METAS_STAGE = 2;
+constexpr char STRATEGY_TAG = 'P';
+constexpr bool USE_BASE = false;
+constexpr int BASE_METAS_STAGE = 0;
 constexpr int BASE_MEMORY_STAGE = 0;
 constexpr char BASE_STRATEGY_TAG = 'A';
-constexpr double BASE_CONFIDENCE = 16.0;
 
-constexpr uint64_t EPOCHS = uint64_t(24) * 131072000;
+constexpr uint64_t EPOCHS = uint64_t(4) * 131072000;
 constexpr double INV_TEMP = 20 * 0.69314718056;
 constexpr double LEARNING_RATE = 1.0 / 1537.0;
-constexpr double VARIANCE_MIN = 0.0625;
-constexpr double COOLDOWN_START = 0.8;
-constexpr double VISITS_FLOOR = 0.0;
+constexpr double PREFLOP_INV_TEMP = 40 * 0.69314718056;
+constexpr double PREFLOP_LEARNING_RATE = 1.0 / 6147.0;
 
+
+constexpr double VARIANCE_MIN = 1.0 / 16.0;
+constexpr double BASE_CONFIDENCE = 0.0;
+constexpr double VISITS_FLOOR = 0.0;
+constexpr double COOLDOWN_START = 0.8;
 
 constexpr bool TRACE_KEY_ENABLED = false;
 constexpr uint64_t TRACE_KEY = 0x0000000000000000;

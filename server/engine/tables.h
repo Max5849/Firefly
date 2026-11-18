@@ -1,9 +1,9 @@
 #pragma once
 
-// solver/singleHand/engine.h brings config.h, library.h and HandClusterer, which has no
+// solver/trainer/engine.h brings config.h, library.h and HandClusterer, which has no
 // include guard, so nothing else in the server includes handClusterer.h.
-#include "solver/singleHand/config.h"
-#include "solver/singleHand/engine.h"
+#include "solver/trainer/config.h"
+#include "solver/trainer/engine.h"
 
 // The lookup tables the server's engine reads, loaded once per process.
 //

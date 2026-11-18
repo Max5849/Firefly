@@ -63,7 +63,7 @@ export interface HandState {
   tempStep: number;
 }
 
-/** The temperatures on offer, as k in ln(2^k). 20 is the singleHand trainer's. */
+/** The temperatures on offer, as k in ln(2^k). 20 is the trainer's. */
 export const TEMP_EXPONENTS = [5, 10, 20, 40, 80] as const;
 const DEFAULT_TEMP_STEP = 2;
 

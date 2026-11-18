@@ -4,7 +4,7 @@
 //
 //   build/storeProbe [--spec 740210A] 0x1234... 0xabcd...
 //
-// Without --spec it reads the file solver/singleHand/config.h names.
+// Without --spec it reads the file solver/trainer/config.h names.
 
 #include "server/strategyStore.h"
 

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "solver/singleHand/config.h"
-#include "solver/singleHand/engine.h"
+#include "solver/trainer/config.h"
+#include "solver/trainer/engine.h"
 
 static inline const char* optionName(int option) {
     switch (option) {
@@ -19,6 +19,8 @@ struct TraceNode {
     uint64_t key;
     int combo;
     int seat;
+    // The inverse temperature the node's policy was taken at.
+    double invTemp;
     uint8_t legal;
     bool seeded;
     // The node's visits after this one, and the share this visit took of them.
@@ -62,7 +64,7 @@ inline void formatTrace(const std::vector<TraceNode>& tracePath, std::ostringstr
             // notation: a count of 3e-05 must not read as 0.000.
             << "   node visits " << std::defaultfloat << node.visits << std::fixed
             << (node.seeded ? "   seeded" : "")
-            << "   invTemp " << INV_TEMP
+            << "   invTemp " << node.invTemp
             << "   chips " << node.chips << "   pot " << node.pot << "\n";
         out << std::setprecision(6);
         out << "  reach     " << node.reach << "   share " << std::defaultfloat << node.share
