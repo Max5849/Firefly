@@ -148,7 +148,7 @@ export interface KeyField {
   meaning: string;
   /** The key holds this field at 0 at this node, whatever the hand did. */
   zeroed: boolean;
-  /** False for the preflop board field, which holds each combo's own 169 class (or stage C cluster). */
+  /** False for the preflop board field, which holds each combo's own 169 class. */
   shared: boolean;
   parts: KeyPart[];
 }
@@ -174,7 +174,7 @@ export interface SpotRow {
   combo: string;
   /** The acting seat's reach: its own policy multiplied along the line. */
   reach: number;
-  /** The 169 class (stage C: its cluster) preflop, the hand cluster postflop. */
+  /** The 169 class preflop, the hand cluster postflop. */
   cluster: number;
   key: string;
   found: boolean;

@@ -12,8 +12,8 @@
 // Build and run from the repo root (the tables are read from solver/handAnalysis/):
 //   clang++ -std=c++20 -O2 -I. solver/handAnalysis/classCompare.cpp -o build/classCompare
 //   build/classCompare Ks7h2d            stage A (0) tables
-//   build/classCompare Ks7h2d4c B        stage B (1) tables
-// The stage is its letter or its number. With no arguments it prompts for lines of
+//   build/classCompare Ks7h2d4c C        stage C (2) tables
+// Stage B has no tables yet. The stage is its letter or its number. With no arguments it prompts for lines of
 // "board [stage]".
 // Cards are rank AKQJT98765432 + suit cdhs; boards are 3, 4 or 5 cards.
 

@@ -2,8 +2,8 @@
 #include "solver/handAnalysis/handClusterer.h"
 #include "solver/handAnalysis/dealer.h"
 
-// The metas stage to build (see stagePath): 0 the full cumulative classes, 1 the
-// per-street BoardClusterer classes, 2 the street alone (class = street, 1..3).
+// The metas stage to build (see stagePath): 0 the full cumulative classes, 2 the
+// per-street BoardClusterer classes. Stage 1 has no classifier yet.
 int STAGE = 2;
 
 struct BoardClusterer {
@@ -369,7 +369,7 @@ struct BoardClusterer {
 };
 
 int main() {
-    if (STAGE < 0 || STAGE > 2) {
+    if (STAGE != 0 && STAGE != 2) {
         std::cout << "no board classifier for stage " << STAGE << "\n";
         return 1;
     }
@@ -379,13 +379,8 @@ int main() {
     std::vector<uint16_t> boardClasses(60929700);
     std::unordered_map<uint64_t, int> boardClassIndexes;
     int boardClassIndex = 0;
-    // Gives each distinct key the next sequential id. Stage 2 skips the map: the class is
-    // the street itself, so ids are 1..3 and 0 is never used.
+    // Gives each distinct key the next sequential id.
     auto assignClass = [&](uint64_t boardClassKey, int street) {
-        if (STAGE == 2) {
-            boardClasses[dealer.getBoardIndex(street)] = street;
-            return;
-        }
         auto [it, inserted] = boardClassIndexes.try_emplace(boardClassKey, boardClassIndex);
         if (inserted) {
             boardClassIndex++;
@@ -395,15 +390,13 @@ int main() {
 
     // Full classes are cumulative: each street's key carries a history of the earlier
     // streets (see HandClusterer::flopHistory), and classifyTurn and classifyRiver read
-    // state the earlier classifiers left. Stage 1 classes carry the street in their key,
-    // and stage 2 classes are the street, so ids stay distinct across streets in both.
+    // state the earlier classifiers left. Stage 2 classes carry the street in their key,
+    // so ids stay distinct across streets.
     while (dealer.flopGen()) {
         uint32_t flopClass = 0;
         if (STAGE == 0) {
             flopClass = handClusterer.classifyFlop(dealer.boardCards);
             assignClass(flopClass, 1);
-        } else if (STAGE == 2) {
-            assignClass(0, 1);
         } else {
             assignClass(boardClusterer.classifyBoard(dealer.boardCards, 1), 1);
         }
@@ -413,8 +406,6 @@ int main() {
                 handClusterer.classifyFlop(dealer.boardCards);
                 turnClass = handClusterer.classifyTurn(dealer.boardCards);
                 assignClass((uint64_t)handClusterer.flopHistory | ((uint64_t)turnClass << 18), 2);
-            } else if (STAGE == 2) {
-                assignClass(0, 2);
             } else {
                 assignClass(boardClusterer.classifyBoard(dealer.boardCards, 2), 2);
             }
@@ -425,8 +416,6 @@ int main() {
                     uint32_t riverClass = handClusterer.classifyRiver(dealer.boardCards);
                     assignClass((uint64_t)handClusterer.flopHistory | ((uint64_t)handClusterer.turnHistory << 18)
                         | ((uint64_t)riverClass << 39), 3);
-                } else if (STAGE == 2) {
-                    assignClass(0, 3);
                 } else {
                     assignClass(boardClusterer.classifyBoard(dealer.boardCards, 3), 3);
                 }
@@ -437,7 +426,7 @@ int main() {
         dealer.flopSet();
     }
     int maxClass = *std::max_element(boardClasses.begin(), boardClasses.end());
-    std::cout << (STAGE == 2 ? 3 : boardClassIndex) << " board classes, largest id " << maxClass << "\n";
+    std::cout << boardClassIndex << " board classes, largest id " << maxClass << "\n";
     // solver/trainer stores class + 169 in a 15-bit field.
     if (maxClass + 169 > 0x7FFF) {
         std::cout << "too many board classes for the 15-bit board field; nothing written\n";

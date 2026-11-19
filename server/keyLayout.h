@@ -7,8 +7,8 @@
 // The node's key is actionState | metaState[combo] << ACTION_STATE_BITS (43). Bits 0..42
 // (the action state) and, postflop, bits 43..57 (the board field) are the same for every
 // combo at a node; bits 58..63 are the combo's hand cluster and are left to the
-// per-combo rows. Preflop bits 43..57 hold the combo's 169 class (stage C: its preflop
-// cluster) instead of a board, so there is no shared board field.
+// per-combo rows. Preflop bits 43..57 hold the combo's 169 class instead of a board, so
+// there is no shared board field.
 //
 // Everything here reads the key, not the engine, so a field shows exactly what the key
 // holds - bucketed, clamped, and zeroed where Engine::setActionState leaves it 0.
@@ -317,9 +317,7 @@ KeyLayout decodeKey(const Replay<P>& replay) {
         KeyField& field = add("boardField", "board class + 169", ACTION_STATE_BITS, BOARD_CLASS_BITS);
         if (round == 0) {
             field.shared = false;
-            field.meaning = config.metasStage == 2
-                ? "preflop: holds each combo's preflop cluster, so it is per combo"
-                : "preflop: holds each combo's 169 class, so it is per combo";
+            field.meaning = "preflop: holds each combo's 169 class, so it is per combo";
         } else {
             field.meaning = std::string("stage ") + char('A' + config.metasStage)
                 + " board class " + std::to_string(int(field.value) - 169);

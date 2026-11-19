@@ -3,13 +3,9 @@
 #include "solver/handAnalysis/dealer.h"
 
 // The metas stage to build (see stagePath): it reads boardClasses<letter>.bin and writes
-// handDists<letter>.bin and handMetas<letter>.bin.
+// handDists<letter>.bin and handMetas<letter>.bin. Stages 0 and 2 have board classes;
+// stage 1 has none yet.
 int STAGE = 2;
-// True writes only preflopMetas.bin, the preflop clusters, and ignores STAGE and
-// ACCUMULATE. That file has no stage letter: it reads no board class file, so no stage's
-// tables change it. Its distance and strength weight each bucket by the square of its
-// height, not linearly (bucketWeight).
-bool PREFLOP = false;
 // True enumerates every board and saves the histograms to the stage's handDists file;
 // false reloads them and only clusters. Accumulate again whenever the board class file
 // changes.
@@ -20,8 +16,6 @@ bool ACCUMULATE = false;
 double FLOP_MAX_DISTANCE = 1.0;
 double TURN_MAX_DISTANCE = 1.0;
 double RIVER_MAX_DISTANCE = 1.0;
-// The same, for the one division of 169 preflop classes.
-double PREFLOP_MAX_DISTANCE = 30.0;
 // solver/trainer's hand cluster field is 6 bits, so no board class may keep more clusters.
 const int MAX_CLUSTERS = 64;
 
@@ -38,14 +32,9 @@ void computeCdf(const std::array<float, 165>& point, std::array<double, 165>& cd
 }
 
 // A bucket's weight in cdfDistance and distStrength: its distance from the bottom,
-// 164.5 - p, squared for preflop, so with the cdf's own sum the cost is cubic there
-// rather than quadratic.
+// 164.5 - p, so with the cdf's own sum the cost is quadratic in a bucket's height.
 double bucketWeight(int p) {
-    double weight = 164.5 - p;
-    if (PREFLOP) {
-        weight *= weight;
-    }
-    return weight;
+    return 164.5 - p;
 }
 
 double cdfDistance(const std::array<double, 165>& a, const std::array<double, 165>& b) {
@@ -193,120 +182,6 @@ bool readDists(std::ifstream& file, HandDists& handDists) {
         handDists.emplace(key, dist);
     }
     return bool(file);
-}
-
-// The 169 preflop classes for cards i < j: pairs and offsuit hands 0..90, suited hands
-// 91..168. A copy of the formula in engine.h's loadTables(); keep the two identical, since
-// preflopMetas.bin is indexed by it.
-int preflopClass(int i, int j) {
-    return (i / 4) * (25 - (i / 4)) / 2 + (j / 4) + (90 - (i / 4)) * (i % 4 == j % 4);
-}
-
-// The preflop clusters: every hole pair's showdown bucket on every distinct five-card
-// board, tallied by preflop class, clustered as one division, and written as one cluster
-// id per class to preflopMetas.bin. Reads no board class file. Returns false on failure.
-bool clusterPreflop() {
-    using PreflopDists = std::array<std::array<uint64_t, 165>, 169>;
-    std::array<int, 1326> classOf;
-    std::array<std::string, 169> names;
-    const char* ranks = "AKQJT98765432";
-    for (int i = 0; i < 51; i++) {
-        for (int j = i + 1; j < 52; j++) {
-            int c = preflopClass(i, j);
-            classOf[i * (101 - i) / 2 + j - 1] = c;
-            names[c] = std::string(1, ranks[i / 4]) + ranks[j / 4]
-                + (i / 4 == j / 4 ? "" : i % 4 == j % 4 ? "s" : "o");
-        }
-    }
-
-    // Flops are dealt sorted, so a turn above the flop and a river above the turn visit
-    // each five-card board exactly once. Flops are dealt out round-robin across threads.
-    unsigned numThreads = std::max(1u, std::thread::hardware_concurrency());
-    std::vector<PreflopDists> threadDists(numThreads);
-    std::vector<std::thread> threads;
-    for (unsigned t = 0; t < numThreads; t++) {
-        threads.emplace_back([&, t]() {
-            Dealer dealer;
-            PreflopDists& dists = threadDists[t];
-            uint64_t flop = 0;
-            while (dealer.flopGen()) {
-                if (flop++ % numThreads != t) {
-                    dealer.flopSet();
-                    continue;
-                }
-                while (dealer.turnGen()) {
-                    if (dealer.boardCards[3] > dealer.boardCards[2]) {
-                        while (dealer.riverGen()) {
-                            if (dealer.boardCards[4] > dealer.boardCards[3]) {
-                                std::array<int, 1326> buckets = dealer.rankHands();
-                                for (int i = 0; i < 1326; i++) {
-                                    if (buckets[i] >= 0) {
-                                        dists[classOf[i]][buckets[i]]++;
-                                    }
-                                }
-                            }
-                            dealer.riverSet();
-                        }
-                    }
-                    dealer.turnSet();
-                }
-                dealer.flopSet();
-            }
-        });
-    }
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    std::vector<std::vector<uint64_t>> clusterHands(169);
-    std::vector<uint64_t> clusterSizes(169);
-    std::vector<std::array<float, 165>> clusterPoints(169);
-    for (int c = 0; c < 169; c++) {
-        std::array<uint64_t, 165> dist = {0};
-        uint64_t sum = 0;
-        for (const PreflopDists& dists : threadDists) {
-            for (int p = 0; p < 165; p++) {
-                dist[p] += dists[c][p];
-            }
-        }
-        for (int p = 0; p < 165; p++) {
-            sum += dist[p];
-        }
-        if (sum == 0) {
-            std::cout << "preflop class " << names[c] << " has no showdowns\n";
-            return false;
-        }
-        for (int p = 0; p < 165; p++) {
-            clusterPoints[c][p] = float(double(dist[p]) / double(sum));
-        }
-        clusterHands[c] = {uint64_t(c)};
-        clusterSizes[c] = sum;
-    }
-    std::vector<char> alive(169, 1);
-    int live = mergeDivision(clusterHands, clusterSizes, clusterPoints, alive, 0, 169, PREFLOP_MAX_DISTANCE);
-
-    std::array<uint8_t, 169> preflopClusters;
-    std::cout << "preflop: " << live << " clusters\n";
-    int cluster = 0;
-    for (int i = 0; i < 169; i++) {
-        if (!alive[i]) continue;
-        std::cout << "  " << cluster << ":";
-        for (uint64_t c : clusterHands[i]) {
-            preflopClusters[c] = uint8_t(cluster);
-            std::cout << " " << names[c];
-        }
-        std::cout << "\n";
-        cluster++;
-    }
-
-    std::string name = "solver/handAnalysis/preflopMetas.bin";
-    std::ofstream file(name, std::ios::binary);
-    file.write(reinterpret_cast<const char*>(preflopClusters.data()), preflopClusters.size());
-    if (!file) {
-        std::cout << "could not write " << name << "\n";
-        return false;
-    }
-    return true;
 }
 
 // Clusters each board class's hands independently, spread across threads. A key that
@@ -520,8 +395,9 @@ void accumulateDists(HandDists& flopHandDists, HandDists& turnHandDists, HandDis
 }
 
 int main() {
-    if (PREFLOP) {
-        return clusterPreflop() ? 0 : 1;
+    if (STAGE != 0 && STAGE != 2) {
+        std::cout << "no board classes for stage " << STAGE << "\n";
+        return 1;
     }
     std::string distsName = stagePath("handDists", STAGE);
     HandDists flopHandDists;

@@ -21,8 +21,6 @@ struct ServerTables {
     // Indexed by metas stage; empty until requireStage(stage) has run.
     inline static std::array<std::vector<uint16_t>, METAS_STAGE_COUNT> boardClassTables;
     inline static std::array<ankerl::unordered_dense::map<uint64_t, uint8_t>, METAS_STAGE_COUNT> handMetas;
-    // Stage C keys preflop on the class's cluster; loaded with stage C.
-    inline static std::array<uint8_t, 169> preflopClusters = {};
 
     // The tables every stage shares: binomials and the 169 classes, as
     // Engine::loadTables builds them.
@@ -42,7 +40,7 @@ struct ServerTables {
                     }
                 }
             }
-            // Engine::loadTables' formula; equityClusterer.cpp's preflopClass() copies it.
+            // Engine::loadTables' formula.
             for (int i = 0; i < 51; i++) {
                 for (int j = i + 1; j < 52; j++) {
                     preflopHandClasses[holePairIndex(i, j)] = (i / 4) * (25 - (i / 4)) / 2
@@ -74,21 +72,6 @@ struct ServerTables {
                     throw std::runtime_error(stagePath("handMetas", stage)
                         + ": a hand meta overflows the 6-bit key field");
                 }
-            }
-            if (stage == 2) {
-                const std::string path = "solver/handAnalysis/preflopMetas.bin";
-                if (fileSize(path) != preflopClusters.size()) {
-                    throw std::runtime_error(path + " has an unexpected size");
-                }
-                std::array<uint8_t, 169> clusters;
-                std::ifstream file = openRead(path);
-                readExact(file, clusters.data(), clusters.size(), path);
-                for (uint8_t cluster : clusters) {
-                    if (cluster >= 169) {
-                        throw std::runtime_error(path + " has a cluster of 169 or more");
-                    }
-                }
-                preflopClusters = clusters;
             }
             boardClassTables[stage] = std::move(table);
             handMetas[stage] = std::move(metas);

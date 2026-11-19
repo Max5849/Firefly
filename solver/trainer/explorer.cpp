@@ -550,6 +550,7 @@ int main () {
                   << "PREFLOP_LEARNING_RATE: " << PREFLOP_LEARNING_RATE << std::endl;
 
         Engine::loadTables();
+        Engine::requireStages(Explorer::METAS_STAGE_MASK);
 
         Explorer explorer(threads);
         if (USE_BASE) {

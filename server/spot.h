@@ -16,8 +16,7 @@ struct SpotRow {
     // The acting seat's reach: the product of its own policy along the line. 0 for a
     // combo the line has ruled out (a missing record along the way).
     float reach = 0;
-    // The hand part of the key: the 169 class (stage C: its preflop cluster) preflop,
-    // the hand cluster postflop.
+    // The hand part of the key: the 169 class preflop, the hand cluster postflop.
     int cluster = 0;
     uint64_t key = 0;
     bool found = false;

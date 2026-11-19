@@ -64,8 +64,6 @@ struct Engine {
     inline static std::array<std::vector<uint16_t>, METAS_STAGE_COUNT> boardClassTables;
     inline static std::array<ankerl::unordered_dense::map<uint64_t, uint8_t>, METAS_STAGE_COUNT> handMetas;
     inline static std::array<uint64_t, 1326> preflopHandClasses;
-    // The preflop cluster per 169-class index, from preflopMetas.bin; stage C keys on it.
-    inline static std::array<uint8_t, 169> preflopClusters;
     HandClusterer handClusterer;
     std::array<Player, PLAYER_COUNT> players;
     std::array<int, 52> deck;
@@ -183,7 +181,12 @@ struct Engine {
             std::ifstream handScoreFile = openRead(handScorePath);
             readExact(handScoreFile, handScoreTable.data(), handScoreBytes, handScorePath);
 
+            // A stage without a boardClasses file has no tables yet (stage B at present) and
+            // is left empty; requireStages throws if a run keys on it.
             for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
+                if (!std::filesystem::exists(stagePath("boardClasses", stage))) {
+                    continue;
+                }
                 std::vector<uint16_t>& table = boardClassTables[stage];
                 loadTable(stagePath("boardClasses", stage), table);
                 if (*std::max_element(table.begin(), table.end()) + 169 > BOARD_CLASS_MASK) {
@@ -211,22 +214,6 @@ struct Engine {
                     }
                 }
             }
-            {
-                const std::string path = "solver/handAnalysis/preflopMetas.bin";
-                if (fileSize(path) != preflopClusters.size()) {
-                    throw std::runtime_error(path + " has an unexpected size");
-                }
-                std::ifstream file = openRead(path);
-                readExact(file, preflopClusters.data(), preflopClusters.size(), path);
-                for (uint8_t cluster : preflopClusters) {
-                    // A preflop board field must stay below the postflop ones, which start at 169.
-                    if (cluster >= 169) {
-                        throw std::runtime_error(path + " has a cluster of 169 or more");
-                    }
-                }
-            }
-
-            // equityClusterer.cpp's preflopClass() copies this formula; keep the two identical.
             for (int i = 0; i < 51; i++) {
                 for (int j = i + 1; j < 52; j++) {
                     int preflopHandMeta = (i / 4) * (25 - (i / 4)) / 2
@@ -235,6 +222,20 @@ struct Engine {
                 }
             }
         });
+    }
+
+    static bool hasTables(int stage) {
+        return !boardClassTables[stage].empty();
+    }
+
+    // Throws unless every metas stage whose bit is set in stageMask has tables.
+    static void requireStages(uint32_t stageMask) {
+        for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
+            if ((stageMask >> stage & 1) && !hasTables(stage)) {
+                throw std::runtime_error("metas stage " + std::to_string(stage) + " has no tables: "
+                    + stagePath("boardClasses", stage) + " is missing");
+            }
+        }
     }
 
     std::uniform_int_distribution<int> cardDist;
@@ -257,8 +258,6 @@ struct Engine {
             });
             const uint64_t preflopClass = preflopHandClasses[holePairIndex(holeCards[0], holeCards[1])];
             players[i].set(holeCards, preflopClass, i);
-            // Stage C keys preflop on the class's cluster, in the board field like a class.
-            players[i].metaState[2] = preflopClusters[preflopClass];
         }
         round = 0;
         heads = PLAYER_COUNT;
@@ -552,7 +551,9 @@ struct Engine {
     void setMetaState(uint32_t stageMask) {
         uint32_t boardIndex = getBoardIndex();
         for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
-            boardClass[stage] = boardClassTables[stage][boardIndex];
+            if (stageMask >> stage & 1) {
+                boardClass[stage] = boardClassTables[stage][boardIndex];
+            }
         }
         for (int p = 0; p < PLAYER_COUNT; p++) {
             Player& player = players[p];
@@ -575,7 +576,7 @@ struct Engine {
             return false;
         }
         round++;
-        if (round == 1) {
+        if (round == 4) {
             return false;
         }
         if (heads > 3) {

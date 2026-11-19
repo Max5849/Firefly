@@ -5,7 +5,7 @@
 // Must be run from the repository root: the engine resolves the handAnalysis tables,
 // and the registry the strategy files, through relative paths.
 //
-// POST /strategy  {"config": {"players": 7, "chips": 400, "ante": 2, "metasStage": 1,
+// POST /strategy  {"config": {"players": 7, "chips": 400, "ante": 2, "metasStage": 2,
 //                             "memoryStage": 0, "tag": "A"},
 //                  "actions": [2, 1], "board": "As7h2d"}
 //   -> the table (game), the acting seat's key decoded (key), and the strategy, range,

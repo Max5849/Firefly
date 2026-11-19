@@ -69,8 +69,8 @@ static int bucket(int x) {
     return (x > 0) + (x > 2);
 }
 
-// The metas stages whose tables are built. Stage C needs handMetasC.bin and
-// preflopMetas.bin, which a checkout may not have yet.
+// The metas stages whose tables are built. Stage B has none yet, and a checkout may
+// lack any stage's.
 static uint32_t loadStages() {
     uint32_t mask = 0;
     for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
@@ -84,19 +84,17 @@ static uint32_t loadStages() {
     return mask;
 }
 
-// Engine::loadTables would load handScores.bin (only showdown reads it) and fail on any
-// stage whose tables are not built, so the trainer's statics are copied from the
-// server's. A stage that is not loaded gets stage A's board classes: setMetaState reads
-// every stage's board class, but keys only the stages in its mask.
+// Engine::loadTables would load handScores.bin (only showdown reads it), so the
+// trainer's statics are copied from the server's. A stage that is not loaded stays
+// empty: setMetaState reads and keys only the stages in its mask.
 static void seedTrainerTables(uint32_t stageMask) {
     Engine::binomials = ServerTables::binomials;
     Engine::preflopHandClasses = ServerTables::preflopHandClasses;
-    Engine::preflopClusters = ServerTables::preflopClusters;
-    const int fallback = std::countr_zero(stageMask);
     for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
-        const int from = stageMask >> stage & 1 ? stage : fallback;
-        Engine::boardClassTables[stage] = ServerTables::boardClassTables[from];
-        Engine::handMetas[stage] = ServerTables::handMetas[from];
+        if (stageMask >> stage & 1) {
+            Engine::boardClassTables[stage] = ServerTables::boardClassTables[stage];
+            Engine::handMetas[stage] = ServerTables::handMetas[stage];
+        }
     }
 }
 

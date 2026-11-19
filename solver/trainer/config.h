@@ -5,9 +5,9 @@
 constexpr int PLAYER_COUNT = 7;
 constexpr float CHIP_COUNT = 400.0;
 constexpr float ANTE = 0.0;
-constexpr int METAS_STAGE = 1;
+constexpr int METAS_STAGE = 2;
 constexpr int MEMORY_STAGE = 0;
-constexpr char STRATEGY_TAG = 'P';
+constexpr char STRATEGY_TAG = 'A';
 constexpr bool USE_BASE = false;
 constexpr int BASE_METAS_STAGE = 0;
 constexpr int BASE_MEMORY_STAGE = 0;
@@ -49,7 +49,7 @@ constexpr double BASE_MAX_LOAD = 0.5;
 constexpr uint64_t CHUNK_HANDS = 1ULL << 16;
 constexpr uint64_t PRINT_CHUNKS = 1ULL << 4;
 
-constexpr int RUNOUTS = 16;
+constexpr int RUNOUTS = 64;
 inline constexpr int COMBO_COUNT = 1326;
 
 inline int holePairIndex(int i, int j) {

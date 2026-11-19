@@ -165,8 +165,8 @@ Run this **on the Mac**, from the repository root. It pushes to the VM.
 cd ~/Poker/Firefly
 
 rsync -avP -e "ssh -i ~/.ssh/your-oracle-key" \
-  solver/handAnalysis/boardClassesB.bin \
-  solver/handAnalysis/handMetasB.bin \
+  solver/handAnalysis/boardClassesC.bin \
+  solver/handAnalysis/handMetasC.bin \
   ubuntu@<VM_PUBLIC_IP>:/opt/firefly/solver/handAnalysis/
 
 rsync -avP -e "ssh -i ~/.ssh/your-oracle-key" \
@@ -176,7 +176,7 @@ rsync -avP -e "ssh -i ~/.ssh/your-oracle-key" \
 
 The tables are per metas stage, named by letter (`A` = stage 0, the full detail,
 `B` = 1, `C` = 2): copy `boardClasses<L>.bin` and `handMetas<L>.bin` for every stage
-a strategy you serve was trained at, and `preflopMetas.bin` too for stage C. The
+a strategy you serve was trained at (stage B has no tables yet). The
 server loads a stage's tables on the first request for it, so a missing stage only
 fails the requests that ask for it (`tablesMissing`).
 
@@ -190,7 +190,7 @@ for example `740210A`. Copy the `.idx` beside it too if you built one on the Mac
 `-P` shows progress and lets you resume: if the transfer drops, run the same
 command again and it picks up where it stopped.
 
-Stage B's tables are about 125 MB, but a strategy file is large: `strategy_740210A.bin`
+Stage C's tables are about 125 MB, but a strategy file is large: `strategy_740210A.bin`
 is 3.0 GB (126M records), and its index another 2 GB. 3 GB over a home upload link
 takes roughly 40 minutes at 10 Mbit/s, 8 minutes at 50 Mbit/s. The VM needs the disk
 for both files, and page cache to keep the lookups off the disk.
@@ -212,8 +212,7 @@ stat -c "%s  %n" solver/handAnalysis/*.bin solver/strategies/*.bin
 | --- | --- |
 | `solver/handAnalysis/boardClasses<L>.bin` | 121859400 |
 | `solver/handAnalysis/handMetasA.bin` | 54845027 |
-| `solver/handAnalysis/handMetasB.bin` | 3088817 |
-| `solver/handAnalysis/preflopMetas.bin` (stage C only) | 169 |
+| `solver/handAnalysis/handMetasC.bin` | 3088817 |
 | `solver/strategies/strategy_<spec>.bin` | 8 + 24 × records |
 
 A `handMetas<L>.bin` is 8 + 9 × entries bytes, so its size changes whenever the
@@ -876,8 +875,8 @@ API serves.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `cannot find -lz` at link time | zlib headers missing | `sudo apt install zlib1g-dev` |
-| `solver/handAnalysis/boardClassesB.bin has an unexpected size` | copy truncated or missing | re-run the rsync; compare against the byte table in §5 |
-| `tablesMissing` from the API | that metas stage's `boardClasses<L>.bin` / `handMetas<L>.bin` (or `preflopMetas.bin`) not copied | copy them (§5); the next request loads them |
+| `solver/handAnalysis/boardClassesC.bin has an unexpected size` | copy truncated or missing | re-run the rsync; compare against the byte table in §5 |
+| `tablesMissing` from the API | that metas stage's `boardClasses<L>.bin` / `handMetas<L>.bin` not copied | copy them (§5); the next request loads them |
 | `spot.found` near 0 on every node | a strategy file trained on a different key layout than the server was built with | retrain with the current solver, or port the trainer's key changes to `server/engine/tableEngine.h` and `server/keyLayout.h` |
 | `... is not in the 24 byte record format` | strategy file in an old layout, or a partial copy | re-copy `strategy_<spec>.bin` from a run of the current solver |
 | `strategyUnreadable` from the API | the index could not be rebuilt, or the file is corrupt | check write access to `solver/strategies/`; run `./build/indexBuilder <path>` to see the error |

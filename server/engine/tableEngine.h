@@ -5,7 +5,7 @@
 #include "server/engine/tables.h"
 
 // A combo's node within a decision; see getGroup. NO_GROUP marks a combo out of the
-// range. Preflop a group is the board field (a 169 class, or stage C's cluster), and
+// range. Preflop a group is the board field (a 169 class), and
 // postflop the hand cluster, so 256 covers both.
 inline constexpr int GROUP_COUNT = 256;
 inline constexpr uint8_t NO_GROUP = 0xFF;
@@ -125,8 +125,7 @@ struct TableEngine {
 
     // Engine::deal, given the five board cards (the server fills streets the hand has
     // not reached with any unused cards; nothing reads them before they are revealed).
-    // Every combo starts with its 169 class in every stage, except stage C, which keys
-    // on that class's preflop cluster.
+    // Every combo starts with its 169 class in every stage.
     void deal(const std::array<int, 5>& board) {
         for (int i = 0; i < P; i++) {
             players[i].set(i, startingChips);
@@ -141,7 +140,6 @@ struct TableEngine {
             for (int stage = 0; stage < METAS_STAGE_COUNT; stage++) {
                 metaState[stage][combo] = preflopClass;
             }
-            metaState[2][combo] = ServerTables::preflopClusters[preflopClass];
         }
         round = 0;
         heads = P;
@@ -478,7 +476,7 @@ struct TableEngine {
     }
 
     // A combo's group at a node: combos in one group share a key. The board field
-    // preflop (a 169 class, or stage C's cluster), the hand cluster postflop.
+    // preflop (a 169 class), the hand cluster postflop.
     uint8_t getGroup(int metasStage, int combo) const {
         const uint64_t meta = metaState[metasStage][combo];
         return uint8_t(round == 0 ? meta : meta >> BOARD_CLASS_BITS);
@@ -503,7 +501,7 @@ struct TableEngine {
             return false;
         }
         round++;
-        if (round == 1) {
+        if (round == 4) {
             return false;
         }
         if (heads > 3) {

@@ -82,8 +82,8 @@ server rebuilds it beside the strategy file: about 25 seconds and a 2 GB index a
 
 A strategy file is `strategy_<spec>.bin`, with
 `spec = 100000·players + 100·chips + 100·ante + 10·metasStage + memoryStage`, then the
-tag letter: 7 players, 400 chips, ante 2, metas stage B (1), memory stage A (0), tag A
-is `740210A`. The chips and ante terms overlap unless the stack is a multiple of 10,
+tag letter: 7 players, 400 chips, ante 2, metas stage C (2), memory stage A (0), tag A
+is `740220A`. The chips and ante terms overlap unless the stack is a multiple of 10,
 so the server only accepts such stacks, from 10 to 990.
 
 Keys are the trainer's: action state in bits 0–42, board field 43–57, 6-bit hand
@@ -98,7 +98,7 @@ opens fine and finds nothing, so `spot.found` is 0 on every node.
 
 ```json
 {
-  "config": { "players": 7, "chips": 400, "ante": 2, "metasStage": 1, "memoryStage": 0, "tag": "A" },
+  "config": { "players": 7, "chips": 400, "ante": 2, "metasStage": 2, "memoryStage": 0, "tag": "A" },
   "actions": [1, 0, 0, 0, 0, 1, 1],
   "board": "As7h2d",
   "invTemp": 13.862943611198906,
@@ -119,8 +119,8 @@ An unknown field or section is a 400 that names it.
 #### `game`
 
 ```json
-{ "config": {"players": 7, "chips": 400, "ante": 2, "metasStage": 1, "memoryStage": 0,
-             "tag": "A", "spec": "740210A"},
+{ "config": {"players": 7, "chips": 400, "ante": 2, "metasStage": 2, "memoryStage": 0,
+             "tag": "A", "spec": "740220A"},
   "round": 1, "street": "flop", "board": "As7h2d", "pot": 8, "heads": 3,
   "blinds": "1/2", "ante": 2,
   "seats": [{"seat": 0, "name": "BTN", "stack": 400, "bet": 0, "inHand": false,
@@ -166,7 +166,7 @@ is given in each `spot` row. Fields, in order:
 | `hero` | 36–40 | seats behind hero, raises hero faces, calls since the pot opened or was raised |
 | `relativePosition` | 41 | whether hero acts after the villain postflop |
 | `calledTwice` | 42 | hero has called twice on this street (so cannot call again) |
-| `boardField` | 43–57 | board class + 169 postflop; preflop each combo's 169 class (stage C: its cluster), so `"shared": false` |
+| `boardField` | 43–57 | board class + 169 postflop; preflop each combo's 169 class, so `"shared": false` |
 
 For each field the section lists `shift`, `width`, `bits` (most significant first),
 `value`, `meaning`, `zeroed` (the key holds the field at 0 at this node, whatever the
@@ -199,8 +199,8 @@ digits, but not stored in the key), the exact `spr` and `cpr`, and `actionStateB
   `i < j`. A row is `null` when the combo uses a board card. On a row with
   `"found": false`, the node has no record, so only `reach`, `cluster`, `key` and
   `clusterCombos` are present.
-- **`cluster`** is the combo's group: the 169 class preflop (stage C: its preflop
-  cluster), the hand cluster postflop. Combos in a group share a key and a record.
+- **`cluster`** is the combo's group: the 169 class preflop, the hand
+  cluster postflop. Combos in a group share a key and a record.
 - **`reach`** is the acting seat's: the product of its own policy along the line. It
   is 0 for a combo the line has ruled out, which still carries its strategy.
 - **`weights`** are the record's four values for options 1–4: returns as a share of
@@ -266,10 +266,11 @@ Every error body has a machine-readable `code` and an `error` message:
   (seats after the big blind) cannot limp or call a single raise. The button and
   blinds can limp; the first preflop call opens the pot.
 
-**Hands end after preflop.** `beginNewRound()` ends the betting when preflop finishes
-(the trainer scores it over runout boards), so any line that closes preflop answers
-`handEnded` / `showdown`, and the flop is never reached. An off-tree action is not projected onto the nearest
-legal one.
+**Hands play to the river.** `beginNewRound()` ends the betting after the river
+(`round == 4`), when a single player is left, when more than 3 players see a new
+street, or when the first player to act on it is all in; the trainer scores those
+early endings over runout boards. A line that ends the hand answers `handEnded` /
+`showdown`. An off-tree action is not projected onto the nearest legal one.
 
 ## Tests
 
@@ -298,8 +299,9 @@ The test runs in two parts.
    - every illegal option has a reason and no legal one does;
    - every raise lands on its `betTo`.
 
-At 4000 hands (2026-11-18): 29k lockstep decisions, 133k replay nodes, all preflop,
-0 failures, and the default `strategy_740010P.bin` holds 100% of on-policy keys.
+At 4000 hands (2026-11-18, hands to the river): 41k lockstep decisions (39k preflop,
+939 flop, 709 turn, 465 river) and 180k replay nodes (132k preflop, 22k flop, 16k turn,
+11k river), 0 failures.
 A metas stage whose tables are not built is skipped, and the test names it.
 
 `build/storeProbe [--spec 740210A] <hex keys...>` prints what the mmap path returns
@@ -311,7 +313,7 @@ for a key, taken exactly as the file stores it.
 repository root:
 
 - `solver/handAnalysis/boardClasses<L>.bin` and `handMetas<L>.bin` for each metas
-  stage served (`A`, `B`, `C`), plus `preflopMetas.bin` for stage C
+  stage served (`A` or `C`; stage `B` has no tables yet)
 - every `solver/strategies/strategy_<spec>.bin` to serve (8 + 24 bytes per record:
   uint64 key, int16 weights[4] in 1/1024 pot steps, uint64 packed variance codes —
   the trainer's format; any other record size is rejected), and its `.idx` if built
@@ -320,7 +322,7 @@ repository root:
 reaches a showdown.
 
 Measured on the development machine against `strategy_740210A.bin` (126M records):
-- the first request takes about 100 ms (stage B's tables load), then about 2 ms for
+- the first request takes about 100 ms (stage C's tables load), then about 2 ms for
   both the opening node and a flop node;
 - the full response is about 480–550 KB of JSON, which gzips to about 14 KB;
 - RSS was 168 MB after a few requests (the strategy and index mappings are page
