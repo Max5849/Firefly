@@ -35,11 +35,11 @@
 #include <unistd.h>
 
 // Deals a worker claims at a time.
-constexpr uint64_t COMPRESS_CHUNK_DEALS = 1ULL << 16;
+constexpr uint64_t COMPRESS_CHUNK_DEALS = 1ULL << 8;
 // Deals between progress reports, and the window the stopping rule measures.
-constexpr uint64_t COMPRESS_WINDOW_DEALS = 1ULL << 20;
+constexpr uint64_t COMPRESS_WINDOW_DEALS = 1ULL << 16;
 // Stop once a window finds fewer new keys than this per deal.
-constexpr double COMPRESS_MIN_NEW_RATE = 1e-6;
+constexpr double COMPRESS_MIN_NEW_RATE = 0.05;
 // Stop after this many deals whatever the rate (the training run's hand count), unless
 // --max-deals says otherwise.
 constexpr uint64_t COMPRESS_MAX_DEALS = EPOCHS;
