@@ -42,12 +42,8 @@ static inline uint64_t affineUpdateVariances(std::atomic<uint64_t>& word, uint8_
     return next;
 }
 
-// The inverse temperature and base learning rate for a decision on the given round:
-// the PREFLOP_ ones on round 0, else INV_TEMP and LEARNING_RATE.
-static inline double invTemp(int round) {
-    return round == 0 ? PREFLOP_INV_TEMP : INV_TEMP;
-}
-
+// The base learning rate for a decision on the given round: PREFLOP_LEARNING_RATE on
+// round 0, else LEARNING_RATE. The inverse temperature is config.h's invTemp(round).
 static inline double baseLearningRate(int round) {
     return round == 0 ? PREFLOP_LEARNING_RATE : LEARNING_RATE;
 }
@@ -444,15 +440,9 @@ struct Explorer {
         std::cout << "Pruned " << pruned << " nodes under " << VISITS_FLOOR << " visits" << std::endl;
     }
 
-    // Players, chips / 10, the ante, the metas and memory stages, then the tag: 740211A
-    // at 7 players, 400 chips, an ante of 2, both stages 1 and tag A.
-    static_assert(ANTE == int(ANTE) && ANTE >= 0 && ANTE <= 9,
-        "the spec holds the ante as a single digit");
-    static_assert(METAS_STAGE_COUNT <= 10 && MEMORY_STAGE_COUNT <= 10,
-        "the spec holds each stage as a single digit");
+    // config.h's trainerSpec: players, chips / 10, the ante, the stages, the tag.
     static std::string spec(int metasStage, int memoryStage, char tag) {
-        return std::to_string((int)(100000 * PLAYER_COUNT + 100 * CHIP_COUNT + 100 * ANTE
-            + 10 * metasStage + 1 * memoryStage)) + tag;
+        return trainerSpec(metasStage, memoryStage, tag);
     }
 
     void downloadStrategyBase() {

@@ -7,12 +7,12 @@ constexpr float CHIP_COUNT = 400.0;
 constexpr float ANTE = 1.0;
 constexpr int METAS_STAGE = 2;
 constexpr int MEMORY_STAGE = 0;
-constexpr char STRATEGY_TAG = 'B';
+constexpr char STRATEGY_TAG = 'A';
 constexpr bool USE_BASE = false;
 constexpr int BASE_METAS_STAGE = 0;
 constexpr int BASE_MEMORY_STAGE = 0;
 constexpr char BASE_STRATEGY_TAG = 'A';
-
+constexpr char COMPRESS_TAG = 'N';
 constexpr uint64_t EPOCHS = uint64_t(72) * 131072000;
 constexpr double INV_TEMP = 20 * 0.69314718056;
 constexpr double LEARNING_RATE = 1.0 / 1537.0;
@@ -40,7 +40,7 @@ constexpr uint64_t HAND_META_MASK = (1ULL << HAND_META_BITS) - 1;
 static_assert(ACTION_STATE_BITS + BOARD_CLASS_BITS + HAND_META_BITS == 64);
 
 constexpr uint64_t STRATEGY_CAP_LOG2 = 30;
-constexpr double MAX_LOAD = 0.95;
+constexpr double MAX_LOAD = 0.8;
 
 constexpr uint64_t STRATEGY_RECORD_BYTES = 24;
 constexpr uint64_t STRATEGY_HEADER_BYTES = 8;
@@ -51,6 +51,28 @@ constexpr uint64_t PRINT_CHUNKS = 1ULL << 4;
 
 constexpr int RUNOUTS = 16;
 inline constexpr int COMBO_COUNT = 1326;
+
+// The policy's inverse temperature per pot for a decision on the given round: the
+// PREFLOP_ one on round 0, else INV_TEMP. Shared by the trainer and compress.
+inline double invTemp(int round) {
+    return round == 0 ? PREFLOP_INV_TEMP : INV_TEMP;
+}
+
+// Players, chips / 10, the ante, the metas and memory stages, then the tag: 740211A
+// at 7 players, 400 chips, an ante of 2, both stages 1 and tag A. A run writes
+// solver/strategies/strategy_<trainerSpec(...)>.bin.
+static_assert(ANTE == int(ANTE) && ANTE >= 0 && ANTE <= 9,
+    "the spec holds the ante as a single digit");
+static_assert(METAS_STAGE_COUNT <= 10 && MEMORY_STAGE_COUNT <= 10,
+    "the spec holds each stage as a single digit");
+inline std::string trainerSpecNumber(int metasStage, int memoryStage) {
+    return std::to_string((int)(100000 * PLAYER_COUNT + 100 * CHIP_COUNT + 100 * ANTE
+        + 10 * metasStage + 1 * memoryStage));
+}
+
+inline std::string trainerSpec(int metasStage, int memoryStage, char tag) {
+    return trainerSpecNumber(metasStage, memoryStage) + tag;
+}
 
 inline int holePairIndex(int i, int j) {
     return i * (101 - i) / 2 + j - 1;
