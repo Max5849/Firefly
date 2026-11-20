@@ -258,13 +258,15 @@ Every error body has a machine-readable `code` and an `error` message:
 
 - **Raises are only** half pot, one and a half pot, or all in. Which of these are
   offered depends on the SPR at that node: half pot needs SPR ≥ 1.5, one and a half
-  pot SPR ≥ 3.5, and all in is offered only below SPR 7.5.
+  pot SPR ≥ 3.5, and all in is offered only below SPR 7.5 preflop and below SPR 3.5
+  postflop.
 - **At most six raises** per hand, and the sixth can only be all in.
-- No flat call when facing three or more raises since you last acted, or after
-  calling twice on the street.
-- Preflop, no flat call when facing two raises since you last acted, and UTG to CO
-  (seats after the big blind) cannot limp or call a single raise. The button and
-  blinds can limp; the first preflop call opens the pot.
+- No flat call after calling twice on the street.
+- **Preflop opens.** Nobody limps. The small blind opens one and a half pot or folds;
+  every other seat opens half pot or folds.
+- **Preflop calls.** One seat may flat call a single raise; after that only the big
+  blind may call it too. Facing two raises since you last acted, there is no flat
+  call. Together these keep every flop to at most 3 players.
 
 **Hands play to the river.** `beginNewRound()` ends the betting after the river
 (`round == 4`), when a single player is left, when more than 3 players see a new

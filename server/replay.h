@@ -171,18 +171,20 @@ std::string illegalReason(const TableEngine<P>& engine, int option) {
         if (player.spr < 0.0005f || raises >= 6) {
             return "";
         }
-        if (player.raisesFaced > 2) {
-            return "you are facing three or more raises since you last acted: fold or "
-                "re-raise, no flat call";
-        }
         if (player.calls > 1) {
             return "you have already called twice on this street: fold or re-raise";
         }
-        if (engine.round == 0 && player.raisesFaced > 1) {
-            return "preflop, a seat facing two raises since it last acted cannot flat call";
-        }
-        if (engine.round == 0 && engine.raiseHistory[0] < 2 && engine.action > 2) {
-            return "preflop, UTG to CO cannot limp or flat call a single raise: fold or raise";
+        if (engine.round == 0) {
+            if (raises == 0) {
+                return "preflop, nobody may limp: fold or raise";
+            }
+            if (raises == 1 && engine.calls > 0 && engine.action != 2) {
+                return "preflop, once one seat has flat called a single raise, only the "
+                    "big blind may call it too: fold or re-raise";
+            }
+            if (raises >= 2 && player.raisesFaced > 1) {
+                return "preflop, a seat facing two raises since it last acted cannot flat call";
+            }
         }
         return "";
     }
@@ -200,6 +202,15 @@ std::string illegalReason(const TableEngine<P>& engine, int option) {
         }
         return "the sixth raise can only be all-in";
     }
+    if (engine.round == 0 && raises == 0) {
+        if (option == 2 && engine.action == 1) {
+            return "preflop, the small blind opens one and a half pot, not half pot";
+        }
+        if (option == 3 && engine.action != 1) {
+            return "preflop, only the small blind opens one and a half pot; other seats "
+                "open half pot";
+        }
+    }
     if (option == 2 && player.spr < 1.5f) {
         return "the stack-to-pot ratio is " + sprText()
             + ", below the 1.5 needed to raise half pot";
@@ -208,9 +219,13 @@ std::string illegalReason(const TableEngine<P>& engine, int option) {
         return "the stack-to-pot ratio is " + sprText()
             + ", below the 3.5 needed to raise one and a half pot";
     }
-    if (option == 4 && player.spr >= 7.5f) {
+    if (option == 4 && engine.round == 0 && player.spr >= 7.5f) {
         return "the stack-to-pot ratio is " + sprText()
-            + ", at or above the 7.5 beyond which an all-in is not offered";
+            + ", at or above the 7.5 beyond which a preflop all-in is not offered";
+    }
+    if (option == 4 && engine.round > 0 && player.spr >= 3.5f) {
+        return "the stack-to-pot ratio is " + sprText()
+            + ", at or above the 3.5 beyond which a postflop all-in is not offered";
     }
     return "";
 }

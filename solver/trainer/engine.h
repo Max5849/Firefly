@@ -391,7 +391,7 @@ struct Engine {
             if (raises > 4) {
                 options[4] = true;
             } else {
-                if (player.spr < 7.5f) {
+                if ((round == 0 && player.spr < 7.5f) || player.spr < 3.5f) {
                     options[4] = true;
                 } 
                 if (player.spr >= 3.5f) {
@@ -401,11 +401,26 @@ struct Engine {
                     options[2] = true;
                 }
             }
-            if (player.raisesFaced > 2 || player.calls > 1) {
+            if (player.calls > 1) {
                 options[1] = false;
             }
-            if (round == 0 && ((raiseHistory[0] < 2 && action > 2) || (player.raisesFaced > 1))) {
-                options[1] = false;
+            if (round == 0) {
+                if (raises == 0) {
+                    options[1] = false;
+                    if (action != 1) {
+                        options[3] = false;
+                    } else {
+                        options[2] = false;
+                    }
+                } else if (raises == 1) {
+                    if (calls > 0 && action != 2) {
+                        options[1] = false;
+                    }
+                } else {
+                    if (player.raisesFaced > 1) {
+                        options[1] = false;
+                    }
+                }
             }
         }
         return options;

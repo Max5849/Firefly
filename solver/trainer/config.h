@@ -4,16 +4,16 @@
 
 constexpr int PLAYER_COUNT = 7;
 constexpr float CHIP_COUNT = 400.0;
-constexpr float ANTE = 0.0;
+constexpr float ANTE = 1.0;
 constexpr int METAS_STAGE = 2;
 constexpr int MEMORY_STAGE = 0;
-constexpr char STRATEGY_TAG = 'A';
+constexpr char STRATEGY_TAG = 'B';
 constexpr bool USE_BASE = false;
 constexpr int BASE_METAS_STAGE = 0;
 constexpr int BASE_MEMORY_STAGE = 0;
 constexpr char BASE_STRATEGY_TAG = 'A';
 
-constexpr uint64_t EPOCHS = uint64_t(4) * 131072000;
+constexpr uint64_t EPOCHS = uint64_t(72) * 131072000;
 constexpr double INV_TEMP = 20 * 0.69314718056;
 constexpr double LEARNING_RATE = 1.0 / 1537.0;
 constexpr double PREFLOP_INV_TEMP = 40 * 0.69314718056;
@@ -39,7 +39,7 @@ constexpr uint64_t BOARD_CLASS_MASK = (1ULL << BOARD_CLASS_BITS) - 1;
 constexpr uint64_t HAND_META_MASK = (1ULL << HAND_META_BITS) - 1;
 static_assert(ACTION_STATE_BITS + BOARD_CLASS_BITS + HAND_META_BITS == 64);
 
-constexpr uint64_t STRATEGY_CAP_LOG2 = 28;
+constexpr uint64_t STRATEGY_CAP_LOG2 = 30;
 constexpr double MAX_LOAD = 0.95;
 
 constexpr uint64_t STRATEGY_RECORD_BYTES = 24;
@@ -49,7 +49,7 @@ constexpr double BASE_MAX_LOAD = 0.5;
 constexpr uint64_t CHUNK_HANDS = 1ULL << 16;
 constexpr uint64_t PRINT_CHUNKS = 1ULL << 4;
 
-constexpr int RUNOUTS = 64;
+constexpr int RUNOUTS = 16;
 inline constexpr int COMBO_COUNT = 1326;
 
 inline int holePairIndex(int i, int j) {

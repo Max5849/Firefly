@@ -715,7 +715,8 @@ int main(int argc, char** argv) {
                 "through that same softmax at the request's invTemp; the default is the "
                 "trainer's INV_TEMP";
             body["streets"] = "hands are played to the river: the betting ends after the "
-                "river, or after any raised street that leaves more than 3 players";
+                "river, or when more than 3 players would see a new street (the preflop "
+                "call rules keep every flop to at most 3)";
             response.set_content(body.dump(2), "application/json");
         });
 

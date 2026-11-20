@@ -446,7 +446,7 @@ int main(int argc, char** argv) {
         Tally lock;
         lockstep(hands, stageMask, store.get(), lock);
         std::cout << "Lockstep with Engine (" << PLAYER_COUNT << " seats, " << CHIP_COUNT
-                  << " chips, ante " << ANTE << "): " << lock.nodes << " decisions, "
+                  << " chips, ante " << ANTE << "): " << lock.nodes << " decisions"
                   << "\n  preflop " << lock.perRound[0] << ", flop " << lock.perRound[1]
                   << ", turn " << lock.perRound[2] << ", river " << lock.perRound[3] << "\n";
         if (store != nullptr) {
